@@ -10,7 +10,6 @@ name: Update toolchain
 
 on:
   schedule:
-    # 1st and 15th, 02:00 Asia/Taipei.
     - cron: "0 18 1,15 * *"
   workflow_dispatch:
 
