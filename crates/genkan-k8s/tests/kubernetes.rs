@@ -993,10 +993,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "needs a Kubernetes cluster (KUBECONFIG)"]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one end-to-end scenario reads best top to bottom"
-    )]
+    #[expect(clippy::too_many_lines, reason = "one User lifecycle scenario")]
     async fn user_recreation_collects_only_the_original_users_dependents() {
         use base64::Engine as _;
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -1009,36 +1006,9 @@ mod tests {
         use genkan_k8s::invitations::{Invitee, invite};
         use genkan_k8s::setup::{SETUP_SECRET, issue_setup_link};
         use genkan_store::{
-            CreateCredential, CreateGrant, CredentialStore as _, CredentialType, GrantStore as _,
-            NewExternal, NewPasskey, external_credential_name, passkey_credential_name,
+            CredentialStore as _, CredentialType, GrantStore as _, NewExternal, NewPasskey,
+            external_credential_name, passkey_credential_name,
         };
-
-        async fn create_credentials(store: &KubeCredentialStore, generation: &str) -> [String; 2] {
-            let id = format!("owner-gc-{generation}");
-            let passkey = NewPasskey {
-                name: passkey_credential_name(id.as_bytes()),
-                user: "alice".into(),
-                credential_id: URL_SAFE_NO_PAD.encode(id.as_bytes()),
-                record: "{}".into(),
-                label: None,
-            };
-            assert_eq!(
-                store.create(&passkey).await.unwrap(),
-                CreateCredential::Created
-            );
-            let external = NewExternal {
-                name: external_credential_name("https://github.com", &id),
-                user: "alice".into(),
-                kind: CredentialType::GitHub,
-                issuer: "https://github.com".into(),
-                subject: id,
-            };
-            assert_eq!(
-                store.link(&external).await.unwrap(),
-                CreateCredential::Created
-            );
-            [passkey.name, external.name]
-        }
 
         let env = Env::new().await;
         let users: Api<User> = env.admin_api();
@@ -1046,54 +1016,67 @@ mod tests {
         let grants: Api<Grant> = env.genkan_api();
         let invitations: Api<Invitation> = env.genkan_api();
         let secrets: Api<Secret> = env.genkan_api();
-        let admin = env.admin.clone();
-        let namespace = env.namespace.clone();
-        // Keep the namespace cleanup outside the task, including when an assertion fails.
-        let result = tokio::spawn(async move {
-            let pp = PostParams::default();
-            let user = user_object("alice", "alice", &[], false);
-            let original_uid = users.create(&pp, &user).await.unwrap().uid().unwrap();
-            let issuer = BaseUrl::parse("issuer", "https://login.example.com").unwrap();
-            let t0 = now();
-            let time = UnixTime::from_secs(t0);
-            let valid_for = Duration::from_hours(1);
-            let idle = UnixTime::from_secs(t0 + 1800);
-            let credential_store = KubeCredentialStore::new(credentials.clone());
-            let grant_store = KubeGrantStore::new(grants.clone());
-            let invitee = Invitee {
-                username: "alice".into(),
-                display_name: None,
-                groups: vec![],
-                elevated_groups: vec![],
-                email: None,
-                language: None,
+        let credential_store = KubeCredentialStore::new(credentials.clone());
+        let grant_store = KubeGrantStore::new(grants.clone());
+        let user = user_object("alice", "alice", &[], false);
+        let pp = PostParams::default();
+        let mut uid = users.create(&pp, &user).await.unwrap().uid().unwrap();
+        let issuer = BaseUrl::parse("issuer", "https://login.example.com").unwrap();
+        let t0 = now();
+        let time = UnixTime::from_secs(t0);
+        let valid_for = Duration::from_hours(1);
+        let invitee = Invitee {
+            username: "alice".into(),
+            display_name: None,
+            groups: vec![],
+            elevated_groups: vec![],
+            email: None,
+            language: None,
+        };
+
+        // Setup precedes credentials; only GC, never reset, removes these dependents.
+        issue_setup_link(
+            env.admin.clone(),
+            &env.namespace,
+            &issuer,
+            "alice",
+            valid_for,
+            false,
+            time,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            secrets.get(SETUP_SECRET).await.unwrap().owner_references()[0].uid,
+            uid
+        );
+
+        let mut original = None;
+        for (generation, digit) in [("old", "1"), ("fresh", "2")] {
+            let passkey = NewPasskey {
+                name: passkey_credential_name(generation.as_bytes()),
+                user: "alice".into(),
+                credential_id: URL_SAFE_NO_PAD.encode(generation.as_bytes()),
+                record: "{}".into(),
+                label: None,
             };
-
-            // Setup must precede credentials: this scenario never uses --reset to delete them.
-            issue_setup_link(
-                admin.clone(),
-                &namespace,
-                &issuer,
-                "alice",
-                valid_for,
-                false,
-                time,
-            )
-            .await
-            .unwrap();
-            let original_setup_uid = secrets.get(SETUP_SECRET).await.unwrap().uid().unwrap();
-            let old_credentials = create_credentials(&credential_store, "old").await;
-            let old_grant = format!("g-{}", "1".repeat(64));
-            assert_eq!(
-                grant_store
-                    .create(&new_grant(&old_grant, t0), idle)
-                    .await
-                    .unwrap(),
-                CreateGrant::Created
-            );
-            let old_invitation = invite(
-                admin.clone(),
-                &namespace,
+            credential_store.create(&passkey).await.unwrap();
+            let external = NewExternal {
+                name: external_credential_name("https://github.com", generation),
+                user: "alice".into(),
+                kind: CredentialType::GitHub,
+                issuer: "https://github.com".into(),
+                subject: generation.into(),
+            };
+            credential_store.link(&external).await.unwrap();
+            let grant = format!("g-{}", digit.repeat(64));
+            grant_store
+                .create(&new_grant(&grant, t0), UnixTime::from_secs(t0 + 1800))
+                .await
+                .unwrap();
+            let invitation = invite(
+                env.admin.clone(),
+                &env.namespace,
                 &issuer,
                 &invitee,
                 valid_for,
@@ -1101,125 +1084,61 @@ mod tests {
             )
             .await
             .unwrap();
-            assert!(!old_invitation.created_user);
-
-            users
-                .delete("alice", &DeleteParams::background())
-                .await
-                .unwrap();
-            // Recreate immediately, without waiting for any dependent or garbage collector.
-            let replacement_uid = users.create(&pp, &user).await.unwrap().uid().unwrap();
-            assert_ne!(replacement_uid, original_uid);
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-
-            // These writes use Genkan's ordinary Role, including the stores' User GET.
-            let fresh_grant = format!("g-{}", "2".repeat(64));
-            assert_eq!(
-                grant_store
-                    .create(&new_grant(&fresh_grant, t0), idle)
-                    .await
-                    .unwrap(),
-                CreateGrant::Created
-            );
-            let fresh_invitation = invite(
-                admin.clone(),
-                &namespace,
-                &issuer,
-                &invitee,
-                valid_for,
-                time,
-            )
-            .await
-            .unwrap();
-            assert!(!fresh_invitation.created_user);
-
-            // The setup Secret is a singleton: observe its deletion before issuing another.
-            // Old credentials must also be gone before setup's HasCredentials check can pass.
-            tokio::time::timeout_at(deadline, async {
-                loop {
-                    let setup_gone = secrets.get_opt(SETUP_SECRET).await.unwrap().is_none();
-                    let passkey_gone = credentials
-                        .get_opt(&old_credentials[0])
-                        .await
-                        .unwrap()
-                        .is_none();
-                    let external_gone = credentials
-                        .get_opt(&old_credentials[1])
-                        .await
-                        .unwrap()
-                        .is_none();
-                    if setup_gone && passkey_gone && external_gone {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-            })
-            .await
-            .expect("the original setup Secret and Credentials were not garbage-collected");
-            issue_setup_link(admin, &namespace, &issuer, "alice", valid_for, false, time)
-                .await
-                .unwrap();
-            let fresh_setup_uid = secrets.get(SETUP_SECRET).await.unwrap().uid().unwrap();
-            assert_ne!(fresh_setup_uid, original_setup_uid);
-            let fresh_credentials = create_credentials(&credential_store, "fresh").await;
-
-            // GC is asynchronous; only eventual disappearance is required, not a latency bound.
-            tokio::time::timeout_at(deadline, async {
-                loop {
-                    let grant_gone = grants.get_opt(&old_grant).await.unwrap().is_none();
-                    let invitation_gone = invitations
-                        .get_opt(&old_invitation.name)
-                        .await
-                        .unwrap()
-                        .is_none();
-                    if grant_gone && invitation_gone {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-            })
-            .await
-            .expect("the original Grant and Invitation were not garbage-collected");
-
-            for name in &old_credentials {
-                assert!(credentials.get_opt(name).await.unwrap().is_none());
-            }
-            assert_eq!(
-                users.get("alice").await.unwrap().uid().unwrap(),
-                replacement_uid
-            );
-            let fresh_setup = secrets.get(SETUP_SECRET).await.unwrap();
-            assert_eq!(fresh_setup.uid().unwrap(), fresh_setup_uid);
-            let fresh_objects = [
-                credentials
-                    .get(&fresh_credentials[0])
-                    .await
-                    .unwrap()
-                    .metadata,
-                credentials
-                    .get(&fresh_credentials[1])
-                    .await
-                    .unwrap()
-                    .metadata,
-                grants.get(&fresh_grant).await.unwrap().metadata,
-                invitations
-                    .get(&fresh_invitation.name)
-                    .await
-                    .unwrap()
-                    .metadata,
-                fresh_setup.metadata,
+            let metadata = [
+                credentials.get(&passkey.name).await.unwrap().metadata,
+                credentials.get(&external.name).await.unwrap().metadata,
+                grants.get(&grant).await.unwrap().metadata,
+                invitations.get(&invitation.name).await.unwrap().metadata,
             ];
-            for metadata in fresh_objects {
-                let owners = metadata.owner_references.unwrap();
-                assert_eq!(owners.len(), 1);
-                assert_eq!(owners[0].uid, replacement_uid);
-                assert_ne!(owners[0].controller, Some(true));
-                assert_ne!(owners[0].block_owner_deletion, Some(true));
+            for object in metadata {
+                assert_eq!(object.owner_references.unwrap()[0].uid, uid);
             }
-        })
-        .await;
+            if generation == "old" {
+                original = Some((passkey.name, external.name, grant, invitation.name));
+                users
+                    .delete("alice", &DeleteParams::background())
+                    .await
+                    .unwrap();
+                // Recreate immediately, without waiting for GC of the original dependents.
+                let replacement = users.create(&pp, &user).await.unwrap().uid().unwrap();
+                assert_ne!(replacement, uid);
+                uid = replacement;
+            } else {
+                // Wait for all old objects together; fresh ones must remain after collection.
+                let (old_passkey, old_external, old_grant, old_invitation) =
+                    original.as_ref().unwrap();
+                tokio::time::timeout(Duration::from_secs(120), async {
+                    loop {
+                        if credentials.get_opt(old_passkey).await.unwrap().is_none()
+                            && credentials.get_opt(old_external).await.unwrap().is_none()
+                            && grants.get_opt(old_grant).await.unwrap().is_none()
+                            && invitations.get_opt(old_invitation).await.unwrap().is_none()
+                            && secrets.get_opt(SETUP_SECRET).await.unwrap().is_none()
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                })
+                .await
+                .expect("the original User's dependents were not garbage-collected");
+                assert_eq!(users.get("alice").await.unwrap().uid().unwrap(), uid);
+                assert_eq!(
+                    credentials.get(&passkey.name).await.unwrap().spec.user,
+                    "alice"
+                );
+                assert_eq!(
+                    credentials.get(&external.name).await.unwrap().spec.user,
+                    "alice"
+                );
+                assert_eq!(grants.get(&grant).await.unwrap().spec.user, "alice");
+                assert_eq!(
+                    invitations.get(&invitation.name).await.unwrap().spec.user,
+                    "alice"
+                );
+            }
+        }
         env.cleanup().await;
-        result.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

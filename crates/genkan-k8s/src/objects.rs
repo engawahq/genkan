@@ -35,34 +35,11 @@
 
 use std::fmt::Debug;
 
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{Api, DeleteParams, PostParams, Preconditions};
 use kube::core::NamespaceResourceScope;
 use kube::{Resource, ResourceExt as _};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-
-/// Binds a new dependent to the current User incarnation for eventual Kubernetes GC.
-///
-/// This is cleanup, not synchronous revocation: reads do not validate the owner UID.
-pub(crate) async fn user_owner<K>(
-    api: &Api<K>,
-    name: &str,
-) -> Result<OwnerReference, genkan_store::StoreError>
-where
-    K: Resource + Clone,
-{
-    let namespace = api.namespace().ok_or_else(|| {
-        genkan_store::StoreError("User dependents require a namespaced API".to_owned())
-    })?;
-    let users: Api<crate::crd::user::User> = Api::namespaced(api.clone().into_client(), namespace);
-    let user = users
-        .get(name)
-        .await
-        .map_err(|error| genkan_store::StoreError(error.to_string()))?;
-    user.owner_ref(&())
-        .ok_or_else(|| genkan_store::StoreError("User is missing its Kubernetes UID".to_owned()))
-}
 
 /// Outcome of [`create_once`].
 #[derive(Debug, Clone, PartialEq, Eq)]

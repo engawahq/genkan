@@ -19,56 +19,14 @@ Connect client (Argo CD, Grafana, Headlamp, …) can use the same issuer.
   service account cannot create Secrets, bindings or users of its own choosing; SCIM writes are
   bounded by an admission policy.
 - **State in Kubernetes.** Users, passkeys, clients, sessions and invitations are custom
-  resources; there is no database.
+  resources; there is no database. Deleting a User eventually cleans up its passkeys, sessions
+  and links through owner references; this is not immediate revocation. Do not use
+  `--cascade=orphan`.
 - **Small.** One static binary in an otherwise empty image (about 20 MB), a few MiB of memory at
   rest; sign-in pages are server-rendered with about 1 KB of script each.
 
 [conformance.md](conformance.md) maps every specification requirement Genkan implements to the
 code and the test that proves it.
-
-### User deletion and dependent cleanup
-
-New Credentials (passkeys and upstream account links), Grants, Invitations and the setup
-Secret carry a same-namespace User `ownerReference`, including its Kubernetes UID. Normal
-cascading deletion eventually removes these objects even if a User with the same name is
-recreated. Genkan uses ordinary, non-controller references without `blockOwnerDeletion`;
-the server does not need permission to delete Users.
-
-This is lifecycle cleanup, **not immediate authentication revocation**. Credential and Grant
-reads do not compare owner UIDs. Until Kubernetes GC completes, an old record can still be
-used against a same-name replacement User. An unhealthy GC controller can extend that window;
-orphan deletion deliberately preserves dependents. Sealed authorization codes, flow cookies
-and WebAuthn ceremony state are not Kubernetes objects and are outside this cleanup mechanism.
-Already-issued JWTs remain usable until expiry. Do not use `--cascade=orphan` when retiring
-an account, or rely on a particular GC latency as a security boundary.
-
-See Kubernetes [Owners and Dependents](https://kubernetes.io/docs/concepts/overview/working-with-objects/owners-dependents/).
-The cluster test `user_recreation_collects_only_the_original_users_dependents` verifies
-eventual collection after same-name recreation and survival of the replacement's dependents.
-
-#### Upgrading an existing alpha installation
-
-No CRD schema change or automatic backfill is required. Old records lack owner references and
-will not acquire this cleanup behavior automatically. For this unreleased alpha, use a clean
-authentication-state cutover rather than assigning an old record to the current same-name User:
-
-1. Stop Genkan (including its invitation mailer) and other authentication-state writers.
-   Keep the cluster-admin kubeconfig available; this procedure removes every user's credentials,
-   refresh families and outstanding enrollment links.
-2. In the Genkan namespace, delete the old authentication records:
-
-   ```sh
-   kubectl -n "$GENKAN_NAMESPACE" delete credentials.genkan.engawahq.dev \
-     grants.genkan.engawahq.dev invitations.genkan.engawahq.dev --all
-   kubectl -n "$GENKAN_NAMESPACE" delete secret genkan-setup --ignore-not-found
-   ```
-
-3. Deploy the new image and restore the previous replica count. Restarting also invalidates
-   the process-local sealed flows. Keep Users, OAuthClients, signing keys and TLS Secrets.
-4. Issue fresh setup/invitation links, re-enroll passkeys and re-link upstream accounts.
-   Previously issued JWTs are not revoked by deleting these records; wait for their expiry
-   before treating the cutover as fully effective.
-
 
 ## How it fits together
 
