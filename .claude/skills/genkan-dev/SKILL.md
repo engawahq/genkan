@@ -17,7 +17,7 @@ description: Day-to-day development loop for the Genkan repository — environme
 
 ## Checks (what CI runs)
 ```sh
-nix develop -c cargo fmt --all
+nix develop -c cargo fmt --all --check   # drop --check to apply the formatting
 nix develop -c cargo lint          # clippy --workspace --all-targets --all-features --locked -D warnings
 RUSTDOCFLAGS="-D warnings" nix develop -c cargo doc --workspace --no-deps --document-private-items --locked
 nix develop -c cargo nextest run --workspace --all-features --locked --no-tests=warn
