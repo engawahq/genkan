@@ -1,103 +1,102 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/cover-dark.avif">
+  <img alt="Genkan: cross out admin.conf, log in to Kubernetes with a passkey" src="docs/images/cover-light.avif">
+</picture>
+
 # Genkan
 
 **Delete `admin.conf`. Log in to your cluster with a passkey.**
 
-> Status: alpha. Not released yet; expect breaking changes.
+Most self-managed clusters are run with one admin kubeconfig that never expires, gets copied to
+every laptop, and cannot be revoked. Genkan (玄関, the entrance of a Japanese house) replaces it
+with a passkey: `kubectl` opens your browser, you touch your fingerprint reader, and you get a
+token that lasts minutes, not years.
 
-Genkan (玄関, the entrance of a Japanese house) is a passkey-first OpenID Connect issuer for
-self-managed Kubernetes clusters (k3s, k0s, kubeadm). kube-apiserver verifies Genkan's tokens
-itself through [Structured Authentication Configuration][kep-3331], so people sign in with a
-passkey instead of carrying a long-lived admin kubeconfig that cannot be revoked. Any OpenID
-Connect client (Argo CD, Grafana, Headlamp, …) can use the same issuer.
+> **Status: alpha.** Not released yet; expect breaking changes.
 
-- **No passwords.** Passkeys (WebAuthn, user verification required) are the primary credential;
-  GitHub and Google accounts can be linked as alternatives for ordinary access.
-- **Least privilege by default.** A normal token carries ordinary groups. Administrative groups
-  (`genkan:elevated:<group>`) exist only in a non-refreshable token of at most five minutes,
-  issued right after a passkey sign-in that asks for elevation, and kube-apiserver's own
-  configuration rejects any other token that carries them.
-- **No standing secrets in the issuer's hands.** Tokens are short-lived and audience-bound; only
-  hashes of codes, refresh tokens and links are stored; signing keys rotate on a schedule. The
-  service account cannot create Secrets, bindings or users of its own choosing; SCIM writes are
-  bounded by an admission policy.
-- **State in Kubernetes.** Users, passkeys, clients, sessions and invitations are custom
-  resources; there is no database.
-- **Small.** One static binary in an otherwise empty image (about 20 MB), a few MiB of memory at
-  rest; sign-in pages are server-rendered with about 1 KB of script each.
+https://github.com/user-attachments/assets/4c6e29f2-341c-4622-8cc5-4337e13e53b5
 
-## How it fits together
+*Signing in to [Aptakube](https://aptakube.com) with a passkey: the cluster opens for browsing,
+and restarting a deployment is refused with 403 until you ask for admin rights.*
 
-```text
-browser ──passkey──▶ genkan (in the cluster) ──tokens──▶ kubectl / OIDC clients
-                        │  ▲                                     │
-                 custom resources                       bearer token
-                        ▼  │                                     ▼
-                  kube-apiserver ◀──discovery + keys (internal TLS)── verifies tokens itself
-```
+## Why Genkan
 
-The admin tool `genkanctl` runs on an administrator's machine with their own kubeconfig. It
-prints the install manifests, writes kube-apiserver's `AuthenticationConfiguration` for the
-distribution, and issues the one-time links people use to enrol a passkey.
+- **Passkeys, not passwords.** Touch ID, Windows Hello or a security key. Teammates can also
+  link a GitHub or Google account for everyday access.
+- **Admin rights only when you ask, for five minutes.** By default your everyday token can look
+  but not touch. Changing the cluster needs a fresh passkey tap and a token that expires on its own.
+- **No forever key on anyone's laptop.** Tokens last minutes and Kubernetes checks them itself;
+  admin tokens cannot be renewed at all. Revoke a person's sessions and their access ends when
+  the token in hand expires, within ten minutes.
+- **Runs inside the cluster it protects.** One small pod (about 20 MB), no database, no extra
+  servers. Works with k3s, k0s and kubeadm, and with any OpenID Connect app such as Argo CD or
+  Grafana.
 
-## Crates
+## What it looks like
 
-The workspace is a flat `crates/` directory of small crates whose dependencies only point
-downwards ([Kladov][matklad-workspaces]; acyclic, levelled dependencies after Lakos [4] and Martin
-[5]). Each crate hides one design decision behind a narrow interface
-([Parnas][parnas]); storage is a set of traits (ports) with in-memory and Kubernetes adapters
-([Cockburn][cockburn]). The in-cluster server and the administrator's CLI are separate binaries,
-as in Kanidm (`kanidmd`/`kanidm`), etcd (`etcd`/`etcdctl`) and cert-manager (`cmctl`), so code
-that only an administrator should run never ships in the server image. Every crate has a README
-that is also its crate-level documentation (`cargo doc --open`).
+<table>
+  <tr>
+    <td width="33%"><picture>
+      <source media="(prefers-color-scheme: dark)" srcset="docs/images/sign-in-dark.avif">
+      <img alt="Sign-in page with a passkey button and Continue with GitHub" src="docs/images/sign-in-light.avif">
+    </picture></td>
+    <td width="33%"><picture>
+      <source media="(prefers-color-scheme: dark)" srcset="docs/images/sign-in-elevated-dark.avif">
+      <img alt="Sign-in page for admin access, with the passkey button only" src="docs/images/sign-in-elevated-light.avif">
+    </picture></td>
+    <td width="33%"><picture>
+      <source media="(prefers-color-scheme: dark)" srcset="docs/images/setup-dark.avif">
+      <img alt="Setup page for creating a passkey from a one-time link" src="docs/images/setup-light.avif">
+    </picture></td>
+  </tr>
+  <tr>
+    <td align="center"><b>Everyday sign-in</b><br>passkey or GitHub</td>
+    <td align="center"><b>Admin access</b><br>passkey only, 5 minutes</td>
+    <td align="center"><b>Joining</b><br>a one-time invitation link</td>
+  </tr>
+</table>
 
-| Crate | What it holds | Depends on |
-|---|---|---|
-| [`genkan-core`](crates/genkan-core) | time, cryptographic helpers, validated config values, protocol names | — |
-| [`genkan-keys`](crates/genkan-keys) | signing keys, JWK publication, JWS signing and verification, rotation | core |
-| [`genkan-store`](crates/genkan-store) | storage ports (traits, records) and in-memory adapters | core, keys |
-| [`genkan-tls`](crates/genkan-tls) | trust roots, certificate issuance, a reloadable TLS listener | core |
-| [`genkan-ui`](crates/genkan-ui) | server-rendered pages, embedded assets, translations, security headers | core |
-| [`genkan-oauth`](crates/genkan-oauth) | the OAuth 2.0 / OpenID Connect authorization server | core, keys, store, ui |
-| [`genkan-signin`](crates/genkan-signin) | passkey enrolment and sign-in, upstream providers, page routes | core, keys, store, oauth, ui |
-| [`genkan-mail`](crates/genkan-mail) | a minimal SMTP submission client for invitation links | core |
-| [`genkan-scim`](crates/genkan-scim) | SCIM 2.0 provisioning endpoints | core, store |
-| [`genkan-k8s`](crates/genkan-k8s) | custom resources, Kubernetes adapters, GC, manifests, kube-apiserver config | core, keys, store, tls |
-| [`genkan`](crates/genkan) | **binary**: the in-cluster server | all of the above |
-| [`genkanctl`](crates/genkanctl) | **binary**: the administrator's CLI | core, k8s |
-| [`genkan-test-support`](crates/genkan-test-support), [`genkan-e2e`](crates/genkan-e2e) | test helpers; end-to-end tests on a cluster | — |
+## How it works
 
-The sign-in pages' TypeScript and Tailwind sources live in [`ui/`](ui); their built output is
-committed to `crates/genkan-ui/assets` and embedded in the binary, so building Genkan needs only
-Cargo.
+1. You run `kubectl get pods`. Your browser opens Genkan's sign-in page.
+2. You sign in with your passkey. `kubectl` receives a token valid for ten minutes and renews it
+   quietly while you work.
+3. Kubernetes checks the token itself. Genkan never sits in the path of your requests.
 
-## Install
+Need to change something? Use your admin context: one more passkey tap, five minutes of admin
+rights, then back to read-only.
 
-To try it end to end on a k3s VM, follow [docs/get-started.md](docs/get-started.md).
+## Get started
+
+The [step-by-step guide](docs/get-started.md) builds a k3s cluster in a VM, installs Genkan and
+signs `kubectl` in with a passkey from your Mac, in about half an hour.
+
+On a cluster you already run, the shape of it is:
 
 ```sh
+export GENKAN_ISSUER=https://login.example.com
 genkanctl crds | kubectl apply -f -
-genkanctl manifests --issuer https://login.example.com --image <image@digest> | kubectl apply -f -
-genkanctl kube-config --issuer https://login.example.com --distro k3s > authn.yaml   # then follow the printed steps
-genkanctl setup-link --issuer https://login.example.com --username admin           # open it, create a passkey
+# --invitations lets the server redeem the links `genkanctl invite` prints.
+genkanctl manifests --image <image> --serve-arg=--invitations | kubectl apply -f -
+# Prints kube-apiserver's configuration and how to install it for your distribution:
+genkanctl kube-config --distro k3s > authn.yaml
+# A one-time link: open it and create your passkey.
+genkanctl setup-link --username admin
 ```
 
-`deploy/crds.json` and `deploy/rbac.json` are the committed outputs of `genkanctl crds` and
-`genkanctl rbac`, for review in pull requests.
+There is no published image yet; the guide shows how to build one.
 
-## Development
+Then:
 
-With Nix: `nix develop` (or `direnv allow`). Without Nix: install rustup; `rust-toolchain.toml`
-selects the same compiler. See [CONTRIBUTING.md](CONTRIBUTING.md) for the checks CI runs, the
-dependency policy and how to run the cluster tests.
+- [Sign in with GitHub](docs/github-sign-in.md) for teammates who prefer it.
+- `genkanctl invite --username alice` to send someone a one-time link. It needs the server
+  started with `--invitations`, as above; without it the link cannot be redeemed.
 
-```sh
-cargo lint                   # clippy with CI's settings
-cargo nextest run --workspace
-cargo doc --workspace --open # design notes and references live in the rustdoc
-```
+## Learn more
 
-[docs/conformance.md](docs/conformance.md) maps every specification requirement Genkan
-implements to the code and the test that proves it.
+- [Architecture](docs/architecture.md): how the pieces fit, security properties, the crates.
+- [Conformance](docs/conformance.md): every specification requirement, mapped to code and tests.
+- [Contributing](CONTRIBUTING.md): development setup, the checks CI runs, dependency policy.
 
 ## Licence and credits
 
@@ -107,23 +106,3 @@ The sign-in pages copy component class strings from [shadcn/ui](https://ui.shadc
 notice in `ui/styles/shadcn.css`) and ship the [Geist](https://github.com/vercel/geist-font) font (SIL Open
 Font License 1.1, `crates/genkan-ui/assets/LICENSE-Geist.txt`). The container image includes
 Mozilla's CA certificate bundle as packaged by nixpkgs (MPL-2.0).
-
-## References
-
-1. The Kubernetes Authors, "KEP-3331: Structured Authentication Configuration."
-   <https://github.com/kubernetes/enhancements/tree/master/keps/sig-auth/3331-structured-authentication-configuration>
-2. A. Kladov, "Large Rust Workspaces," Aug. 22, 2021.
-   <https://matklad.github.io/2021/08/22/large-rust-workspaces.html>
-3. D. L. Parnas, "On the criteria to be used in decomposing systems into modules," *Commun.
-   ACM*, vol. 15, no. 12, pp. 1053–1058, Dec. 1972, doi:
-   [10.1145/361598.361623](https://doi.org/10.1145/361598.361623).
-4. J. Lakos, *Large-Scale C++ Software Design*. Addison-Wesley, 1996.
-5. R. C. Martin, *Agile Software Development, Principles, Patterns, and Practices*. Prentice
-   Hall, 2002 (the Acyclic and Stable Dependencies Principles).
-6. A. Cockburn, "The Hexagonal (Ports & Adapters) Architecture," 2005.
-   <https://alistair.cockburn.us/hexagonal-architecture/>
-
-[kep-3331]: https://github.com/kubernetes/enhancements/tree/master/keps/sig-auth/3331-structured-authentication-configuration
-[matklad-workspaces]: https://matklad.github.io/2021/08/22/large-rust-workspaces.html
-[parnas]: https://doi.org/10.1145/361598.361623
-[cockburn]: https://alistair.cockburn.us/hexagonal-architecture/
