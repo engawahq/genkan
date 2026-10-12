@@ -2,15 +2,18 @@
 //!
 //! It serves only the internal metadata document (whose `jwks_uri` points back here) and the JWK
 //! set, over TLS with the certificate from the Secret `genkanctl kube-config` writes
-//! ([`genkan_k8s::internal_tls`]). The listener starts once that Secret exists and picks up a
-//! renewed certificate without a restart.
+//! ([`genkan_k8s::internal_tls`]). Startup binds the socket before spawning this task, as
+//! [Dex] does for its listeners: a bind error stops the process, not just internal discovery.
+//! The empty resolver rejects TLS handshakes until a usable certificate is loaded; polling
+//! replaces it without restarting the listener. Readiness depends only on signing keys.
+//!
+//! [Dex]: https://github.com/dexidp/dex/blob/05a2750/cmd/dex/serve.go
 //!
 //! The internal document differs from the public one only in `jwks_uri`: its `issuer` stays the
 //! public issuer, because kube-apiserver requires the fetched document to name its configured
 //! `issuer.url` ([`genkan_k8s::kube_config`] explains the mechanism). No authorization, token or
 //! sign-in endpoint is reachable here; this listener is the only one that terminates TLS itself.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,10 +24,9 @@ use genkan_k8s::internal_tls::{self, Material};
 use genkan_keys::manager::PublishedKeys;
 use genkan_oauth::discovery::ProviderMetadata;
 use genkan_oauth::metadata::{AppState, router};
-use genkan_tls::listener::{Resolver, TlsListener, server_config};
+use genkan_tls::listener::{Resolver, TlsListener};
 use k8s_openapi::api::core::v1::Secret;
 use kube::Api;
-use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -36,8 +38,6 @@ const EXPIRY_WARNING: Duration = Duration::from_hours(30 * 24);
 /// Settings of the internal listener.
 #[derive(Debug, Clone)]
 pub struct InternalConfig {
-    /// Address to bind.
-    pub listen: SocketAddr,
     /// The public issuer (the internal document keeps it).
     pub issuer: BaseUrl,
     /// Overrides the URL recorded in the Secret.
@@ -46,18 +46,18 @@ pub struct InternalConfig {
     pub max_age: Duration,
 }
 
-/// Runs the internal listener until `shutdown`: polls the certificate Secret, starts serving
-/// once it exists, and swaps in renewed certificates.
+/// Serves an already-bound socket until `shutdown`, polling for initial and renewed TLS material.
 pub async fn run<C: Clock>(
+    listener: TlsListener,
+    resolver: Arc<Resolver>,
     config: InternalConfig,
     secrets: Api<Secret>,
     keys: PublishedKeys,
     clock: C,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let resolver = Arc::new(Resolver::default());
     let (metadata_tx, metadata_rx) = watch::channel(Bytes::new());
-    let mut server: Option<JoinHandle<()>> = None;
+    let server = start(listener, &config, metadata_rx, keys, &shutdown);
     let mut reported_missing = false;
     let mut interval = tokio::time::interval(RELOAD_INTERVAL);
     loop {
@@ -96,8 +96,8 @@ pub async fn run<C: Clock>(
             continue;
         };
         warn_if_expiring(&material, clock.now());
-        resolver.set(Arc::clone(&material.key));
         let document = ProviderMetadata::new(&config.issuer, &url).to_bytes();
+        // Publish metadata before enabling the first successful TLS handshake.
         metadata_tx.send_if_modified(|current| {
             let changed = *current != document;
             if changed {
@@ -105,13 +105,9 @@ pub async fn run<C: Clock>(
             }
             changed
         });
-        if server.is_none() {
-            server = start(&config, &resolver, &metadata_rx, &keys, &shutdown, &url).await;
-        }
+        resolver.set(Arc::clone(&material.key));
     }
-    if let Some(server) = server
-        && let Err(error) = server.await
-    {
+    if let Err(error) = server.await {
         tracing::error!(%error, "internal listener failed");
     }
 }
@@ -127,40 +123,16 @@ fn warn_if_expiring(material: &Material, now: UnixTime) {
     }
 }
 
-async fn start(
+fn start(
+    listener: TlsListener,
     config: &InternalConfig,
-    resolver: &Arc<Resolver>,
-    metadata: &watch::Receiver<Bytes>,
-    keys: &PublishedKeys,
+    metadata: watch::Receiver<Bytes>,
+    keys: PublishedKeys,
     shutdown: &watch::Receiver<bool>,
-    url: &BaseUrl,
-) -> Option<JoinHandle<()>> {
-    let tls = match server_config(Arc::clone(resolver)) {
-        Ok(tls) => tls,
-        Err(error) => {
-            tracing::error!(%error, "internal listener: TLS configuration");
-            return None;
-        }
-    };
-    let listener = match TcpListener::bind(config.listen).await {
-        Ok(tcp) => TlsListener::new(tcp, tls),
-        Err(error) => Err(error),
-    };
-    let listener = match listener {
-        Ok(listener) => listener,
-        Err(error) => {
-            tracing::error!(%error, address = %config.listen, "internal listener: bind failed");
-            return None;
-        }
-    };
-    tracing::info!(address = %config.listen, %url, "internal listener serving");
-    let app = router(AppState::dynamic(
-        metadata.clone(),
-        keys.clone(),
-        config.max_age,
-    ));
+) -> JoinHandle<()> {
+    let app = router(AppState::dynamic(metadata, keys, config.max_age));
     let mut shutdown = shutdown.clone();
-    Some(tokio::spawn(async move {
+    tokio::spawn(async move {
         let stopped = async move {
             drop(shutdown.wait_for(|stop| *stop).await);
         };
@@ -170,7 +142,7 @@ async fn start(
         {
             tracing::error!(%error, "internal listener stopped");
         }
-    }))
+    })
 }
 
 #[cfg(test)]
@@ -179,11 +151,12 @@ mod tests {
 
     use genkan_k8s::internal_tls::{internal_url, parse, secret};
     use genkan_tls::certificate::issue;
+    use genkan_tls::listener::server_config;
     use rustls::pki_types::pem::PemObject as _;
     use rustls::pki_types::{CertificateDer, ServerName};
     use rustls::{ClientConfig, RootCertStore};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-    use tokio::net::TcpStream;
+    use tokio::net::{TcpListener, TcpStream};
     use tokio_rustls::TlsConnector;
 
     use super::*;
@@ -203,8 +176,8 @@ mod tests {
         TlsConnector::from(Arc::new(config))
     }
 
-    /// The issued certificate verifies for its IP (as kube-apiserver checks it), serves the
-    /// metadata over TLS, and a renewed certificate is used without restarting the listener.
+    /// Before a certificate is loaded, TLS is refused; loading and renewing one enables
+    /// discovery on the same pre-bound listener without a restart.
     #[tokio::test]
     async fn serves_metadata_with_the_issued_certificate_and_renews_in_place() {
         let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -217,17 +190,22 @@ mod tests {
         let first = issue(ip, &[], now, Duration::from_hours(1)).unwrap();
         let url = internal_url(ip).unwrap();
         let resolver = Arc::new(Resolver::default());
-        resolver.set(parse(&secret("ns", &first, &url)).unwrap().key);
 
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp.local_addr().unwrap();
         let listener =
             TlsListener::new(tcp, server_config(Arc::clone(&resolver)).unwrap()).unwrap();
-        let address = axum::serve::Listener::local_addr(&listener).unwrap();
         let issuer = BaseUrl::parse("issuer", "https://login.example.com").unwrap();
         let metadata = ProviderMetadata::new(&issuer, &url).to_bytes();
         let (_keys_tx, keys) = watch::channel(None);
-        let app = router(AppState::new(metadata, keys, Duration::from_mins(5)));
-        tokio::spawn(async move { axum::serve(listener, app).await });
+        let (_metadata_tx, metadata) = watch::channel(metadata);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = InternalConfig {
+            issuer,
+            url: None,
+            max_age: Duration::from_mins(5),
+        };
+        let server = start(listener, &config, metadata, keys, &shutdown_rx);
 
         let fetch = |ca: String| async move {
             let tcp = TcpStream::connect(address).await.unwrap();
@@ -242,6 +220,8 @@ mod tests {
             std::io::Result::Ok(response)
         };
 
+        assert!(fetch(first.ca_pem.clone()).await.is_err());
+        resolver.set(parse(&secret("ns", &first, &url)).unwrap().key);
         let response = fetch(first.ca_pem.clone()).await.unwrap();
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert!(response.contains(r#""issuer":"https://login.example.com""#));
@@ -257,5 +237,7 @@ mod tests {
                 .unwrap()
                 .starts_with("HTTP/1.1 200")
         );
+        shutdown_tx.send_replace(true);
+        server.await.unwrap();
     }
 }

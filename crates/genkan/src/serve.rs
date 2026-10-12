@@ -1,8 +1,8 @@
 //! `genkan`: wires configuration, storage, keys and HTTP together.
 //!
-//! Startup order: signing keys are reconciled once (and the process exits if that fails), then
-//! the background tasks start (key rotation, garbage collection of grants and, with invitations,
-//! of invitations, the mailer, the internal listener), and only then is the public port bound.
+//! Startup order: Kubernetes mode binds the internal port first, failing immediately if it is
+//! unavailable. Signing keys are then reconciled once, background tasks start (key rotation,
+//! garbage collection, optional mailer, internal TLS), and the public port is bound.
 //! With the Kubernetes store, if the API server becomes unreachable, Genkan keeps serving the
 //! last published keys; logins and refreshes that need a write fail closed, and the background
 //! tasks retry.
@@ -11,6 +11,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::serve::Listener as _;
 use genkan_core::clock::SystemClock;
 use genkan_core::crypto::{Sealer, hash_secret};
 use genkan_k8s::crd::grant::Grant;
@@ -39,6 +40,7 @@ use genkan_store::{
     CredentialStore, Directory, GrantStore, MemoryCredentialStore, MemoryDirectory,
     MemoryGrantStore, MemorySetupStore, SetupStore,
 };
+use genkan_tls::listener::{Resolver, TlsListener, server_config};
 use k8s_openapi::api::core::v1::Secret;
 use kube::Client;
 use kube::api::Api;
@@ -110,6 +112,11 @@ pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
             namespace,
             key_secret,
         } => {
+            let internal_listener = TcpListener::bind(config.internal_listen).await?;
+            let resolver = Arc::new(Resolver::default());
+            let tls = server_config(Arc::clone(&resolver)).map_err(io::Error::other)?;
+            let internal_listener = TlsListener::new(internal_listener, tls)?;
+            tracing::info!(address = %internal_listener.local_addr()?, "internal listener bound");
             let client = Client::try_default().await?;
             let namespace = namespace
                 .clone()
@@ -161,7 +168,7 @@ pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
                 &config,
                 (keys, directory, grants, credentials, setup),
                 background.into_iter().chain([gc]).collect(),
-                Some(internal_secrets),
+                Some((internal_listener, resolver, internal_secrets)),
                 scim,
                 shutdown_tx,
             )
@@ -256,7 +263,7 @@ async fn run<S: KeyStore, D: Directory, G: GrantStore, K: CredentialStore, T: Se
     config: &ServeConfig,
     (keys, directory, grants, credentials, setup): (S, D, G, K, T),
     mut background: Vec<JoinHandle<()>>,
-    internal_secrets: Option<Api<Secret>>,
+    internal_listener: Option<(TlsListener, Arc<Resolver>, Api<Secret>)>,
     scim: Option<axum::Router>,
     shutdown_tx: watch::Sender<bool>,
 ) -> Result<(), ServeError> {
@@ -270,14 +277,15 @@ async fn run<S: KeyStore, D: Directory, G: GrantStore, K: CredentialStore, T: Se
         async move { manager.run(RECONCILE_INTERVAL, shutdown).await }
     });
 
-    if let Some(secrets) = internal_secrets {
+    if let Some((listener, resolver, secrets)) = internal_listener {
         let internal = InternalConfig {
-            listen: config.internal_listen,
             issuer: config.issuer.clone(),
             url: config.internal_url.clone(),
             max_age: config.metadata_max_age,
         };
         background.push(tokio::spawn(internal::run(
+            listener,
+            resolver,
             internal,
             secrets,
             manager.subscribe(),

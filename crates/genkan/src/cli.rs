@@ -161,7 +161,8 @@ pub struct ServeArgs {
     pub elevated_token_lifetime: Duration,
 
     /// Address of the internal TLS listener kube-apiserver fetches discovery and keys from.
-    /// It starts once `genkanctl kube-config` has issued its certificate (Kubernetes store only).
+    /// Binds at startup; TLS handshakes fail until `genkanctl kube-config` issues its certificate
+    /// (Kubernetes store only).
     #[arg(long, env = "GENKAN_INTERNAL_LISTEN", default_value = "0.0.0.0:8443")]
     pub internal_listen: SocketAddr,
 
