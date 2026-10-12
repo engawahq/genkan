@@ -23,7 +23,8 @@ mod tests {
     use genkan_core::clock::{Clock as _, SystemClock};
     use genkan_core::config::BaseUrl;
     use genkan_k8s::crd::client::{ClientType, OAuthClient, OAuthClientSpec};
-    use genkan_k8s::crd::definitions;
+    use genkan_k8s::crd::credential::Credential;
+    use genkan_k8s::crd::{USER_LABEL, definitions};
     use genkan_k8s::kube_config::{self, DiscoveryMode, Distro};
     use genkan_k8s::setup::issue_setup_link;
     use genkan_k8s::{deployment, rbac};
@@ -287,6 +288,24 @@ mod tests {
         .await;
         assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
         reply.json()
+    }
+
+    async fn refresh(address: &str, token: &str) -> Reply {
+        let form = form_urlencoded::Serializer::new(String::new())
+            .extend_pairs([
+                ("grant_type", "refresh_token"),
+                ("client_id", "kubectl"),
+                ("refresh_token", token),
+            ])
+            .finish();
+        http(
+            address,
+            Method::POST,
+            "/token",
+            &[],
+            Some(("application/x-www-form-urlencoded", form)),
+        )
+        .await
     }
 
     #[tokio::test]
@@ -573,6 +592,34 @@ mod tests {
             working_set <= 30 * 1024 * 1024,
             "working set {working_set} bytes exceeds 30 MiB"
         );
+
+        // A partial reset can remove credentials while leaving a usable refresh-token family.
+        // Prove the family's current token works, then retry reset with no credentials left.
+        let refreshed = refresh(&address, tokens["refresh_token"].as_str().unwrap()).await;
+        assert_eq!(refreshed.status, StatusCode::OK, "{:?}", refreshed.body);
+        let refreshed = refreshed.json();
+        let current_refresh = refreshed["refresh_token"].as_str().unwrap();
+        let credentials: Api<Credential> = Api::namespaced(admin.clone(), &namespace);
+        let selector = ListParams::default().labels(&format!("{USER_LABEL}=admin"));
+        credentials
+            .delete_collection(&DeleteParams::default(), &selector)
+            .await
+            .unwrap();
+        assert!(credentials.list(&selector).await.unwrap().items.is_empty());
+        issue_setup_link(
+            admin.clone(),
+            &namespace,
+            &issuer,
+            "admin",
+            Duration::from_mins(10),
+            true,
+            SystemClock.now(),
+        )
+        .await
+        .unwrap();
+        let denied = refresh(&address, current_refresh).await;
+        assert_eq!(denied.status, StatusCode::BAD_REQUEST, "{:?}", denied.body);
+        assert_eq!(denied.json()["error"], "invalid_grant");
 
         // Clean up: forget the issuer, remove the namespace.
         write_authn(&authn_dir, EMPTY_AUTHN);

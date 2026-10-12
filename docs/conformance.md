@@ -110,6 +110,7 @@ its container image.
 | Project requirement | Signing keys in a Secret, rotation with overlap | `genkan-k8s/src/keys.rs` | `signing_keys_persist_and_only_one_writer_wins` *(cluster)* | Met |
 | WebAuthn Level 3 §7.1 | A known credential ID fails registration | `genkan-store` `passkey_credential_name`, create-once | `genkan-signin/tests/signin.rs`; `setup_link_is_single_use_and_replaceable` *(cluster)* | Met |
 | RFC 9700 §4.14.2 | Refresh rotation with reuse detection | `genkan-k8s/src/grants.rs`, `genkan-store` `classify` | `grant_rotation_is_linearizable` *(cluster: 1 of 64 rotates)* | Met |
+| Project account-recovery policy; RFC 9700 §4.14.2 (security-event revocation, MAY) | Reset deletes credentials and refresh-token families before writing a setup link, including zero-credential retries after partial failure | `genkan-k8s/src/setup.rs` | `genkan-k8s/tests/setup_reset.rs: reset_retries_grant_deletion_after_credentials_are_gone`, `reset_revokes_old_grants_without_credentials` (mock Kubernetes HTTP API, real OAuth router); `genkan-e2e/tests/e2e.rs: passkey_sign_in_then_kubectl_auth_whoami` *(cluster: refresh succeeds before reset and fails afterward)* | Met |
 
 ## OAuth 2.0 and OpenID Connect
 

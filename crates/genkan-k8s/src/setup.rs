@@ -12,6 +12,14 @@
 //! send to servers or proxies. A user who already has passkeys gets a link only with `--reset`,
 //! which also deletes the user's credentials and grants: otherwise the link's holder could add a
 //! passkey to an account that someone else controls.
+//!
+//! Reset always deletes both collections, even when there are no credentials left. A failed
+//! grant deletion may follow a successful credential deletion, so a retry cannot use the
+//! credential count as evidence that sessions are gone. No setup Secret is written until both
+//! deletions succeed. This implements Genkan's account-recovery policy using the security-event
+//! refresh-token revocation permitted by [RFC 9700 §4.14.2].
+//!
+//! [RFC 9700 §4.14.2]: https://www.rfc-editor.org/rfc/rfc9700.html#section-4.14.2
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -262,13 +270,13 @@ pub async fn issue_setup_link(
     let selector = ListParams::default().labels(&format!("{USER_LABEL}={username}"));
     let credentials: Api<Credential> = Api::namespaced(client.clone(), namespace);
     let existing = credentials.list(&selector).await?.items.len();
-    if existing > 0 {
-        if !reset {
-            return Err(SetupLinkError::HasCredentials {
-                user: username.to_owned(),
-                count: existing,
-            });
-        }
+    if existing > 0 && !reset {
+        return Err(SetupLinkError::HasCredentials {
+            user: username.to_owned(),
+            count: existing,
+        });
+    }
+    if reset {
         credentials
             .delete_collection(&DeleteParams::default(), &selector)
             .await?;
