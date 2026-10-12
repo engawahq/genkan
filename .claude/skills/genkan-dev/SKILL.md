@@ -20,7 +20,7 @@ description: Day-to-day development loop for the Genkan repository — environme
 nix develop -c cargo fmt --all
 nix develop -c cargo lint          # clippy --workspace --all-targets --all-features --locked -D warnings
 RUSTDOCFLAGS="-D warnings" nix develop -c cargo doc --workspace --no-deps --document-private-items --locked
-nix develop -c cargo nextest run --workspace
+nix develop -c cargo nextest run --workspace --all-features --locked --no-tests=warn
 nix develop -c cargo deny --locked check
 nix develop -c ./scripts/unsafe-report.sh
 nix develop -c bash -c 'shellcheck scripts/*.sh && actionlint && nixfmt --check flake.nix'
