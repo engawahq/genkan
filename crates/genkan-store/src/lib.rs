@@ -89,6 +89,14 @@ pub trait Directory: Send + Sync + 'static {
     fn client(&self, id: &str) -> impl Future<Output = Result<Option<Client>, StoreError>> + Send;
     /// Looks up a user by object name.
     fn user(&self, name: &str) -> impl Future<Output = Result<Option<User>, StoreError>> + Send;
+    /// Looks up a user by immutable subject (the object UID), with current authorization data.
+    ///
+    /// Adapters may use a metadata index to locate the object, but must verify the UID of the
+    /// directly read user. Ambiguous subjects fail closed.
+    fn user_by_subject(
+        &self,
+        subject: &str,
+    ) -> impl Future<Output = Result<Option<User>, StoreError>> + Send;
 }
 
 /// A refresh-token family to create.
@@ -278,6 +286,22 @@ impl Directory for MemoryDirectory {
     fn user(&self, name: &str) -> impl Future<Output = Result<Option<User>, StoreError>> + Send {
         let users = self.users.lock().unwrap_or_else(PoisonError::into_inner);
         future::ready(Ok(users.get(name).cloned()))
+    }
+
+    fn user_by_subject(
+        &self,
+        subject: &str,
+    ) -> impl Future<Output = Result<Option<User>, StoreError>> + Send {
+        let users = self.users.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut matches = users.values().filter(|user| user.subject == subject);
+        let user = matches.next().cloned();
+        let result = if matches.next().is_some() {
+            Err(StoreError("ambiguous user subject".to_owned()))
+        } else {
+            Ok(user)
+        };
+        drop(users);
+        future::ready(result)
     }
 }
 

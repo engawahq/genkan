@@ -24,6 +24,7 @@ mod tests {
     use genkan_core::config::BaseUrl;
     use genkan_k8s::crd::client::{ClientType, OAuthClient, OAuthClientSpec};
     use genkan_k8s::crd::credential::Credential;
+    use genkan_k8s::crd::user::User;
     use genkan_k8s::crd::{USER_LABEL, definitions};
     use genkan_k8s::kube_config::{self, DiscoveryMode, Distro};
     use genkan_k8s::setup::issue_setup_link;
@@ -567,6 +568,34 @@ mod tests {
         .await;
         let access_token = tokens["access_token"].as_str().unwrap();
         let id_token = tokens["id_token"].as_str().unwrap();
+
+        // UserInfo resolves metadata by UID without changing the token contract, then checks
+        // the latest user spec. A disable must take effect without waiting for a watch update.
+        let users: Api<User> = Api::namespaced(admin.clone(), &namespace);
+        let subject = users.get("admin").await.unwrap().uid().unwrap();
+        let authorization = format!("Bearer {access_token}");
+        let headers = [("authorization", authorization.as_str())];
+        let info = http(&address, Method::GET, "/userinfo", &headers, None).await;
+        assert_eq!(info.status, StatusCode::OK);
+        assert_eq!(info.json(), json!({"sub": subject}));
+        users
+            .patch(
+                "admin",
+                &PatchParams::default(),
+                &Patch::Merge(json!({"spec": {"disabled": true}})),
+            )
+            .await
+            .unwrap();
+        let disabled = http(&address, Method::GET, "/userinfo", &headers, None).await;
+        assert_eq!(disabled.status, StatusCode::UNAUTHORIZED);
+        users
+            .patch(
+                "admin",
+                &PatchParams::default(),
+                &Patch::Merge(json!({"spec": {"disabled": false}})),
+            )
+            .await
+            .unwrap();
 
         // kube-apiserver accepts the access token once it has loaded the configuration.
         let scratch = std::env::temp_dir();

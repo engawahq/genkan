@@ -14,12 +14,11 @@
 //!   `Bearer` challenge, and a bad one `invalid_token` (RFC 6750 §3).
 //! - Responses carry `Cache-Control: no-store`.
 //!
-//! The signed private `genkan_user` object-name claim selects one direct directory read, never
-//! a subject search. Its user's UID must equal `sub`, so deleting, renaming or recreating an
-//! object cannot redirect an existing token to another identity. Missing locators fail closed:
-//! tokens minted before this claim was introduced need renewal for UserInfo, but remain usable
-//! by kube-apiserver until expiry. The response always carries the grant's subject, consistent
-//! with [OIDC Core §5.3.2]'s subject requirement and client-side substitution check.
+//! The directory resolves the immutable `sub` UID through metadata, then directly reads the
+//! current user and verifies that UID before returning claims. Neither a renamed/recreated
+//! object nor stale index metadata can substitute another identity. No additional access-token
+//! claim is required, so previously issued tokens remain usable. The response subject follows
+//! [OIDC Core §5.3.2]'s requirement and client-side substitution check.
 //!
 //! [OIDC Core §5.3.2]: https://openid.net/specs/openid-connect-core-1_0.html#UserInfoResponse
 
@@ -40,7 +39,6 @@ use super::error::no_store;
 struct AccessClaims {
     iss: String,
     sub: String,
-    genkan_user: String,
     exp: u64,
     client_id: String,
     #[serde(default)]
@@ -108,7 +106,6 @@ pub async fn userinfo<D: Directory, G: GrantStore, C: Clock>(
         || claims.iss != server.issuer.as_str()
         || claims.exp <= server.now().as_secs()
         || claims.client_id.is_empty()
-        || claims.genkan_user.is_empty()
     {
         return invalid();
     }
@@ -116,7 +113,7 @@ pub async fn userinfo<D: Directory, G: GrantStore, C: Clock>(
     if !scopes.contains(&"openid") {
         return challenge(StatusCode::FORBIDDEN, Some("insufficient_scope"));
     }
-    let user = match server.directory.user(&claims.genkan_user).await {
+    let user = match server.directory.user_by_subject(&claims.sub).await {
         Ok(Some(user)) if user.subject == claims.sub && !user.disabled => user,
         Ok(_) => return invalid(),
         Err(error) => {

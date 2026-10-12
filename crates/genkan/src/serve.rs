@@ -1,8 +1,9 @@
 //! `genkan`: wires configuration, storage, keys and HTTP together.
 //!
-//! Startup order: signing keys are reconciled once (and the process exits if that fails), then
-//! the background tasks start (key rotation, garbage collection of grants and, with invitations,
-//! of invitations, the mailer, the internal listener), and only then is the public port bound.
+//! Startup refuses to bind the public port until Kubernetes directory metadata watches publish
+//! their initial snapshots and signing keys are reconciled. Background tasks watch directory
+//! metadata, rotate keys, collect expired grants and invitations, send mail and serve the internal
+//! listener. Startup failure signals shutdown to any tasks already running.
 //! With the Kubernetes store, if the API server becomes unreachable, Genkan keeps serving the
 //! last published keys; logins and refreshes that need a write fail closed, and the background
 //! tasks retry.
@@ -59,8 +60,8 @@ const RECONCILE_INTERVAL: Duration = Duration::from_mins(1);
 const MAX_BODY: usize = 16 * 1024;
 /// Maximum time to handle one request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-/// Four independent groups reserve capacity within the original 256-request budget.
-const GROUP_CONCURRENT: usize = 64;
+/// Each business route/method service has its own admission budget.
+const ROUTE_CONCURRENT: usize = 64;
 
 /// Why the server stopped with an error.
 #[derive(Debug, Error)]
@@ -72,6 +73,9 @@ pub enum ServeError {
     /// Signing keys could not be prepared at startup.
     #[error("preparing signing keys: {0}")]
     Keys(#[from] ManagerError),
+    /// Kubernetes directory metadata could not be synchronized at startup.
+    #[error("preparing directory metadata: {0}")]
+    Directory(#[from] genkan_store::StoreError),
     /// The process sealing key could not be created.
     #[error("creating the process sealing key failed")]
     Crypto,
@@ -91,6 +95,7 @@ pub enum ServeError {
 /// fails.
 pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let outcome = async {
     match &config.store {
         Store::Memory => {
             tracing::warn!(
@@ -105,7 +110,7 @@ pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
                 MemorySetupStore::default(),
             );
             let scim = scim_router(&config, MemoryUserAdmin::default())?;
-            run(&config, stores, Vec::new(), None, scim, shutdown_tx).await
+            run(&config, stores, Vec::new(), None, scim, shutdown_tx.clone()).await
         }
         Store::Kubernetes {
             namespace,
@@ -120,14 +125,21 @@ pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
                 Api::namespaced(client.clone(), &namespace),
                 key_secret.clone(),
             );
-            let directory = KubeDirectory::new(
+            let mut background = Vec::new();
+            let (directory, watcher) = KubeDirectory::new(
                 Api::namespaced(client.clone(), &namespace),
                 Api::namespaced(client.clone(), &namespace),
+                shutdown_rx.clone(),
             );
+            background.push(watcher);
+            tokio::time::timeout(Duration::from_secs(30), directory.wait_until_ready())
+                .await
+                .map_err(|_elapsed| {
+                    ServeError::Config("directory metadata initial synchronization timed out".into())
+                })??;
             let grants = KubeGrantStore::new(Api::namespaced(client.clone(), &namespace));
             let credentials = KubeCredentialStore::new(Api::namespaced(client.clone(), &namespace));
             let mut setup = KubeSetupStore::new(Api::namespaced(client.clone(), &namespace));
-            let mut background = Vec::new();
             if config.invitations {
                 setup = setup.with_invitations(Api::namespaced(client.clone(), &namespace));
                 background.push(tokio::spawn({
@@ -164,11 +176,15 @@ pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
                 background.into_iter().chain([gc]).collect(),
                 Some(internal_secrets),
                 scim,
-                shutdown_tx,
+                shutdown_tx.clone(),
             )
             .await
         }
     }
+    }.await;
+    // Startup failures must also terminate any watchers already spawned.
+    shutdown_tx.send_replace(true);
+    outcome
 }
 
 /// The SCIM routes, if SCIM is enabled: reads the token file and keeps only its hash.
@@ -242,105 +258,68 @@ fn mailer(config: &MailConfig) -> Result<Mailer, ServeError> {
         .map_err(|error| ServeError::Config(error.to_string()))
 }
 
-/// One group's admission budget and process-lifetime rejection counter.
-struct RequestGroup {
-    name: &'static str,
-    slots: tokio::sync::Semaphore,
-    rejected: AtomicU64,
-}
-
-impl RequestGroup {
-    fn new(name: &'static str) -> Self {
-        Self {
-            name,
-            slots: tokio::sync::Semaphore::new(GROUP_CONCURRENT),
-            rejected: AtomicU64::new(0),
-        }
-    }
-}
-
-/// Independent budgets prevent authorization traffic from exhausting token or sign-in capacity.
-struct RequestLimits {
-    authorization: RequestGroup,
-    tokens: RequestGroup,
-    signin: RequestGroup,
-    other: RequestGroup,
-}
-
-impl RequestLimits {
-    fn new() -> Self {
-        Self {
-            authorization: RequestGroup::new("authorization"),
-            tokens: RequestGroup::new("tokens"),
-            signin: RequestGroup::new("signin"),
-            other: RequestGroup::new("other"),
-        }
-    }
-
-    fn group(&self, path: &str) -> &RequestGroup {
-        match path {
-            "/authorize" | "/par" => &self.authorization,
-            "/token" | "/revoke" => &self.tokens,
-            path if path == "/login"
-                || path.starts_with("/login/")
-                || path == "/setup"
-                || path.starts_with("/setup/")
-                || path.starts_with("/upstream/") =>
-            {
-                &self.signin
-            }
-            _ => &self.other,
-        }
-    }
-}
-
-/// Rejects overload before reading a body, with no queue outside the handler timeout.
-///
-/// A borrowed permit is held until the handler completes, and released on cancellation or
-/// timeout. Responses are small, non-streaming forms/JSON/pages. Overload uses `503` and a
-/// one-second retry suggestion ([RFC 9110 §15.6.4 and §10.2.3]).
-///
-/// [RFC 9110 §15.6.4 and §10.2.3]: https://www.rfc-editor.org/rfc/rfc9110.html#section-15.6.4
-async fn admit(
-    axum::extract::State(limits): axum::extract::State<Arc<RequestLimits>>,
-    request: axum::extract::Request,
-    next: axum::middleware::Next,
+/// Maps load shedding to an immediate retryable response without logging request secrets.
+fn admission_error(
+    error: &axum::BoxError,
+    rejected: &AtomicU64,
+    router: &'static str,
 ) -> axum::response::Response {
     use axum::http::{StatusCode, header};
     use axum::response::IntoResponse as _;
 
-    let group = limits.group(request.uri().path());
-    let Ok(_permit) = group.slots.try_acquire() else {
-        let rejected_total = group.rejected.fetch_add(1, Ordering::Relaxed) + 1;
+    if error.is::<tower::load_shed::error::Overloaded>() {
+        let rejected_total = rejected.fetch_add(1, Ordering::Relaxed) + 1;
         tracing::warn!(
             event = "request_overload",
-            group = group.name,
+            router,
             rejected_total,
             "request rejected for load"
         );
-        return (
+        (
             StatusCode::SERVICE_UNAVAILABLE,
             [
                 (header::RETRY_AFTER, "1"),
                 (header::CACHE_CONTROL, "no-store"),
             ],
         )
-            .into_response();
-    };
-    next.run(request).await
+            .into_response()
+    } else {
+        tracing::error!("unexpected request admission error");
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    }
 }
 
-/// Body and time limits are universal; concurrency admission reserves per-group capacity.
+/// Limits each route/method independently, rather than sharing a semaphore across the router.
+///
+/// Load shedding polls the limiter before calling it, so saturation never queues outside the
+/// universal timeout. Permits are released on handler completion, cancellation or timeout.
+/// Overload uses `503` with a one-second retry suggestion ([RFC 9110 §15.6.4]).
+///
+/// [RFC 9110 §15.6.4]: https://www.rfc-editor.org/rfc/rfc9110.html#section-15.6.4
+fn business_limits(router: axum::Router, name: &'static str) -> axum::Router {
+    let rejected = Arc::new(AtomicU64::new(0));
+    // Materialize deferred handlers once: otherwise axum can rebuild a per-service semaphore
+    // when supplying state at request/connection time instead of sharing it across route clones.
+    router.with_state(()).layer(
+        tower::ServiceBuilder::new()
+            .layer(axum::error_handling::HandleErrorLayer::new(
+                move |error: axum::BoxError| {
+                    let rejected = Arc::clone(&rejected);
+                    async move { admission_error(&error, &rejected, name) }
+                },
+            ))
+            .load_shed()
+            .concurrency_limit(ROUTE_CONCURRENT),
+    )
+}
+
+/// Body and time limits apply universally, including metadata and probes.
 fn limits(router: axum::Router) -> axum::Router {
     router
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))
         .layer(tower_http::timeout::TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
             REQUEST_TIMEOUT,
-        ))
-        .layer(axum::middleware::from_fn_with_state(
-            Arc::new(RequestLimits::new()),
-            admit,
         ))
 }
 
@@ -409,24 +388,36 @@ async fn run<S: KeyStore, D: Directory, G: GrantStore, K: CredentialStore, T: Se
         manager.subscribe(),
         config.metadata_max_age,
     ))
-    .merge(endpoints::router(Arc::clone(&server)))
-    .merge(genkan_signin::router(Arc::clone(&sign_in)))
-    .merge(pages::router(Arc::clone(&server), &kinds));
+    .merge(business_limits(
+        endpoints::router(Arc::clone(&server)),
+        "oauth",
+    ))
+    .merge(business_limits(
+        genkan_signin::router(Arc::clone(&sign_in)),
+        "signin",
+    ))
+    .merge(business_limits(
+        pages::router(Arc::clone(&server), &kinds),
+        "pages",
+    ));
     if !providers.is_empty() {
         let roots = genkan_tls::trust::roots(config.upstream_ca_file.as_deref())
             .map_err(|error| ServeError::Config(error.to_string()))?;
         let http =
             HyperClient::new(roots).map_err(|error| ServeError::Config(error.to_string()))?;
         tracing::info!(providers = ?kinds, "upstream sign-in enabled");
-        app = app.merge(upstream::router(Arc::new(Upstream {
-            sign_in,
-            providers,
-            http,
-            used_states: OneTimeIds::default(),
-        })));
+        app = app.merge(business_limits(
+            upstream::router(Arc::new(Upstream {
+                sign_in,
+                providers,
+                http,
+                used_states: OneTimeIds::default(),
+            })),
+            "upstream",
+        ));
     }
     if let Some(scim) = scim {
-        app = app.merge(scim);
+        app = app.merge(business_limits(scim, "scim"));
     }
     let app = limits(app);
     let listener = TcpListener::bind(config.listen).await?;
@@ -487,45 +478,59 @@ mod tests {
         Request::builder().uri(path).body(Body::empty()).unwrap()
     }
 
-    #[tokio::test]
-    async fn overloaded_authorization_does_not_block_token_or_signin() {
+    async fn assert_route_isolation(saturated: &'static str) {
         let entered = Arc::new(Semaphore::new(0));
         let release = Arc::new(Semaphore::new(0));
-        let app = limits(
-            axum::Router::new()
-                .route(
-                    "/authorize",
-                    get({
+        let business = axum::Router::new()
+            .route(
+                saturated,
+                get({
+                    let entered = Arc::clone(&entered);
+                    let release = Arc::clone(&release);
+                    move || {
                         let entered = Arc::clone(&entered);
                         let release = Arc::clone(&release);
-                        move || {
-                            let entered = Arc::clone(&entered);
-                            let release = Arc::clone(&release);
-                            async move {
-                                entered.add_permits(1);
-                                release.acquire().await.unwrap().forget();
-                                StatusCode::OK
-                            }
+                        async move {
+                            entered.add_permits(1);
+                            release.acquire().await.unwrap().forget();
+                            StatusCode::OK
                         }
-                    }),
-                )
-                .route("/par", get(|| async { StatusCode::OK }))
-                .route("/token", get(|| async { StatusCode::OK }))
-                .route("/login/options", get(|| async { StatusCode::OK })),
+                    }
+                })
+                .post(|| async { StatusCode::OK }),
+            )
+            .route("/par", get(|| async { StatusCode::OK }))
+            .route("/token", get(|| async { StatusCode::OK }))
+            .route("/login/options", get(|| async { StatusCode::OK }));
+        let app = limits(
+            axum::Router::new()
+                .route("/readyz", get(|| async { StatusCode::OK }))
+                .route("/healthz", get(|| async { StatusCode::OK }))
+                .merge(business_limits(business, "test")),
         );
         let mut tasks = Vec::new();
-        for _ in 0..64 {
-            tasks.push(tokio::spawn(app.clone().oneshot(request("/authorize"))));
+        for _ in 0..ROUTE_CONCURRENT {
+            tasks.push(tokio::spawn(app.clone().oneshot(request(saturated))));
         }
-        entered.acquire_many(64).await.unwrap().forget();
-        let rejected =
-            tokio::time::timeout(Duration::from_secs(1), app.clone().oneshot(request("/par")))
-                .await
-                .expect("overload must not queue")
-                .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            entered.acquire_many(u32::try_from(ROUTE_CONCURRENT).unwrap()),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+        let rejected = tokio::time::timeout(
+            Duration::from_secs(1),
+            app.clone().oneshot(request(saturated)),
+        )
+        .await
+        .expect("overload must not queue")
+        .unwrap();
         assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(rejected.headers()[header::RETRY_AFTER], "1");
-        for path in ["/token", "/login/options"] {
+        assert_eq!(rejected.headers()[header::CACHE_CONTROL], "no-store");
+        for path in ["/par", "/token", "/login/options", "/readyz", "/healthz"] {
             let response =
                 tokio::time::timeout(Duration::from_secs(1), app.clone().oneshot(request(path)))
                     .await
@@ -533,13 +538,73 @@ mod tests {
                     .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
         }
-        release.add_permits(64);
+        // A different method of the saturated route also has its own budget.
+        let post = Request::builder()
+            .method("POST")
+            .uri(saturated)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), app.clone().oneshot(post))
+                .await
+                .unwrap()
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        // Cancellation releases one slot, without waiting for the other handlers.
+        let cancelled = tasks.pop().unwrap();
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        let replacement = tokio::spawn(app.clone().oneshot(request(saturated)));
+        tokio::time::timeout(Duration::from_secs(1), entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        release.add_permits(ROUTE_CONCURRENT);
+        tasks.push(replacement);
         for task in tasks {
             assert_eq!(task.await.unwrap().unwrap().status(), StatusCode::OK);
         }
+        // Completion releases all slots too.
+        release.add_permits(1);
         assert_eq!(
-            app.oneshot(request("/par")).await.unwrap().status(),
+            app.oneshot(request(saturated)).await.unwrap().status(),
             StatusCode::OK
         );
+    }
+
+    #[tokio::test]
+    async fn overloaded_authorization_is_isolated_per_route_and_method() {
+        assert_route_isolation("/authorize").await;
+    }
+
+    #[tokio::test]
+    async fn overloaded_userinfo_backend_does_not_block_probes() {
+        assert_route_isolation("/userinfo").await;
+    }
+
+    #[test]
+    fn admission_errors_count_only_overload() {
+        let rejected = Arc::new(AtomicU64::new(0));
+        for expected in 1..=2 {
+            let response = admission_error(
+                &tower::load_shed::error::Overloaded::new().into(),
+                &rejected,
+                "test",
+            );
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(rejected.load(Ordering::Relaxed), expected);
+        }
+        let response = admission_error(
+            &io::Error::other("unexpected middleware failure").into(),
+            &rejected,
+            "test",
+        );
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(rejected.load(Ordering::Relaxed), 2);
+        assert!(!response.headers().contains_key(header::RETRY_AFTER));
     }
 }

@@ -286,13 +286,21 @@ its own buckets unless distributed rate limiting is configured. See the
 [RateLimit options](https://doc.traefik.io/traefik/reference/routing-configuration/http/middlewares/ratelimit/)
 and [Gateway middleware prerequisites](https://doc.traefik.io/traefik/reference/routing-configuration/kubernetes/gateway-api/#extensionref-filters).
 
-Genkan additionally reserves 64 concurrent requests for each of four independent groups:
-authorization (`/authorize`, `/par`), tokens (`/token`, `/revoke`), sign-in (`/login*`,
-`/setup*`, `/upstream/*`), and other routes. A full group immediately returns `503` with
-`Retry-After: 1`, without queuing ahead of the ten-second handler timeout. These are
-per-process concurrency limits, not per-IP rate limits. Structured `request_overload`
-events expose the group and cumulative rejection count; `kubernetes_directory_lookup` events
-expose resource, operation, outcome and API latency in milliseconds. Aggregate them in your log backend.
+Genkan additionally limits each business route/method service to 64 concurrent requests.
+Full services immediately return `503` with `Retry-After: 1`, without queuing ahead of the
+ten-second handler timeout. Health/readiness probes and discovery/keys do not share those
+slots. These are per-process concurrency limits, not per-IP rate limits. Structured
+`request_overload` events expose cumulative rejection counts; `kubernetes_directory_lookup`
+events expose resource, operation, outcome and API latency in milliseconds.
+Aggregate them in your log backend.
+
+Kubernetes directory metadata is watched before the public listener starts. Unknown client
+names are rejected locally, including a flood of distinct random IDs; known clients still
+use a direct GET so secret, redirect URI and audience changes take effect on the next request.
+UserInfo resolves `sub` from watched user metadata and directly reads the user to verify its
+UID and enabled state. Access-token claims do not change. New objects become visible after
+their watch events arrive; watch lag can delay sign-ins, never authorize stale client/user
+data. There is no per-ID API-read fallback for unknown index entries.
 
 ## 6. Let kube-apiserver trust Genkan
 

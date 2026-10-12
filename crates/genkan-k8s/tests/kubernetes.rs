@@ -861,10 +861,17 @@ mod tests {
             RotationPolicy::DEFAULT,
         );
         manager.reconcile().await.unwrap();
+        let (directory_shutdown, directory_shutdown_rx) = watch::channel(false);
+        let (directory, directory_task) =
+            KubeDirectory::new(env.genkan_api(), env.genkan_api(), directory_shutdown_rx);
+        tokio::time::timeout(Duration::from_secs(30), directory.wait_until_ready())
+            .await
+            .unwrap()
+            .unwrap();
         let server = Arc::new(AuthorizationServer {
             issuer: BaseUrl::parse("issuer", "https://login.example.com").unwrap(),
             lifetimes: Lifetimes::DEFAULT,
-            directory: KubeDirectory::new(env.genkan_api(), env.genkan_api()),
+            directory,
             grants: KubeGrantStore::new(env.genkan_api()),
             clock: SystemClock,
             keys: manager.subscribe(),
@@ -981,6 +988,8 @@ mod tests {
         ]))
         .await;
         assert_eq!(status, 400);
+        directory_shutdown.send(true).unwrap();
+        directory_task.await.unwrap();
         env.cleanup().await;
     }
 

@@ -1,127 +1,169 @@
 //! [`Directory`] backed by `User` and `OAuthClient` objects.
 //!
-//! Users and known clients are read by name on every request, so disabling a user or changing
-//! a client takes effect immediately. Only absent clients are cached: five seconds of monotonic
-//! time, at most 1024 names, shared by clones. This limits repeated unknown-client API reads
-//! without retaining stale authorization data; a newly created client can take five seconds to
-//! appear. Backend errors are never cached.
+//! Metadata-only watches index client names and user UIDs; arbitrary unknown identifiers never
+//! cause per-request API reads. The initial snapshots must complete before any lookup. Relists
+//! replace each index atomically, and watch errors retry with backoff without falling back to
+//! per-identifier reads.
+//!
+//! An index is only a locator, never authorization data: known clients and users are read directly
+//! on every request. Watch lag may temporarily deny a new object, but cannot retain a revoked
+//! permission or client secret. Subject lookups also compare the fetched UID, because Kubernetes
+//! permits a deleted object's name to be reused but assigns every new object a distinct [UID].
+//! Ambiguous subjects fail closed.
+//!
+//! [UID]: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#uids
 
-use std::collections::{HashMap, VecDeque};
-use std::future::Future;
-use std::sync::Arc;
+use std::fmt::Debug;
 use std::time::{Duration, Instant};
 
+use futures_util::StreamExt as _;
 use genkan_keys::Algorithm;
 use genkan_store::{Client, Directory, StoreError, User};
-use kube::ResourceExt as _;
 use kube::api::Api;
-use tokio::sync::Mutex;
+use kube::core::{NamespaceResourceScope, PartialObjectMeta};
+use kube::runtime::WatchStreamExt as _;
+use kube::runtime::reflector::Store;
+use kube::runtime::reflector::store::Writer;
+use kube::runtime::watcher::{self, watcher};
+use kube::{Resource, ResourceExt as _};
+use serde::de::DeserializeOwned;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 
 use crate::crd::client::OAuthClient;
 use crate::crd::user::User as UserObject;
 
-/// Reads clients and users from the API server.
+/// Locates clients and user subjects through metadata, then reads current API objects.
 #[derive(Clone)]
 pub struct KubeDirectory {
     clients: Api<OAuthClient>,
     users: Api<UserObject>,
-    missing_clients: Arc<Mutex<NegativeClients>>,
+    client_index: Store<PartialObjectMeta<OAuthClient>>,
+    user_index: Store<PartialObjectMeta<UserObject>>,
 }
 
-impl std::fmt::Debug for KubeDirectory {
+impl Debug for KubeDirectory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("KubeDirectory")
     }
 }
 
 impl KubeDirectory {
-    /// Uses the given (namespaced) APIs and a bounded, shared negative client cache.
+    /// Starts metadata-only watches in the same namespaces as the supplied APIs.
+    ///
+    /// Keep the returned task alive until shutdown and call [`Self::wait_until_ready`] before
+    /// serving requests. Aborting the task before its initial snapshots makes readiness fail.
     #[must_use]
-    pub fn new(clients: Api<OAuthClient>, users: Api<UserObject>) -> Self {
-        Self {
+    pub fn new(
+        clients: Api<OAuthClient>,
+        users: Api<UserObject>,
+        shutdown: watch::Receiver<bool>,
+    ) -> (Self, JoinHandle<()>) {
+        let client_writer = Writer::default();
+        let user_writer = Writer::default();
+        let directory = Self {
+            client_index: client_writer.as_reader(),
+            user_index: user_writer.as_reader(),
             clients,
             users,
-            missing_clients: Arc::new(Mutex::new(NegativeClients::default())),
-        }
+        };
+        let client_metadata = metadata_api(&directory.clients);
+        let user_metadata = metadata_api(&directory.users);
+        let task = tokio::spawn(async move {
+            tokio::join!(
+                run_index(client_metadata, client_writer, shutdown.clone(), "client"),
+                run_index(user_metadata, user_writer, shutdown, "user"),
+            );
+        });
+        (directory, task)
     }
 
-    /// The clock seam keeps expiry tests deterministic without changing the runtime clock.
-    async fn client_at(
-        &self,
-        id: &str,
-        now: impl Fn() -> Instant + Send,
-    ) -> Result<Option<Client>, StoreError> {
-        {
-            let mut missing = self.missing_clients.lock().await;
-            if missing.contains(id, now()) {
-                return Ok(None);
-            }
-        }
+    /// Waits for both metadata indexes to contain their complete initial snapshots.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either watch task stops before its initial snapshot completes.
+    /// The caller must bound startup waiting when the API server remains unavailable.
+    pub async fn wait_until_ready(&self) -> Result<(), StoreError> {
+        tokio::try_join!(
+            self.client_index.wait_until_ready(),
+            self.user_index.wait_until_ready(),
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            StoreError(format!(
+                "directory metadata index did not initialize: {error}"
+            ))
+        })
+    }
+
+    async fn read_user(&self, name: &str) -> Result<Option<User>, StoreError> {
         let started = Instant::now();
-        let result = self.clients.get_opt(id).await;
-        record_lookup("client", started.elapsed(), &result);
-        let object = result.map_err(|e| backend(&e))?;
-        if object.is_none() {
-            self.missing_clients.lock().await.insert(id, now());
-        }
-        Ok(object.map(|object| {
-            let id = object.name_any();
-            let spec = object.spec;
-            Client {
-                id,
-                display_name: spec.display_name,
-                kind: spec.kind,
-                redirect_uris: spec.redirect_uris,
-                audiences: spec.audiences,
-                secret_hash: spec.secret_hash,
-                id_token_alg: spec.id_token_signing_alg.unwrap_or(Algorithm::Es256),
-            }
-        }))
+        let result = self.users.get_opt(name).await;
+        record_lookup("user", started.elapsed(), &result);
+        Ok(result.map_err(|e| backend(&e))?.and_then(convert))
     }
 }
 
-const NEGATIVE_TTL: Duration = Duration::from_secs(5);
-const NEGATIVE_CAPACITY: usize = 1024;
-
-/// Insertion order is also expiry order. Hits never extend a miss's lifetime, and duplicate
-/// concurrent misses never add another queue entry. Different names may still read concurrently.
-#[derive(Default)]
-struct NegativeClients {
-    entries: HashMap<Arc<str>, Instant>,
-    oldest: VecDeque<Arc<str>>,
+fn metadata_api<K>(api: &Api<K>) -> Api<PartialObjectMeta<K>>
+where
+    K: Resource<Scope = NamespaceResourceScope, DynamicType = ()> + Clone,
+{
+    let client = api.clone().into_client();
+    match api.namespace() {
+        Some(namespace) => Api::namespaced(client, namespace),
+        None => Api::all(client),
+    }
 }
 
-impl NegativeClients {
-    fn expire(&mut self, now: Instant) {
-        while self.oldest.front().is_some_and(|id| {
-            self.entries
-                .get(id)
-                .is_some_and(|inserted| now.duration_since(*inserted) >= NEGATIVE_TTL)
-        }) {
-            if let Some(id) = self.oldest.pop_front() {
-                self.entries.remove(&id);
+/// Each writer publishes relists only on `InitDone`, preserving the last complete snapshot.
+async fn run_index<K>(
+    api: Api<PartialObjectMeta<K>>,
+    mut writer: Writer<PartialObjectMeta<K>>,
+    mut shutdown: watch::Receiver<bool>,
+    resource: &'static str,
+) where
+    K: Resource<Scope = NamespaceResourceScope, DynamicType = ()>
+        + Clone
+        + DeserializeOwned
+        + Debug
+        + Send
+        + Sync
+        + 'static,
+{
+    let mut events = watcher(api, watcher::Config::default())
+        .default_backoff()
+        .boxed();
+    while !*shutdown.borrow() {
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
             }
+            event = events.next() => match event {
+                Some(Ok(event)) => writer.apply_watcher_event(&event),
+                Some(Err(error)) => {
+                    tracing::warn!(
+                        event = "kubernetes_directory_watch",
+                        resource,
+                        outcome = "error",
+                        %error,
+                        "directory metadata watch error; retrying with backoff"
+                    );
+                }
+                None => {
+                    tracing::warn!(
+                        event = "kubernetes_directory_watch",
+                        resource,
+                        outcome = "stopped",
+                        "directory metadata watch stopped"
+                    );
+                    break;
+                }
+            },
         }
-    }
-
-    fn contains(&mut self, id: &str, now: Instant) -> bool {
-        self.expire(now);
-        self.entries.contains_key(id)
-    }
-
-    fn insert(&mut self, id: &str, now: Instant) {
-        self.expire(now);
-        if self.entries.contains_key(id) {
-            return;
-        }
-        if self.entries.len() == NEGATIVE_CAPACITY
-            && let Some(id) = self.oldest.pop_front()
-        {
-            self.entries.remove(&id);
-        }
-        let id: Arc<str> = Arc::from(id);
-        self.oldest.push_back(Arc::clone(&id));
-        self.entries.insert(id, now);
     }
 }
 
@@ -151,15 +193,55 @@ fn backend(error: &kube::Error) -> StoreError {
 }
 
 impl Directory for KubeDirectory {
-    fn client(&self, id: &str) -> impl Future<Output = Result<Option<Client>, StoreError>> + Send {
-        self.client_at(id, Instant::now)
+    async fn client(&self, id: &str) -> Result<Option<Client>, StoreError> {
+        self.wait_until_ready().await?;
+        if self
+            .client_index
+            .find(|object| object.metadata.name.as_deref() == Some(id))
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let started = Instant::now();
+        let result = self.clients.get_opt(id).await;
+        record_lookup("client", started.elapsed(), &result);
+        Ok(result.map_err(|e| backend(&e))?.map(|object| {
+            let id = object.name_any();
+            let spec = object.spec;
+            Client {
+                id,
+                display_name: spec.display_name,
+                kind: spec.kind,
+                redirect_uris: spec.redirect_uris,
+                audiences: spec.audiences,
+                secret_hash: spec.secret_hash,
+                id_token_alg: spec.id_token_signing_alg.unwrap_or(Algorithm::Es256),
+            }
+        }))
     }
 
     async fn user(&self, name: &str) -> Result<Option<User>, StoreError> {
-        let started = Instant::now();
-        let result = self.users.get_opt(name).await;
-        record_lookup("user", started.elapsed(), &result);
-        Ok(result.map_err(|e| backend(&e))?.and_then(convert))
+        self.wait_until_ready().await?;
+        self.read_user(name).await
+    }
+
+    async fn user_by_subject(&self, subject: &str) -> Result<Option<User>, StoreError> {
+        self.wait_until_ready().await?;
+        // Filter under one store read lock so an ambiguous snapshot never picks an arbitrary user.
+        // Only matching metadata is cloned, not a full snapshot of every user.
+        let matches = self
+            .user_index
+            .state_filter(|object| object.metadata.uid.as_deref() == Some(subject));
+        let [metadata] = matches.as_slice() else {
+            return Ok(None);
+        };
+        let Some(name) = metadata.metadata.name.as_deref() else {
+            return Ok(None);
+        };
+        Ok(self
+            .read_user(name)
+            .await?
+            .filter(|user| user.subject == subject))
     }
 }
 
@@ -178,5 +260,5 @@ fn convert(object: UserObject) -> Option<User> {
 }
 
 #[cfg(test)]
-#[path = "directory_cache_tests.rs"]
+#[path = "directory_watch_tests.rs"]
 mod tests;
