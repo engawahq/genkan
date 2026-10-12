@@ -145,13 +145,24 @@ impl OneTimeIds {
 /// cancels tasks; the process-local sealing key then disappears, so old codes cannot reopen.
 ///
 /// Expired entries with active holders or waiters are retained until those operations finish.
-/// No global lock is held across an await. Memory is bounded by unexpired codes plus unfinished
-/// operations.
+/// No global lock is held across an await. At most 256 operations can run or wait for a code
+/// lock. Admission is nonblocking and its permit belongs to the actual operation, not its
+/// HTTP request: cancelled callers cannot create an unbounded detached backlog on slow storage.
 ///
 /// [RFC 6749 §4.1.2]: https://www.rfc-editor.org/rfc/rfc6749#section-4.1.2
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct CodeRedemptions {
     entries: Mutex<HashMap<String, CodeEntry>>,
+    operations: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for CodeRedemptions {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            operations: Arc::new(tokio::sync::Semaphore::new(256)),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -161,6 +172,11 @@ struct CodeEntry {
 }
 
 impl CodeRedemptions {
+    /// Reserves bounded operation capacity without queuing an unbounded admission waiter.
+    pub(crate) fn try_admit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.operations).try_acquire_owned().ok()
+    }
+
     /// The single-use state and operation lock for one authenticated, unexpired code.
     pub(crate) fn entry(
         &self,

@@ -631,6 +631,63 @@ mod tests {
         assert_eq!(refresh(&h, &token).await.error(), "invalid_grant");
     }
 
+    #[tokio::test]
+    async fn cancelled_code_requests_retain_bounded_operation_capacity_until_completion() {
+        let pause = Pause::new();
+        let h = harness_with_store(
+            Lifetimes::DEFAULT,
+            PausedGrants {
+                create: Some(Arc::clone(&pause)),
+                ..PausedGrants::default()
+            },
+        )
+        .await;
+        let code = sign_in(&h, "alice", &kubectl_authorize(&[])).await;
+        let unrelated = sign_in(&h, "alice", &kubectl_authorize(&[])).await;
+        let mut requests = Vec::new();
+        // One create is held in storage and the other accepted operations wait on its code.
+        // Poll each HTTP future into the handler before cancelling any of the callers.
+        for _ in 0..256 {
+            let mut request = Box::pin(exchange(&h, &code));
+            std::future::poll_fn(|cx| {
+                assert!(request.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            requests.push(request);
+        }
+        pause.started().await;
+        assert_eq!(exchange(&h, &unrelated).await.error(), "server_error");
+        drop(requests);
+        assert_eq!(
+            exchange(&h, &unrelated).await.error(),
+            "server_error",
+            "cancelling HTTP callers must not release still-running operation permits"
+        );
+
+        pause.release.add_permits(1);
+        let recovered = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let reply = exchange(&h, &unrelated).await;
+                if reply.json()["error"] != "server_error" {
+                    break reply;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(recovered.status, StatusCode::OK, "{:?}", recovered.body);
+        // Exhausted admission did not consume the unrelated genuine code, and its new family
+        // is usable once actual operations complete and capacity becomes available again.
+        assert_eq!(
+            refresh(&h, recovered.json()["refresh_token"].as_str().unwrap())
+                .await
+                .status,
+            StatusCode::OK
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn exactly_one_concurrent_redemption_succeeds() {
         let h = Arc::new(harness().await);

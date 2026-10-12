@@ -428,6 +428,10 @@ async fn exchange_code<D: Directory, G: GrantStore, C: Clock>(
         return Err(INVALID_GRANT);
     }
 
+    let permit = server
+        .used_codes
+        .try_admit()
+        .ok_or_else(OAuthError::server)?;
     let entry = server.used_codes.entry(&claims.id, claims.expires_at, now);
     let server = Arc::clone(server);
     let client = client.clone();
@@ -448,6 +452,7 @@ async fn exchange_code<D: Directory, G: GrantStore, C: Clock>(
             redeem_code(&server, &client, &claims, now).await
         };
         drop(redeemed);
+        drop(permit);
         result
     })
     .await

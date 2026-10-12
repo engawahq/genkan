@@ -31,6 +31,9 @@ page). Used by `genkan` (the server), `genkan-signin` (which calls `complete_aut
   across pending storage operations or HTTP request cancellation; unrelated codes proceed
   independently. A replay revokes the refresh family (RFC 6749 §4.1.2). Already-issued signed
   tokens cannot be recalled and expire normally.
+  At most 256 redemption/replay operations run or wait on a code; exhausted admission returns
+  `server_error` without consuming it. Capacity remains reserved until the operation finishes,
+  even if its HTTP caller is cancelled.
 - Refresh tokens rotate; a replayed one revokes its whole family (RFC 9700 §4.14.2). Only
   SHA-256 hashes of refresh secrets are stored.
 - Access tokens (RFC 9068) and ID tokens differ in their claims, not only in `typ`, because
