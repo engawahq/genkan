@@ -324,6 +324,7 @@ mod tests {
         assert_eq!(header.alg, jsonwebtoken::Algorithm::ES256);
         assert_eq!(at["client_id"], "kubectl");
         assert_eq!(at["sub"], "uid-alice");
+        assert_eq!(at["genkan_user"], "alice");
         assert_eq!(at["preferred_username"], "alice");
         assert_eq!(at["groups"], serde_json::json!(["admins"]));
         assert_eq!(
@@ -1226,6 +1227,91 @@ mod tests {
             userinfo(&h, Some(access)).await.status,
             StatusCode::UNAUTHORIZED
         );
+    }
+
+    #[tokio::test]
+    async fn userinfo_rejects_deleted_renamed_and_recreated_users() {
+        let h = harness().await;
+        let code = sign_in(&h, "alice", &kubectl_authorize(&[])).await;
+        let tokens = exchange(&h, &code).await.json();
+        let access = tokens["access_token"].as_str().unwrap();
+        assert_eq!(userinfo(&h, Some(access)).await.status, StatusCode::OK);
+
+        h.server.directory.remove_user("alice");
+        assert_eq!(
+            userinfo(&h, Some(access)).await.status,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // Even the same subject at a new object name cannot rescue the old locator.
+        h.server.directory.put_user(User {
+            name: "alice-renamed".into(),
+            subject: "uid-alice".into(),
+            username: "alice".into(),
+            ..User::default()
+        });
+        assert_eq!(
+            userinfo(&h, Some(access)).await.status,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // Reusing the original name for a different UID must not expose its claims.
+        h.server.directory.put_user(User {
+            name: "alice".into(),
+            subject: "uid-recreated".into(),
+            username: "replacement".into(),
+            ..User::default()
+        });
+        let reply = userinfo(&h, Some(access)).await;
+        assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(reply.body.as_slice(), b"");
+    }
+
+    #[tokio::test]
+    async fn userinfo_rejects_missing_and_forged_user_locators() {
+        let h = harness().await;
+        let code = sign_in(&h, "alice", &kubectl_authorize(&[])).await;
+        let tokens = exchange(&h, &code).await.json();
+        let access = tokens["access_token"].as_str().unwrap();
+        let (_, original) = verify(&h, access, "kubernetes");
+        h.server.directory.put_user(User {
+            name: "other".into(),
+            subject: "uid-other".into(),
+            username: "other-private-username".into(),
+            ..User::default()
+        });
+        let keys = h.server.keys.borrow().clone().unwrap();
+        let key = keys.signer(Algorithm::Es256, h.clock.now()).unwrap();
+
+        // Valid signatures deliberately isolate locator validation from signature rejection.
+        for locator in [None, Some(""), Some("other"), Some("does-not-exist")] {
+            let mut claims = original.clone();
+            claims.as_object_mut().unwrap().remove("genkan_user");
+            if let Some(locator) = locator {
+                claims["genkan_user"] = serde_json::json!(locator);
+            }
+            let signed = genkan_keys::jws::sign_compact(&key, "at+jwt", &claims).unwrap();
+            let reply = userinfo(&h, Some(&signed)).await;
+            assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{locator:?}");
+            assert_eq!(reply.body.as_slice(), b"");
+            assert!(
+                reply.headers[header::WWW_AUTHENTICATE]
+                    .to_str()
+                    .unwrap()
+                    .contains(r#"error="invalid_token""#)
+            );
+        }
+
+        // An attacker changing just the locator cannot retain the original signature.
+        let mut claims = original;
+        claims["genkan_user"] = serde_json::json!("other");
+        let parts: Vec<_> = access.split('.').collect();
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&claims).unwrap());
+        let forged = format!("{}.{}.{}", parts[0], payload, parts[2]);
+        let reply = userinfo(&h, Some(&forged)).await;
+        assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(reply.body.as_slice(), b"");
     }
 
     #[tokio::test]

@@ -9,6 +9,7 @@
 
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use genkan_core::clock::SystemClock;
@@ -58,8 +59,8 @@ const RECONCILE_INTERVAL: Duration = Duration::from_mins(1);
 const MAX_BODY: usize = 16 * 1024;
 /// Maximum time to handle one request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-/// Maximum requests handled at once; more wait for a slot.
-const MAX_CONCURRENT: usize = 256;
+/// Four independent groups reserve capacity within the original 256-request budget.
+const GROUP_CONCURRENT: usize = 64;
 
 /// Why the server stopped with an error.
 #[derive(Debug, Error)]
@@ -241,7 +242,95 @@ fn mailer(config: &MailConfig) -> Result<Mailer, ServeError> {
         .map_err(|error| ServeError::Config(error.to_string()))
 }
 
-/// Request limits applied to every route.
+/// One group's admission budget and process-lifetime rejection counter.
+struct RequestGroup {
+    name: &'static str,
+    slots: tokio::sync::Semaphore,
+    rejected: AtomicU64,
+}
+
+impl RequestGroup {
+    fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            slots: tokio::sync::Semaphore::new(GROUP_CONCURRENT),
+            rejected: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Independent budgets prevent authorization traffic from exhausting token or sign-in capacity.
+struct RequestLimits {
+    authorization: RequestGroup,
+    tokens: RequestGroup,
+    signin: RequestGroup,
+    other: RequestGroup,
+}
+
+impl RequestLimits {
+    fn new() -> Self {
+        Self {
+            authorization: RequestGroup::new("authorization"),
+            tokens: RequestGroup::new("tokens"),
+            signin: RequestGroup::new("signin"),
+            other: RequestGroup::new("other"),
+        }
+    }
+
+    fn group(&self, path: &str) -> &RequestGroup {
+        match path {
+            "/authorize" | "/par" => &self.authorization,
+            "/token" | "/revoke" => &self.tokens,
+            path if path == "/login"
+                || path.starts_with("/login/")
+                || path == "/setup"
+                || path.starts_with("/setup/")
+                || path.starts_with("/upstream/") =>
+            {
+                &self.signin
+            }
+            _ => &self.other,
+        }
+    }
+}
+
+/// Rejects overload before reading a body, with no queue outside the handler timeout.
+///
+/// A borrowed permit is held until the handler completes, and released on cancellation or
+/// timeout. Responses are small, non-streaming forms/JSON/pages. Overload uses `503` and a
+/// one-second retry suggestion ([RFC 9110 §15.6.4 and §10.2.3]).
+///
+/// [RFC 9110 §15.6.4 and §10.2.3]: https://www.rfc-editor.org/rfc/rfc9110.html#section-15.6.4
+async fn admit(
+    axum::extract::State(limits): axum::extract::State<Arc<RequestLimits>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::{StatusCode, header};
+    use axum::response::IntoResponse as _;
+
+    let group = limits.group(request.uri().path());
+    let Ok(_permit) = group.slots.try_acquire() else {
+        let rejected_total = group.rejected.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::warn!(
+            event = "request_overload",
+            group = group.name,
+            rejected_total,
+            "request rejected for load"
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [
+                (header::RETRY_AFTER, "1"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+        )
+            .into_response();
+    };
+    next.run(request).await
+}
+
+/// Body and time limits are universal; concurrency admission reserves per-group capacity.
 fn limits(router: axum::Router) -> axum::Router {
     router
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))
@@ -249,7 +338,10 @@ fn limits(router: axum::Router) -> axum::Router {
             axum::http::StatusCode::REQUEST_TIMEOUT,
             REQUEST_TIMEOUT,
         ))
-        .layer(tower::limit::ConcurrencyLimitLayer::new(MAX_CONCURRENT))
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::new(RequestLimits::new()),
+            admit,
+        ))
 }
 
 async fn run<S: KeyStore, D: Directory, G: GrantStore, K: CredentialStore, T: SetupStore>(
@@ -379,4 +471,75 @@ async fn shutdown_signal() {
         () = terminate => {},
     }
     tracing::info!("shutting down");
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use axum::routing::get;
+    use tokio::sync::Semaphore;
+    use tower::ServiceExt as _;
+
+    use super::*;
+
+    fn request(path: &str) -> Request<Body> {
+        Request::builder().uri(path).body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn overloaded_authorization_does_not_block_token_or_signin() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let app = limits(
+            axum::Router::new()
+                .route(
+                    "/authorize",
+                    get({
+                        let entered = Arc::clone(&entered);
+                        let release = Arc::clone(&release);
+                        move || {
+                            let entered = Arc::clone(&entered);
+                            let release = Arc::clone(&release);
+                            async move {
+                                entered.add_permits(1);
+                                release.acquire().await.unwrap().forget();
+                                StatusCode::OK
+                            }
+                        }
+                    }),
+                )
+                .route("/par", get(|| async { StatusCode::OK }))
+                .route("/token", get(|| async { StatusCode::OK }))
+                .route("/login/options", get(|| async { StatusCode::OK })),
+        );
+        let mut tasks = Vec::new();
+        for _ in 0..64 {
+            tasks.push(tokio::spawn(app.clone().oneshot(request("/authorize"))));
+        }
+        entered.acquire_many(64).await.unwrap().forget();
+        let rejected =
+            tokio::time::timeout(Duration::from_secs(1), app.clone().oneshot(request("/par")))
+                .await
+                .expect("overload must not queue")
+                .unwrap();
+        assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(rejected.headers()[header::RETRY_AFTER], "1");
+        for path in ["/token", "/login/options"] {
+            let response =
+                tokio::time::timeout(Duration::from_secs(1), app.clone().oneshot(request(path)))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        release.add_permits(64);
+        for task in tasks {
+            assert_eq!(task.await.unwrap().unwrap().status(), StatusCode::OK);
+        }
+        assert_eq!(
+            app.oneshot(request("/par")).await.unwrap().status(),
+            StatusCode::OK
+        );
+    }
 }

@@ -13,6 +13,15 @@
 //! - A token without the `openid` scope gets `403 insufficient_scope`; a missing token gets a bare
 //!   `Bearer` challenge, and a bad one `invalid_token` (RFC 6750 §3).
 //! - Responses carry `Cache-Control: no-store`.
+//!
+//! The signed private `genkan_user` object-name claim selects one direct directory read, never
+//! a subject search. Its user's UID must equal `sub`, so deleting, renaming or recreating an
+//! object cannot redirect an existing token to another identity. Missing locators fail closed:
+//! tokens minted before this claim was introduced need renewal for UserInfo, but remain usable
+//! by kube-apiserver until expiry. The response always carries the grant's subject, consistent
+//! with [OIDC Core §5.3.2]'s subject requirement and client-side substitution check.
+//!
+//! [OIDC Core §5.3.2]: https://openid.net/specs/openid-connect-core-1_0.html#UserInfoResponse
 
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -31,6 +40,7 @@ use super::error::no_store;
 struct AccessClaims {
     iss: String,
     sub: String,
+    genkan_user: String,
     exp: u64,
     client_id: String,
     #[serde(default)]
@@ -98,6 +108,7 @@ pub async fn userinfo<D: Directory, G: GrantStore, C: Clock>(
         || claims.iss != server.issuer.as_str()
         || claims.exp <= server.now().as_secs()
         || claims.client_id.is_empty()
+        || claims.genkan_user.is_empty()
     {
         return invalid();
     }
@@ -105,8 +116,8 @@ pub async fn userinfo<D: Directory, G: GrantStore, C: Clock>(
     if !scopes.contains(&"openid") {
         return challenge(StatusCode::FORBIDDEN, Some("insufficient_scope"));
     }
-    let user = match server.directory.user_by_subject(&claims.sub).await {
-        Ok(Some(user)) if !user.disabled => user,
+    let user = match server.directory.user(&claims.genkan_user).await {
+        Ok(Some(user)) if user.subject == claims.sub && !user.disabled => user,
         Ok(_) => return invalid(),
         Err(error) => {
             tracing::error!(%error, "user lookup failed");

@@ -15,6 +15,12 @@
 //!
 //! Elevated tokens are access tokens whose `groups` additionally hold `elevated:<group>` names
 //! (see [`crate::endpoints::ELEVATED_GROUP_PREFIX`]).
+//!
+//! Access tokens also carry the signed private `genkan_user` claim, the user's object name.
+//! UserInfo uses it for a direct lookup but checks the immutable `sub` UID before returning
+//! claims; a locator is not an identity. [RFC 9068 §2.2.2] permits private-subsystem attributes.
+//!
+//! [RFC 9068 §2.2.2]: https://www.rfc-editor.org/rfc/rfc9068#section-2.2.2
 
 use genkan_core::clock::UnixTime;
 use genkan_core::crypto::{hex, random};
@@ -56,6 +62,7 @@ impl Subject<'_> {
 struct AccessTokenClaims<'a> {
     iss: &'a str,
     sub: &'a str,
+    genkan_user: &'a str,
     aud: &'a str,
     exp: u64,
     iat: u64,
@@ -117,6 +124,7 @@ pub fn access_token(
     let claims = AccessTokenClaims {
         iss: subject.issuer,
         sub: &subject.user.subject,
+        genkan_user: &subject.user.name,
         aud: subject.audience,
         exp: expires_at.as_secs(),
         iat: now.as_secs(),

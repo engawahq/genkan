@@ -37,8 +37,12 @@ Nothing depends on it.
   `/readyz` once keys are published.
 - **Small and bounded.** A Tokio runtime with two worker threads (one would work; two keep a
   slow request from stalling the key rotator) and axum on HTTP/1.1. Every request body is at most
-  16 KiB, handled within 10 s, with at most 256 requests in flight. The end-to-end test requires
-  the pod's working set after a sign-in to stay within 30 MiB.
+  16 KiB, handled within 10 s. Authorization/PAR, token/revocation, sign-in/setup/upstream, and
+  other routes each reserve 64 concurrent handlers (256 total). Full groups fail immediately
+  with `503` and `Retry-After: 1`; they never queue outside the timeout or borrow another group's
+  slots. Structured `request_overload` logs carry per-group cumulative rejection counts.
+  Per-source-IP rate limiting belongs at the ingress; see [the deployment guide].
+  The end-to-end test requires the pod's working set after a sign-in to stay within 30 MiB.
 - **TLS ends in front of the public listener** (ingress or gateway). The issuer is an `https`
   URL ([OIDC Discovery] §3, [RFC 8414] §2) without a path, so the OpenID and OAuth metadata
   locations coincide at the root ([RFC 8414] §3), and it must match kube-apiserver's
@@ -62,3 +66,5 @@ Nothing depends on it.
 [OIDC Discovery]: https://openid.net/specs/openid-connect-discovery-1_0.html
 [RFC 8414]: https://www.rfc-editor.org/rfc/rfc8414
 [RFC 6750]: https://www.rfc-editor.org/rfc/rfc6750
+
+[the deployment guide]: ../../docs/get-started.md#limit-unauthenticated-traffic-at-the-ingress

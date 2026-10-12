@@ -131,6 +131,7 @@ Tests are in `genkan-oauth/tests/oauth.rs` unless noted.
 | 9700 §2.1.1, §2.2.2 | PKCE required; public-client refresh tokens rotated | MUST | `authorize.rs`, `endpoints.rs` | `pkce_and_code_binding_are_enforced`, `refresh_rotates_and_reuse_revokes_the_family` | Met |
 | 9700 §4.11.2 | 303, never 307 | MUST NOT | `endpoints.rs` | `code_flow_issues_tokens_kubernetes_can_use` | Met |
 | 9068 §2.1, §2.2, §5 | `at+jwt`; required claims; distinct `aud` per resource | MUST | `tokens.rs`, `authorize.rs` | `code_flow_issues_tokens_kubernetes_can_use`, `authorization_endpoint_errors` | Met |
+| 9068 §2.2.2 | Private-subsystem attribute `genkan_user` carries the signed object-name locator, distinct from the immutable `sub` UID | MAY | `tokens.rs`, `userinfo.rs` | `code_flow_issues_tokens_kubernetes_can_use`, `userinfo_rejects_missing_and_forged_user_locators` | Met |
 | 8707 §2 | `invalid_target` for disallowed resources | — | `authorize.rs` | `genkan-oauth: authorize::tests::*` | Met |
 | 9126 §2.1, §2.2, §4 | Authenticated PAR; one-time, client-bound, expiring request URI | MUST | `endpoints.rs` | `pushed_authorization_requests` | Met |
 | 7009 §2.1, §2.2 | Revocation by the owning client with constant-time proof of a current or previous refresh secret; 200 for invalid tokens without deleting a grant | MUST | `endpoints.rs`, `refresh.rs` | `revocation`, `guessed_refresh_secrets_cannot_revoke_a_known_grant`, `current_and_previous_refresh_secrets_authorize_family_revocation`; `genkan-e2e: passkey_sign_in_then_kubectl_auth_whoami` (forged-secret smoke) | Met |
@@ -140,6 +141,7 @@ Tests are in `genkan-oauth/tests/oauth.rs` unless noted.
 | OIDC Core §3.1.2.1 | GET and POST; `prompt=none` without a session fails | MUST | `endpoints.rs`, `authorize.rs` | `authorization_endpoint_accepts_post`, `authorization_endpoint_errors` | Met |
 | OIDC Core §3.1.2.1 | `ui_locales` | OPTIONAL | error page | `genkan-signin/tests/pages.rs: untrusted_authorization_requests_show_an_error_page` | Partial: the sign-in page does not use it |
 | OIDC Core §5.3; RFC 6750 §2.1, §3 | UserInfo with bearer access tokens; challenges with error codes; current claims by scope | MUST | `userinfo.rs` | `userinfo_returns_current_claims_for_access_tokens_only` | Met |
+| OIDC Core §5.3.2 | Always return the grant's `sub`; bind direct object-name lookup to the token's UID and fail closed for deleted, disabled, renamed or recreated users | MUST; binding policy | `userinfo.rs` | `userinfo_returns_current_claims_for_access_tokens_only`, `userinfo_rejects_deleted_renamed_and_recreated_users`, `userinfo_rejects_missing_and_forged_user_locators` | Met (client-side ID token subject comparison remains the client's responsibility) |
 | OIDC Core §12.2 | Refreshed ID token keeps `auth_time`, no nonce | MUST | `endpoints.rs` | `refresh_rotates_and_reuse_revokes_the_family` | Met |
 | OIDC Core §15.1 | `max_age`, `prompt=login` | MUST | every sign-in is a fresh ceremony (no sessions) | `genkan-signin/tests/signin.rs: setup_link_then_passkey_sign_in_issues_tokens` | Met while there are no sessions |
 

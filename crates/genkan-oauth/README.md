@@ -34,6 +34,11 @@ page). Used by `genkan` (the server), `genkan-signin` (which calls `complete_aut
 - Access tokens (RFC 9068) and ID tokens differ in their claims, not only in `typ`, because
   kube-apiserver does not check `typ`. Each access token has exactly one audience from the
   client's allowlist.
+- Access tokens carry the signed private `genkan_user` claim containing the `User` object name
+  (RFC 9068 §2.2.2). UserInfo reads that object directly and requires its UID to match `sub`;
+  missing, disabled, renamed or recreated users cannot redirect claims to another identity.
+  Access tokens issued before this claim was introduced remain valid for kube-apiserver until
+  expiry, but UserInfo rejects them: obtain a newly minted token, including by refresh.
 - Elevated groups exist only in short, non-refreshable tokens issued right after a passkey
   sign-in.
 - Every redirect is `303 See Other` and carries `iss` (RFC 9207).

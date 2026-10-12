@@ -33,6 +33,12 @@ server, the `genkanctl` admin CLI and the `genkan-e2e` tests.
   redemption, one per refresh and one when a grant ends, so anonymous traffic cannot fill etcd
   (the failure mode of storing a request object per unauthenticated `/authorize`, seen in
   [Dex]).
+- **Current authorization data, bounded misses.** The directory reads users and known clients
+  directly by object name on every request; it does not cache permissions or backend errors.
+  Clones share up to 1024 absent client names for five seconds of monotonic time, evicting
+  oldest misses first. A newly created client can therefore take at most five seconds after a
+  cached miss to appear. Each actual directory API GET emits `kubernetes_directory_lookup`
+  with `resource`, `operation`, `outcome` and `latency_ms`, never raw client or user names.
 - **Single use is decided by the API server.** Create with a deterministic name, update with
   `resourceVersion`, delete with `uid` and `resourceVersion` preconditions ([API concepts],
   [DeleteOptions]). Ambiguous answers fail closed. The integration tests race 64 concurrent
