@@ -290,22 +290,87 @@ mod tests {
         reply.json()
     }
 
-    async fn refresh(address: &str, token: &str) -> Reply {
+    async fn post_form(address: &str, path: &str, pairs: &[(&str, &str)]) -> Reply {
         let form = form_urlencoded::Serializer::new(String::new())
-            .extend_pairs([
-                ("grant_type", "refresh_token"),
-                ("client_id", "kubectl"),
-                ("refresh_token", token),
-            ])
+            .extend_pairs(pairs.iter().copied())
             .finish();
         http(
             address,
             Method::POST,
-            "/token",
+            path,
             &[],
             Some(("application/x-www-form-urlencoded", form)),
         )
         .await
+    }
+
+    async fn refresh(address: &str, token: &str) -> Reply {
+        post_form(
+            address,
+            "/token",
+            &[
+                ("grant_type", "refresh_token"),
+                ("client_id", "kubectl"),
+                ("refresh_token", token),
+            ],
+        )
+        .await
+    }
+
+    /// Exercises proof-gated deletion through the deployed server and Kubernetes grant store.
+    async fn guessed_refresh_secrets_preserve_session(address: &str, issued: &str) {
+        let (grant, _) = issued.split_once('.').unwrap();
+        let guessed = format!("{grant}.{}", "A".repeat(43));
+        assert_ne!(guessed, issued);
+        let revoked = post_form(
+            address,
+            "/revoke",
+            &[("token", &guessed), ("client_id", "kubectl")],
+        )
+        .await;
+        assert_eq!(revoked.status, StatusCode::OK);
+        let refreshed = post_form(
+            address,
+            "/token",
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", issued),
+                ("client_id", "kubectl"),
+            ],
+        )
+        .await;
+        assert_eq!(refreshed.status, StatusCode::OK);
+        let current = refreshed.json()["refresh_token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let (grant, _) = current.split_once('.').unwrap();
+        let guessed = format!("{grant}.{}", "A".repeat(43));
+        assert_ne!(guessed, current);
+        let wrong_client = post_form(
+            address,
+            "/token",
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &guessed),
+                ("client_id", "other-client"),
+            ],
+        )
+        .await;
+        assert_eq!(wrong_client.status, StatusCode::BAD_REQUEST);
+        assert_eq!(wrong_client.json()["error"], "invalid_grant");
+        let refreshed = post_form(
+            address,
+            "/token",
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &current),
+                ("client_id", "kubectl"),
+            ],
+        )
+        .await;
+        assert_eq!(refreshed.status, StatusCode::OK);
+        assert!(refreshed.json()["refresh_token"].is_string());
     }
 
     #[tokio::test]
@@ -373,23 +438,25 @@ mod tests {
 
         // The kubectl client, and a setup link for the first admin.
         let clients: Api<OAuthClient> = Api::namespaced(admin.clone(), &namespace);
-        clients
-            .create(
-                &PostParams::default(),
-                &OAuthClient::new(
-                    "kubectl",
-                    OAuthClientSpec {
-                        display_name: None,
-                        kind: ClientType::Public,
-                        redirect_uris: vec![REDIRECT.into()],
-                        audiences: vec!["kubernetes".into()],
-                        secret_hash: None,
-                        id_token_signing_alg: None,
-                    },
-                ),
-            )
-            .await
-            .unwrap();
+        for client_id in ["kubectl", "other-client"] {
+            clients
+                .create(
+                    &PostParams::default(),
+                    &OAuthClient::new(
+                        client_id,
+                        OAuthClientSpec {
+                            display_name: None,
+                            kind: ClientType::Public,
+                            redirect_uris: vec![REDIRECT.into()],
+                            audiences: vec!["kubernetes".into()],
+                            secret_hash: None,
+                            id_token_signing_alg: None,
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+        }
         let link = issue_setup_link(
             admin.clone(),
             &namespace,
@@ -489,6 +556,11 @@ mod tests {
         // Sign in as kubectl would: authorization request, passkey, code, token.
         let tokens = sign_in(&address, &mut device, "openid").await;
         assert!(tokens["refresh_token"].is_string());
+        guessed_refresh_secrets_preserve_session(
+            &address,
+            tokens["refresh_token"].as_str().unwrap(),
+        )
+        .await;
         let access_token = tokens["access_token"].as_str().unwrap();
         let id_token = tokens["id_token"].as_str().unwrap();
 

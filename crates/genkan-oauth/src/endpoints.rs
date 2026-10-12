@@ -42,7 +42,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use genkan_core::clock::{Clock, UnixTime};
-use genkan_store::{Client, CreateGrant, Directory, GrantStore, NewGrant, Rotation, User};
+use genkan_store::{Client, CreateGrant, Directory, Grant, GrantStore, NewGrant, Rotation, User};
 use genkan_ui::i18n::Lang;
 use genkan_ui::pages::{accept_language, error_page};
 use serde::{Deserialize, Serialize};
@@ -602,6 +602,27 @@ fn issue_tokens<D: Directory, G: GrantStore, C: Clock>(
     })
 }
 
+/// Enforces client binding without letting a known grant name authorize family deletion.
+async fn check_refresh_client<D: Directory, G: GrantStore, C: Clock>(
+    server: &AuthorizationServer<D, G, C>,
+    client: &Client,
+    presented: &RefreshToken,
+    stored: &Grant,
+) -> Result<(), OAuthError> {
+    if stored.spec.client == client.id {
+        return Ok(());
+    }
+    if presented.proves_possession(stored) {
+        tracing::warn!(client = %client.id, "refresh token presented by another client; revoking");
+        server
+            .grants
+            .revoke(presented.grant())
+            .await
+            .map_err(store_error)?;
+    }
+    Err(INVALID_GRANT)
+}
+
 async fn refresh<D: Directory, G: GrantStore, C: Clock>(
     server: &AuthorizationServer<D, G, C>,
     client: &Client,
@@ -619,16 +640,7 @@ async fn refresh<D: Directory, G: GrantStore, C: Clock>(
         .await
         .map_err(store_error)?
         .ok_or(INVALID_GRANT)?;
-    if stored.spec.client != client.id {
-        // A token in the wrong hands: end the family.
-        tracing::warn!(client = %client.id, "refresh token presented by another client; revoking");
-        server
-            .grants
-            .revoke(presented.grant())
-            .await
-            .map_err(store_error)?;
-        return Err(INVALID_GRANT);
-    }
+    check_refresh_client(server, client, &presented, &stored).await?;
     let scopes = match params.get("scope") {
         None => stored.spec.scopes.clone(),
         Some(requested) => {
@@ -814,8 +826,10 @@ async fn revoke<D: Directory, G: GrantStore, C: Clock>(
     };
     if let Some(refresh) = RefreshToken::parse(token) {
         match server.grants.get(refresh.grant()).await {
-            // Only the client the token was issued to may revoke it (RFC 7009 §2.1).
-            Ok(Some(grant)) if grant.spec.client == client.id => {
+            // RFC 7009 §2.1: verify both the owning client and possession of its token.
+            Ok(Some(grant))
+                if grant.spec.client == client.id && refresh.proves_possession(&grant) =>
+            {
                 if let Err(error) = server.grants.revoke(refresh.grant()).await {
                     return store_error(error).into_response();
                 }

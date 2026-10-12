@@ -14,8 +14,17 @@
 //! A losing concurrent rotation is a replay too. There is no grace window: kubelogin serialises
 //! refreshes of one token cache with a file lock ([kubelogin]), so legitimate use does not race
 //! itself. Every refresh also checks that the presenting client owns the family (otherwise it is
-//! revoked), that the user still exists and is enabled, and that the scope only narrows
-//! (RFC 6749 §6).
+//! revoked only with proof of the current or previous secret), that the user still exists and is
+//! enabled, and that the scope only narrows ([RFC 6749 §6]).
+//!
+//! Revocation and wrong-client refresh compare the presented secret hash in constant time against
+//! both retained hashes before deleting a family. The grant name is only a lookup key, not a
+//! credential. An unknown secret cannot terminate a session, even when the requester knows its
+//! grant name. The owning client can revoke with either retained secret; invalid revocation
+//! tokens still receive HTTP 200 ([RFC 7009 §2.1 and §2.2]).
+//!
+//! [RFC 6749 §6]: https://www.rfc-editor.org/rfc/rfc6749#section-6
+//! [RFC 7009 §2.1 and §2.2]: https://www.rfc-editor.org/rfc/rfc7009#section-2.1
 //!
 //! One small record per family follows Kanidm, and revoking the family on reuse with no grace
 //! period follows Hydra's default ([Kanidm], [Hydra]). Pinniped and Rauthy delete the old token on
@@ -31,7 +40,8 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use genkan_core::crypto::{CryptoError, hash_secret, random};
+use genkan_core::crypto::{CryptoError, ct_eq, hash_secret, random};
+use genkan_store::Grant;
 
 /// A parsed refresh token.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +94,21 @@ impl RefreshToken {
     #[must_use]
     pub fn hash(&self) -> String {
         hash_secret(self.secret.as_bytes())
+    }
+
+    /// Proves possession of a current or previous family secret, independently of expiry.
+    ///
+    /// Both retained hashes are compared in constant time; a grant name alone cannot authorize
+    /// deletion. Previous secrets remain proof for family revocation, not valid refresh tokens.
+    #[must_use]
+    pub fn proves_possession(&self, grant: &Grant) -> bool {
+        let hash = self.hash();
+        let current = ct_eq(hash.as_bytes(), grant.current_hash.as_bytes());
+        let previous = grant
+            .previous_hash
+            .as_ref()
+            .is_some_and(|previous| ct_eq(hash.as_bytes(), previous.as_bytes()));
+        current | previous
     }
 
     /// The token as sent to the client.

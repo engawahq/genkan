@@ -876,6 +876,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn guessed_refresh_secrets_cannot_revoke_a_known_grant() {
+        for wrong_client in [false, true] {
+            for rotated in [false, true] {
+                let h = harness().await;
+                let first = exchange(&h, &sign_in(&h, "alice", &kubectl_authorize(&[])).await)
+                    .await
+                    .json()["refresh_token"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let current = if rotated {
+                    refresh(&h, &first).await.json()["refresh_token"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                } else {
+                    first.clone()
+                };
+                let (grant, _) = first.split_once('.').unwrap();
+                let guessed = format!("{grant}.{}", "A".repeat(43));
+                assert_ne!(guessed, first);
+                assert_ne!(guessed, current);
+                let reply = if wrong_client {
+                    post(
+                        &h.app,
+                        "/token",
+                        &[("grant_type", "refresh_token"), ("refresh_token", &guessed)],
+                        Some(("web", WEB_SECRET)),
+                    )
+                    .await
+                } else {
+                    post(
+                        &h.app,
+                        "/revoke",
+                        &[("token", &guessed), ("client_id", "kubectl")],
+                        None,
+                    )
+                    .await
+                };
+                if wrong_client {
+                    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+                    assert_eq!(reply.error(), "invalid_grant");
+                } else {
+                    assert_eq!(reply.status, StatusCode::OK);
+                    assert_eq!(reply.headers[header::CACHE_CONTROL], "no-store");
+                }
+                assert_eq!(refresh(&h, &current).await.status, StatusCode::OK);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn current_and_previous_refresh_secrets_authorize_family_revocation() {
+        for wrong_client in [false, true] {
+            for previous in [false, true] {
+                let h = harness().await;
+                let first = exchange(&h, &sign_in(&h, "alice", &kubectl_authorize(&[])).await)
+                    .await
+                    .json()["refresh_token"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let current = refresh(&h, &first).await.json()["refresh_token"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let presented = if previous { &first } else { &current };
+                let reply = if wrong_client {
+                    post(
+                        &h.app,
+                        "/token",
+                        &[
+                            ("grant_type", "refresh_token"),
+                            ("refresh_token", presented),
+                        ],
+                        Some(("web", WEB_SECRET)),
+                    )
+                    .await
+                } else {
+                    post(
+                        &h.app,
+                        "/revoke",
+                        &[("token", presented), ("client_id", "kubectl")],
+                        None,
+                    )
+                    .await
+                };
+                if wrong_client {
+                    assert_eq!(reply.error(), "invalid_grant");
+                } else {
+                    assert_eq!(reply.status, StatusCode::OK);
+                }
+                assert_eq!(refresh(&h, &current).await.error(), "invalid_grant");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn revocation() {
         let h = harness().await;
         let body = exchange(&h, &sign_in(&h, "alice", &kubectl_authorize(&[])).await)
