@@ -22,10 +22,12 @@ description: Change Genkan's sign-in pages — askama templates, TypeScript, Tai
 - **Text.** Every string is a field of `Messages` in `crates/genkan-ui/src/i18n.rs` with English,
   Traditional Chinese (Taiwan usage, 通行密鑰) and Simplified Chinese (通行密钥) values; scripts get
   their messages from `data-msg-*` attributes. A missing translation is a compile error.
-- **Contrast.** Changing a colour token means recomputing WCAG contrast for every pair the pages
-  use (text ≥ 4.5:1, borders and focus rings ≥ 3:1), including alpha compositing.
-  `contrast.py` in this skill does the OKLCH → sRGB → WCAG computation:
-  `python3 .claude/skills/genkan-ui/contrast.py`; add a check there for any new pair. Update the
-  `A11Y` comments in `ui/styles/app.css`.
+- **Contrast.** `contrast.py` in this skill reads the tokens from `ui/styles/app.css` and checks
+  every colour pair the pages render (text ≥ 4.5:1, boundaries and focus rings ≥ 3:1), with
+  alpha compositing; it exits 1 on any failure. Run it after changing a token or a colour class:
+  `python3 .claude/skills/genkan-ui/contrast.py` (inside `nix develop`). Try a value first with
+  `--set light:border='oklch(0.6 0 0)'`. When a template starts rendering a new pair (a variant,
+  state or surface), add it to the inventory in the script. Update the `A11Y` comments in
+  `ui/styles/app.css` with the new ratios.
 - **Budgets.** Brotli sizes are checked by `scripts/ui-budget.sh`; raise a budget only with a
   reason in the commit.

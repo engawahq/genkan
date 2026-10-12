@@ -63,6 +63,7 @@
               tailwindcss_4
               typescript
               brotli
+              python3 # .claude/skills/genkan-ui/contrast.py
 
               # Kubernetes integration tests
               kind
