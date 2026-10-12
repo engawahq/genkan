@@ -7,7 +7,6 @@ cluster from [get-started.md](get-started.md): namespace `genkan-system`, issuer
 
 ```sh
 export GENKAN_ISSUER=https://genkan-k3s.shared
-alias kg='kubectl -n genkan-system'
 ```
 
 | Object | Short name | Who writes it |
@@ -55,7 +54,7 @@ Edit the `User`; the next token Genkan issues carries the change. Tokens already
 their groups until they expire (at most ten minutes for `kubectl`).
 
 ```sh
-kg patch gkuser alice --type=merge -p '{"spec":{"groups":["dev","oncall"]}}'
+kubectl -n genkan-system patch gkuser alice --type=merge -p '{"spec":{"groups":["dev","oncall"]}}'
 ```
 
 For users a directory sync manages (label `genkan.engawahq.dev/source=directory`), change the
@@ -71,7 +70,7 @@ Elevated groups are the only way to powerful roles: Kubernetes sees them as
 asks for it.
 
 ```sh
-kg patch gkuser alice --type=merge -p '{"spec":{"elevatedGroups":["admins"]}}'
+kubectl -n genkan-system patch gkuser alice --type=merge -p '{"spec":{"elevatedGroups":["admins"]}}'
 ```
 
 This works the same for directory-managed users: the sync tool never touches elevated groups.
@@ -93,8 +92,8 @@ genkanctl invite --username alice
 ## See and revoke credentials
 
 ```sh
-kg get gkcred -l genkan.engawahq.dev/user=alice
-kg delete gkcred <name>
+kubectl -n genkan-system get gkcred -l genkan.engawahq.dev/user=alice
+kubectl -n genkan-system delete gkcred <name>
 ```
 
 A deleted credential cannot sign in again. Sessions it already started continue until you
@@ -106,14 +105,14 @@ Each signed-in session is a `Grant`. Deleting it ends the session: the refresh t
 working, and the access token in hand expires within ten minutes.
 
 ```sh
-kg get gkgrant -l genkan.engawahq.dev/user=alice
-kg delete gkgrant -l genkan.engawahq.dev/user=alice
+kubectl -n genkan-system get gkgrant -l genkan.engawahq.dev/user=alice
+kubectl -n genkan-system delete gkgrant -l genkan.engawahq.dev/user=alice
 ```
 
 ## Lost passkey (account recovery)
 
 ```sh
-kg delete gkinvite -l genkan.engawahq.dev/user=alice
+kubectl -n genkan-system delete gkinvite -l genkan.engawahq.dev/user=alice
 genkanctl setup-link --username alice --reset
 ```
 
@@ -129,7 +128,7 @@ Suspend first. A disabled user cannot sign in, and refresh tokens stop working a
 use; nothing is deleted, so it is reversible.
 
 ```sh
-kg patch gkuser alice --type=merge -p '{"spec":{"disabled":true}}'
+kubectl -n genkan-system patch gkuser alice --type=merge -p '{"spec":{"disabled":true}}'
 ```
 
 To remove the person for good, delete their credentials, sessions and pending invitations
@@ -137,9 +136,9 @@ before the `User`:
 
 ```sh
 for kind in gkcred gkgrant gkinvite; do
-  kg delete "$kind" -l genkan.engawahq.dev/user=alice
+  kubectl -n genkan-system delete "$kind" -l genkan.engawahq.dev/user=alice
 done
-kg delete gkuser alice
+kubectl -n genkan-system delete gkuser alice
 ```
 
 Do this in that order. Credentials, sessions and invitations Genkan creates carry an owner
