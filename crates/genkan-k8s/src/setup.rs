@@ -26,8 +26,8 @@ use genkan_store::{Consume, SetupStore, SetupToken, StoreError, invitation_name}
 use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::Secret;
 use kube::api::{Api, DeleteParams, ListParams, ObjectMeta, PostParams};
-use kube::{Client, ResourceExt as _};
 use kube::core::PartialObjectMeta;
+use kube::{Client, ResourceExt as _};
 use thiserror::Error;
 
 use super::MANAGED_BY;
@@ -288,7 +288,8 @@ pub async fn issue_setup_link(
     // Recovery only counts and deletes objects; it must not deserialize unverifiable legacy
     // specs. Metadata-only APIs also handle delete responses containing those old objects.
     // Authentication continues to use the strict Credential/Grant types, with no UID backfill.
-    let credentials: Api<PartialObjectMeta<Credential>> = Api::namespaced(client.clone(), namespace);
+    let credentials: Api<PartialObjectMeta<Credential>> =
+        Api::namespaced(client.clone(), namespace);
     let existing = credentials.list(&selector).await?.items.len();
     if existing > 0 {
         if !reset {
@@ -462,6 +463,7 @@ mod tests {
             secret.metadata.uid = Some("setup-secret".into());
             secret.metadata.resource_version = Some("2".into());
             storage.secret = Some(secret.clone());
+            drop(storage);
             return (StatusCode::CREATED, Json(secret)).into_response();
         }
         panic!("unexpected Kubernetes request: {method} {path}");
@@ -476,21 +478,36 @@ mod tests {
             .fallback(legacy_api)
             .with_state(Arc::clone(&storage));
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let client = Client::try_from(Config::new(format!("http://{address}").parse().unwrap()))
-            .unwrap();
+        let client =
+            Client::try_from(Config::new(format!("http://{address}").parse().unwrap())).unwrap();
         let issuer = BaseUrl::parse("issuer", "https://login.example.com").unwrap();
         let now = UnixTime::from_secs(1000);
 
         let error = issue_setup_link(
-            client.clone(), "test", &issuer, "admin", Duration::from_mins(60), false, now,
+            client.clone(),
+            "test",
+            &issuer,
+            "admin",
+            Duration::from_mins(60),
+            false,
+            now,
         )
         .await
         .unwrap_err();
-        assert!(matches!(error, SetupLinkError::HasCredentials { count: 1, .. }));
+        assert!(matches!(
+            error,
+            SetupLinkError::HasCredentials { count: 1, .. }
+        ));
         assert!(storage.lock().await.secret.is_none());
 
         let link = issue_setup_link(
-            client.clone(), "test", &issuer, "admin", Duration::from_mins(60), true, now,
+            client.clone(),
+            "test",
+            &issuer,
+            "admin",
+            Duration::from_mins(60),
+            true,
+            now,
         )
         .await
         .unwrap();
@@ -505,6 +522,7 @@ mod tests {
         assert_eq!(token.token_hash, hash_secret(raw.as_bytes()));
         let storage = storage.lock().await;
         assert!(storage.credentials_deleted && storage.grants_deleted);
+        drop(storage);
         server.abort();
     }
 }
