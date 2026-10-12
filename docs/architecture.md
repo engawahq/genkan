@@ -21,7 +21,9 @@ Connect client (Argo CD, Grafana, Headlamp, …) can use the same issuer.
 - **State in Kubernetes.** Users, passkeys, clients, sessions and invitations are custom
   resources; there is no database. Deleting a User eventually cleans up its passkeys, sessions
   and links through owner references; this is not immediate revocation. Do not use
-  `--cascade=orphan`.
+  `--cascade=orphan`. Records without an owner reference, such as those written before
+  owner references were added or created by hand without one, are not cleaned up; delete
+  them yourself when you delete the User.
 - **Small.** One static binary in an otherwise empty image (about 20 MB), a few MiB of memory at
   rest; sign-in pages are server-rendered with about 1 KB of script each.
 
