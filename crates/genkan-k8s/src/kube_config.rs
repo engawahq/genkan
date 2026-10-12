@@ -5,6 +5,32 @@
 //! [`crate::internal_tls`]), and prints the `AuthenticationConfiguration` for the chosen
 //! distribution together with how to install it there.
 //!
+//! # Trust-preserving renewal
+//!
+//! Built-in CA keys are discarded, so renewal changes the trust anchor. `prepare` persists a
+//! candidate and prints old+new CA trust without replacing the live leaf. Only explicit
+//! `activate`, naming the persisted rotation id, changes the serving pair. Distribute the exact
+//! overlap configuration and observe a successful reload on **every** control plane first;
+//! the CLI cannot inspect external host files. Keep overlap until every serving leaf matches
+//! the candidate's SHA-256 DER fingerprint, then `finish` removes rollback material and prints
+//! new-only trust. `rollback` restores the previous unexpired pair with overlap retained;
+//! `cancel` discards a prepared or rolled-back candidate. Each write preserves the Secret's
+//! `resourceVersion` ([API updates]); conflicts fail closed and retries read persisted state.
+//! Terminal id/phase markers make retries after lost responses idempotent, including across
+//! CLI restarts. Rotation ids are opaque random identifiers, not certificate fingerprints.
+//!
+//! There is no automatic CA replacement on expiry or parse failure, nor a timed trust cutover.
+//! Ordinary invocation creates initial material only when absent and never overwrites an
+//! externally managed Secret. Activate/finish/cancel are operator acknowledgements of the
+//! documented rollout prerequisites, not proofs that host configuration was distributed.
+//!
+//! [API updates]: https://kubernetes.io/docs/reference/using-api/api-concepts/#updates-to-existing-resources
+//! Successful reload evidence is the per-apiserver success metric and the hash of the exact
+//! applied configuration ([reload metrics], [reload success path]), not elapsed time.
+//!
+//! [reload metrics]: https://github.com/kubernetes/kubernetes/blob/v1.37.1/staging/src/k8s.io/apiserver/pkg/server/options/authenticationconfig/metrics/metrics.go
+//! [reload success path]: https://github.com/kubernetes/kubernetes/blob/v1.37.1/pkg/kubeapiserver/options/authentication.go
+//!
 //! The file is a structured `AuthenticationConfiguration` (`apiserver.config.k8s.io/v1`, GA in
 //! Kubernetes 1.34, [KEP-3331]). kube-apiserver re-reads it about once a minute, so only the
 //! flag that names it needs a restart. It cannot be combined with `--oidc-*` flags.
@@ -101,8 +127,8 @@ use genkan_core::clock::UnixTime;
 use genkan_core::config::{BaseUrl, ConfigError};
 use genkan_core::protocol::{ELEVATED_GROUP_PREFIX, OPENID_CONFIGURATION_PATH};
 use k8s_openapi::api::core::v1::{Secret, Service};
+use kube::Client;
 use kube::api::{Api, PostParams};
-use kube::{Client, ResourceExt as _};
 use thiserror::Error;
 
 use crate::internal_tls::{self, TlsError};
@@ -114,8 +140,46 @@ pub const EXTRA_PREFIX: &str = "genkan.engawahq.dev/";
 /// Most seconds between sign-in and an elevated token's issue: the code lifetime with slack.
 const ELEVATED_FRESHNESS: u64 = 120;
 
-/// Renew a reused certificate that expires sooner than this.
+/// Warn before this remaining validity; never silently replace a live CA.
 const RENEW_BEFORE: Duration = Duration::from_hours(30 * 24);
+
+const ROTATION_ID: &str = "genkan.engawahq.dev/tls-rotation-id";
+const ROTATION_PHASE: &str = "genkan.engawahq.dev/tls-rotation-phase";
+const NEXT_EXPIRY: &str = "genkan.engawahq.dev/tls-next-not-after";
+const PREVIOUS_EXPIRY: &str = "genkan.engawahq.dev/tls-previous-not-after";
+const ACTIVE_CA: &str = "active.ca.crt";
+const NEXT_CERT: &str = "next.tls.crt";
+const NEXT_KEY: &str = "next.tls.key";
+const NEXT_CA: &str = "next.ca.crt";
+const PREVIOUS_CERT: &str = "previous.tls.crt";
+const PREVIOUS_KEY: &str = "previous.tls.key";
+const PREVIOUS_CA: &str = "previous.ca.crt";
+
+/// Built-in CA rotation operations. Activation and cleanup require operator rollout checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CertificateAction {
+    /// Reuse existing material, or issue the initial certificate if the Secret is absent.
+    Current,
+    /// Persist a candidate and print overlapping old+new trust, keeping the old leaf active.
+    Prepare,
+    /// Activate the candidate after every control plane has successfully loaded overlap.
+    Activate,
+    /// Restore the previous unexpired leaf, keeping overlapping trust.
+    Rollback,
+    /// Remove rollback material and print new-only trust after all listeners serve the new leaf.
+    Finish,
+    /// Discard a prepared or rolled-back candidate after all listeners serve the old leaf.
+    Cancel,
+}
+
+/// Persisted rotation identity and phase, including terminal markers for retry safety.
+#[derive(Debug, Clone)]
+pub struct Rotation {
+    /// Opaque identifier to pass to the exact rotation's transition command.
+    pub id: String,
+    /// One of `prepared`, `activated`, `rolled-back`, `finished`, or `cancelled`.
+    pub phase: String,
+}
 
 /// Where kube-apiserver runs; decides the `anonymous` section and the install instructions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -197,7 +261,7 @@ pub enum KubeConfigError {
     Tls(#[from] TlsError),
     /// The existing Secret carries no CA certificate to give kube-apiserver.
     #[error(
-        "Secret {0} has no ca.crt; re-run with --renew-certificate, or add the CA that issued it"
+        "Secret {0} has no ca.crt; add the CA from its issuer without replacing the serving pair"
     )]
     NoCa(&'static str),
     /// An option is invalid.
@@ -206,6 +270,9 @@ pub enum KubeConfigError {
     /// An audience cannot be used.
     #[error("audience {0:?} must be non-empty printable ASCII without spaces")]
     BadAudience(String),
+    /// The requested or persisted certificate rotation is unsafe or inconsistent.
+    #[error("certificate rotation: {0}")]
+    Rotation(String),
 }
 
 /// A YAML double-quoted scalar (JSON string syntax is valid YAML).
@@ -213,13 +280,7 @@ fn quoted(value: &str) -> String {
     serde_json::Value::String(value.to_owned()).to_string()
 }
 
-/// Renders the `AuthenticationConfiguration` (YAML).
-///
-/// # Errors
-///
-/// Returns [`KubeConfigError::Unsupported`] for KubeSolo, and [`KubeConfigError::BadAudience`]
-/// for an empty or unusual audience.
-pub fn authentication_configuration(options: &ApiserverOptions) -> Result<String, KubeConfigError> {
+fn validate_configuration(options: &ApiserverOptions) -> Result<(), KubeConfigError> {
     if options.distro == Distro::Kubesolo {
         return Err(KubeConfigError::Unsupported);
     }
@@ -230,6 +291,17 @@ pub fn authentication_configuration(options: &ApiserverOptions) -> Result<String
     {
         return Err(KubeConfigError::BadAudience(bad.clone()));
     }
+    Ok(())
+}
+
+/// Renders the `AuthenticationConfiguration` (YAML).
+///
+/// # Errors
+///
+/// Returns [`KubeConfigError::Unsupported`] for KubeSolo, and [`KubeConfigError::BadAudience`]
+/// for an empty or unusual audience.
+pub fn authentication_configuration(options: &ApiserverOptions) -> Result<String, KubeConfigError> {
+    validate_configuration(options)?;
     let mut out = String::new();
     let mut line = |text: &str| {
         out.push_str(text);
@@ -415,8 +487,10 @@ pub struct Request {
     pub max_token_lifetime: Duration,
     /// Longest accepted lifetime of an elevated token.
     pub max_elevated_token_lifetime: Duration,
-    /// Issue a new certificate even if a usable one exists.
-    pub renew: bool,
+    /// Built-in certificate lifecycle operation; ordinary invocation is `Current`.
+    pub certificate_action: CertificateAction,
+    /// Exact persisted rotation id; required for activate, rollback, finish and cancel.
+    pub rotation_id: Option<String>,
     /// Lifetime of a newly issued certificate.
     pub certificate_validity: Duration,
     /// The current time.
@@ -430,6 +504,15 @@ pub struct Prepared {
     pub configuration: String,
     /// When a newly issued certificate expires, if one was issued.
     pub issued_until: Option<UnixTime>,
+    /// Persisted rotation state, if any.
+    pub rotation: Option<Rotation>,
+    /// SHA-256 of the active leaf DER (lowercase hex), for checking actual listener rollout.
+    pub serving_leaf_sha256: Option<String>,
+    /// SHA-256 of the candidate leaf DER, distinct from the opaque rotation id.
+    pub candidate_leaf_sha256: Option<String>,
+    /// Active certificate expiry when expired or within the 30-day renewal warning window.
+    /// An unannotated external certificate has no reported expiry.
+    pub expiry_warning: Option<UnixTime>,
 }
 
 /// Prepares the cluster for internal discovery (if chosen) and renders the configuration.
@@ -439,34 +522,77 @@ pub struct Prepared {
 /// Returns [`KubeConfigError`] if the distribution is unsupported, Genkan's Service is missing,
 /// or the API refuses a request.
 pub async fn prepare(client: Client, request: &Request) -> Result<Prepared, KubeConfigError> {
-    if request.distro == Distro::Kubesolo {
-        return Err(KubeConfigError::Unsupported);
-    }
-    let (internal, issued_until) = match request.discovery {
-        DiscoveryMode::Public => (None, None),
-        DiscoveryMode::Internal => {
-            let (internal, issued) = ensure_certificate(client, request).await?;
-            (Some(internal), issued)
-        }
-    };
-    let configuration = authentication_configuration(&ApiserverOptions {
+    // Validate rendering before a lifecycle write, so invalid input never changes trust.
+    let options = ApiserverOptions {
         distro: request.distro,
         issuer: request.issuer.clone(),
-        internal,
+        internal: None,
         audiences: request.audiences.clone(),
         max_token_lifetime: request.max_token_lifetime,
         max_elevated_token_lifetime: request.max_elevated_token_lifetime,
+    };
+    validate_configuration(&options)?;
+    let (
+        internal,
+        issued_until,
+        rotation,
+        serving_leaf_sha256,
+        candidate_leaf_sha256,
+        expiry_warning,
+    ) = match request.discovery {
+        DiscoveryMode::Public => {
+            if request.certificate_action != CertificateAction::Current
+                || request.rotation_id.is_some()
+            {
+                return Err(rotation_error(
+                    "certificate rotation requires internal discovery",
+                ));
+            }
+            (None, None, None, None, None, None)
+        }
+        DiscoveryMode::Internal => {
+            let certificate = ensure_certificate(client, request).await?;
+            (
+                Some(certificate.discovery),
+                certificate.issued_until,
+                certificate.rotation,
+                Some(certificate.serving_leaf_sha256),
+                certificate.candidate_leaf_sha256,
+                certificate.expiry_warning,
+            )
+        }
+    };
+    let configuration = authentication_configuration(&ApiserverOptions {
+        internal,
+        ..options
     })?;
     Ok(Prepared {
         configuration,
         issued_until,
+        rotation,
+        serving_leaf_sha256,
+        candidate_leaf_sha256,
+        expiry_warning,
     })
 }
 
+struct Certificate {
+    discovery: InternalDiscovery,
+    issued_until: Option<UnixTime>,
+    rotation: Option<Rotation>,
+    serving_leaf_sha256: String,
+    candidate_leaf_sha256: Option<String>,
+    expiry_warning: Option<UnixTime>,
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "one read-modify-CAS lifecycle kept together"
+)]
 async fn ensure_certificate(
     client: Client,
     request: &Request,
-) -> Result<(InternalDiscovery, Option<UnixTime>), KubeConfigError> {
+) -> Result<Certificate, KubeConfigError> {
     let namespace = &request.namespace;
     let services: Api<Service> = Api::namespaced(client.clone(), namespace);
     let no_service = || KubeConfigError::NoService {
@@ -487,48 +613,356 @@ async fn ensure_certificate(
 
     let secrets: Api<Secret> = Api::namespaced(client, namespace);
     let existing = secrets.get_opt(internal_tls::SECRET).await?;
-    if let Some(secret) = &existing
-        && !request.renew
-        && let Ok(material) = internal_tls::parse(secret)
-        && material.url.as_ref() == Some(&url)
-        && material
-            .not_after
-            .is_none_or(|t| t > request.now.saturating_add(RENEW_BEFORE))
-    {
-        let ca_pem = material
-            .ca_pem
-            .ok_or(KubeConfigError::NoCa(internal_tls::SECRET))?;
-        return Ok((InternalDiscovery { url, ca_pem }, None));
-    }
-
     let dns_names = [
         format!("{NAME}.{namespace}.svc"),
         format!("{NAME}.{namespace}.svc.cluster.local"),
     ];
-    let issued =
+    let issue = || {
         genkan_tls::certificate::issue(ip, &dns_names, request.now, request.certificate_validity)
-            .map_err(TlsError::from)?;
-    let mut secret = internal_tls::secret(namespace, &issued, &url);
-    let params = PostParams::default();
-    match existing {
-        // Replace with the version read above: a concurrent change makes this fail, not race.
-        Some(current) => {
-            secret.metadata.resource_version = current.resource_version();
-            secrets
-                .replace(internal_tls::SECRET, &params, &secret)
-                .await?;
-        }
+            .map_err(TlsError::from)
+    };
+    let mut issued_until = None;
+    let secret = match existing {
         None => {
-            secrets.create(&params, &secret).await?;
+            if request.certificate_action != CertificateAction::Current
+                || request.rotation_id.is_some()
+            {
+                return Err(rotation_error(
+                    "create the initial certificate with --certificate-action current first",
+                ));
+            }
+            let issued = issue()?;
+            issued_until = Some(issued.not_after);
+            secrets
+                .create(
+                    &PostParams::default(),
+                    &internal_tls::secret(namespace, &issued, &url),
+                )
+                .await?
         }
+        Some(mut current) => {
+            let material = internal_tls::parse(&current)?;
+            if material.url.as_ref() != Some(&url) {
+                return Err(rotation_error(
+                    "the active Secret URL differs from the Service; restore the Service address or replace externally issued material explicitly",
+                ));
+            }
+            material
+                .ca_pem
+                .as_ref()
+                .ok_or(KubeConfigError::NoCa(internal_tls::SECRET))?;
+            let state = rotation(&current)?;
+            let changed = match request.certificate_action {
+                CertificateAction::Current => {
+                    if request.rotation_id.is_some() {
+                        return Err(rotation_error("current does not take --rotation-id"));
+                    }
+                    false
+                }
+                CertificateAction::Prepare
+                | CertificateAction::Activate
+                | CertificateAction::Rollback
+                | CertificateAction::Finish
+                | CertificateAction::Cancel => {
+                    if current
+                        .metadata
+                        .labels
+                        .as_ref()
+                        .and_then(|labels| labels.get(crate::MANAGED_BY.0))
+                        .map(String::as_str)
+                        != Some(crate::MANAGED_BY.1)
+                        || current
+                            .metadata
+                            .owner_references
+                            .as_ref()
+                            .is_some_and(|owners| !owners.is_empty())
+                    {
+                        return Err(rotation_error(
+                            "externally managed material must be renewed by its issuer; the CLI never replaces it",
+                        ));
+                    }
+                    match request.certificate_action {
+                        CertificateAction::Prepare => {
+                            if request.rotation_id.is_some() {
+                                return Err(rotation_error("prepare does not take --rotation-id"));
+                            }
+                            match state.as_ref().map(|state| state.phase.as_str()) {
+                                Some("prepared") => false,
+                                Some("activated" | "rolled-back") => {
+                                    return Err(rotation_error(
+                                        "finish or cancel the outstanding rotation first",
+                                    ));
+                                }
+                                _ => {
+                                    let issued = issue()?;
+                                    issued_until = Some(issued.not_after);
+                                    stage(&mut current, &issued)?;
+                                    true
+                                }
+                            }
+                        }
+                        CertificateAction::Activate
+                        | CertificateAction::Rollback
+                        | CertificateAction::Finish
+                        | CertificateAction::Cancel => transition(&mut current, request)?,
+                        CertificateAction::Current => false,
+                    }
+                }
+            };
+            if changed {
+                // Replace the exact object read, retaining UID/resourceVersion and unrelated
+                // fields.
+                current = secrets
+                    .replace(internal_tls::SECRET, &PostParams::default(), &current)
+                    .await?;
+            }
+            current
+        }
+    };
+    let material = internal_tls::parse(&secret)?;
+    let ca_pem = material
+        .ca_pem
+        .ok_or(KubeConfigError::NoCa(internal_tls::SECRET))?;
+    let serving_leaf_sha256 = fingerprint(&material.key)?;
+    let candidate_leaf_sha256 = secret
+        .data
+        .as_ref()
+        .and_then(|fields| fields.get(NEXT_CERT))
+        .map(|cert| {
+            let key = data(&secret, NEXT_KEY)?;
+            let certified =
+                genkan_tls::certificate::certified_key(&cert.0, &key.0).map_err(TlsError::from)?;
+            fingerprint(&certified)
+        })
+        .transpose()?;
+    Ok(Certificate {
+        discovery: InternalDiscovery { url, ca_pem },
+        issued_until,
+        rotation: rotation(&secret)?,
+        serving_leaf_sha256,
+        candidate_leaf_sha256,
+        expiry_warning: material
+            .not_after
+            .filter(|expires| *expires <= request.now.saturating_add(RENEW_BEFORE)),
+    })
+}
+
+fn fingerprint(key: &rustls::sign::CertifiedKey) -> Result<String, KubeConfigError> {
+    let leaf = key
+        .cert
+        .first()
+        .ok_or_else(|| rotation_error("certificate chain is empty"))?;
+    Ok(genkan_core::crypto::hex(&genkan_core::crypto::sha256(
+        leaf.as_ref(),
+    )))
+}
+
+fn rotation_error(message: &str) -> KubeConfigError {
+    KubeConfigError::Rotation(message.to_owned())
+}
+
+fn annotation<'a>(secret: &'a Secret, key: &str) -> Option<&'a str> {
+    secret
+        .metadata
+        .annotations
+        .as_ref()?
+        .get(key)
+        .map(String::as_str)
+}
+
+fn rotation(secret: &Secret) -> Result<Option<Rotation>, KubeConfigError> {
+    match (
+        annotation(secret, ROTATION_ID),
+        annotation(secret, ROTATION_PHASE),
+    ) {
+        (None, None) => Ok(None),
+        (
+            Some(id),
+            Some(phase @ ("prepared" | "activated" | "rolled-back" | "finished" | "cancelled")),
+        ) if !id.is_empty() => Ok(Some(Rotation {
+            id: id.to_owned(),
+            phase: phase.to_owned(),
+        })),
+        _ => Err(rotation_error(
+            "persisted rotation identity or phase is invalid",
+        )),
     }
-    Ok((
-        InternalDiscovery {
-            url,
-            ca_pem: issued.ca_pem,
-        },
-        Some(issued.not_after),
-    ))
+}
+
+fn data(secret: &Secret, key: &str) -> Result<k8s_openapi::ByteString, KubeConfigError> {
+    secret
+        .data
+        .as_ref()
+        .and_then(|fields| fields.get(key))
+        .cloned()
+        .ok_or_else(|| rotation_error("rotation material is incomplete"))
+}
+
+fn stage(
+    secret: &mut Secret,
+    issued: &genkan_tls::certificate::Issued,
+) -> Result<(), KubeConfigError> {
+    let old_ca = data(secret, internal_tls::CA_KEY)?;
+    let old_pem = std::str::from_utf8(&old_ca.0)
+        .map_err(|_utf8| rotation_error("active CA is not PEM text"))?;
+    let bundle =
+        k8s_openapi::ByteString(format!("{}\n{}", old_pem.trim_end(), issued.ca_pem).into_bytes());
+    let id = genkan_core::crypto::random::<16>()
+        .map_err(|_crypto| rotation_error("generating the rotation id failed"))?;
+    let fields = secret.data.get_or_insert_default();
+    fields.insert(ACTIVE_CA.into(), old_ca);
+    for (key, value) in [
+        (NEXT_CERT, &issued.cert_pem),
+        (NEXT_KEY, &issued.key_pem),
+        (NEXT_CA, &issued.ca_pem),
+    ] {
+        fields.insert(
+            key.into(),
+            k8s_openapi::ByteString(value.as_bytes().to_vec()),
+        );
+    }
+    fields.insert(internal_tls::CA_KEY.into(), bundle);
+    let annotations = secret.metadata.annotations.get_or_insert_default();
+    annotations.insert(ROTATION_ID.into(), genkan_core::crypto::hex(&id));
+    annotations.insert(ROTATION_PHASE.into(), "prepared".into());
+    annotations.insert(NEXT_EXPIRY.into(), issued.not_after.as_secs().to_string());
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "all persisted trust transitions share one exhaustive operation match"
+)]
+fn transition(secret: &mut Secret, request: &Request) -> Result<bool, KubeConfigError> {
+    let state = rotation(secret)?
+        .ok_or_else(|| rotation_error("no staged rotation; run --certificate-action prepare"))?;
+    if request.rotation_id.as_deref() != Some(state.id.as_str()) {
+        return Err(rotation_error(
+            "supply --rotation-id from the exact prepared bundle",
+        ));
+    }
+    let (source, expiry_key, phase) = match request.certificate_action {
+        CertificateAction::Activate => {
+            if state.phase == "activated" {
+                return Ok(false);
+            }
+            if state.phase != "prepared" && state.phase != "rolled-back" {
+                return Err(rotation_error(
+                    "only prepared or rolled-back material can be activated",
+                ));
+            }
+            ([NEXT_CERT, NEXT_KEY, NEXT_CA], NEXT_EXPIRY, "activated")
+        }
+        CertificateAction::Rollback => {
+            if state.phase == "rolled-back" {
+                return Ok(false);
+            }
+            if state.phase != "activated" {
+                return Err(rotation_error(
+                    "only an activated rotation can be rolled back",
+                ));
+            }
+            (
+                [PREVIOUS_CERT, PREVIOUS_KEY, PREVIOUS_CA],
+                PREVIOUS_EXPIRY,
+                "rolled-back",
+            )
+        }
+        CertificateAction::Finish | CertificateAction::Cancel => {
+            let (allowed, completed) = if request.certificate_action == CertificateAction::Finish {
+                (state.phase == "activated", "finished")
+            } else {
+                (
+                    state.phase == "prepared" || state.phase == "rolled-back",
+                    "cancelled",
+                )
+            };
+            if state.phase == completed {
+                return Ok(false);
+            }
+            if !allowed {
+                return Err(rotation_error(
+                    "finish requires activation; cancel requires prepared or rolled-back material",
+                ));
+            }
+            let ca = data(secret, ACTIVE_CA)?;
+            let fields = secret.data.get_or_insert_default();
+            fields.insert(internal_tls::CA_KEY.into(), ca);
+            for key in [
+                ACTIVE_CA,
+                NEXT_CERT,
+                NEXT_KEY,
+                NEXT_CA,
+                PREVIOUS_CERT,
+                PREVIOUS_KEY,
+                PREVIOUS_CA,
+            ] {
+                fields.remove(key);
+            }
+            let annotations = secret.metadata.annotations.get_or_insert_default();
+            annotations.remove(NEXT_EXPIRY);
+            annotations.remove(PREVIOUS_EXPIRY);
+            annotations.insert(ROTATION_PHASE.into(), completed.into());
+            return Ok(true);
+        }
+        CertificateAction::Current | CertificateAction::Prepare => {
+            return Err(rotation_error(
+                "this operation does not transition a rotation",
+            ));
+        }
+    };
+    let expiry = annotation(secret, expiry_key)
+        .and_then(|seconds| seconds.parse::<u64>().ok())
+        .map(UnixTime::from_secs)
+        .ok_or_else(|| rotation_error("rotation expiry is missing"))?;
+    if expiry <= request.now {
+        return Err(rotation_error(
+            "refusing to activate an expired certificate",
+        ));
+    }
+    let [cert_name, key_name, ca_name] = source;
+    let [cert, key, ca] = [
+        data(secret, cert_name)?,
+        data(secret, key_name)?,
+        data(secret, ca_name)?,
+    ];
+    genkan_tls::certificate::certified_key(&cert.0, &key.0).map_err(TlsError::from)?;
+    if state.phase == "prepared" {
+        let old = [
+            data(secret, internal_tls::CERT_KEY)?,
+            data(secret, internal_tls::KEY_KEY)?,
+            data(secret, ACTIVE_CA)?,
+        ];
+        let old_expiry = annotation(secret, internal_tls::NOT_AFTER_ANNOTATION)
+            .ok_or_else(|| rotation_error("built-in certificate has no expiry"))?
+            .to_owned();
+        let fields = secret.data.get_or_insert_default();
+        for (name, value) in [PREVIOUS_CERT, PREVIOUS_KEY, PREVIOUS_CA]
+            .into_iter()
+            .zip(old)
+        {
+            fields.insert(name.into(), value);
+        }
+        secret
+            .metadata
+            .annotations
+            .get_or_insert_default()
+            .insert(PREVIOUS_EXPIRY.into(), old_expiry);
+    }
+    let fields = secret.data.get_or_insert_default();
+    for (name, value) in [internal_tls::CERT_KEY, internal_tls::KEY_KEY, ACTIVE_CA]
+        .into_iter()
+        .zip([cert, key, ca])
+    {
+        fields.insert(name.into(), value);
+    }
+    let annotations = secret.metadata.annotations.get_or_insert_default();
+    annotations.insert(
+        internal_tls::NOT_AFTER_ANNOTATION.into(),
+        expiry.as_secs().to_string(),
+    );
+    annotations.insert(ROTATION_PHASE.into(), phase.into());
+    Ok(true)
 }
 
 #[cfg(test)]

@@ -49,6 +49,15 @@ server, the `genkanctl` admin CLI and the `genkan-e2e` tests.
   configuration ([KEP-3331]) rejects any other token that carries them.
 - **Hashes only.** Grants, invitations, the setup token and client secrets are stored as
   SHA-256 hashes of high-entropy values; credentials hold public keys.
+- **Internal CA renewal preserves overlap.** `kube_config` stages candidate material and old+new
+  trust without changing the serving pair. Explicit activation follows per-control-plane
+  successful authentication configuration reload; finish follows actual served-leaf DER
+  fingerprint checks on every Genkan pod. One Secret and `resourceVersion` CAS preserve the
+  rotation id, phase, candidate and rollback pair through conflicts, ambiguous responses and
+  administrator CLI restarts. There is no sleep-based cutover or automatic CA replacement;
+  external issuers keep ownership. Finish removes rollback keys; cancel requires a prepared
+  or fully rolled-back rotation. Host-file distribution is an operator prerequisite, not
+  something the CLI can prove. See [the renewal procedure](../../docs/get-started.md#renew-the-built-in-internal-ca-without-dropping-trust).
 
 ## References
 

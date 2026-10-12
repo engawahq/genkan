@@ -1343,8 +1343,11 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "passkey",
+ "rustls",
+ "serde-saphyr",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "url",
 ]
 
@@ -1370,6 +1373,7 @@ dependencies = [
  "rustls",
  "schemars 1.2.2",
  "serde",
+ "serde-saphyr",
  "serde_json",
  "thiserror 2.0.21",
  "time",

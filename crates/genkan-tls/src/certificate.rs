@@ -134,8 +134,9 @@ pub fn issue(
 ///
 /// # Errors
 ///
-/// [`CertificateError`] if either is not valid PEM, the chain is empty, or the key type is not
-/// supported.
+/// [`CertificateError`] if either is not valid PEM, the chain is empty, the key type is not
+/// supported, or the key does not match the leaf. A staged renewal must not activate material
+/// that can load but cannot complete a TLS handshake.
 pub fn certified_key(
     chain_pem: &[u8],
     key_pem: &[u8],
@@ -152,7 +153,9 @@ pub fn certified_key(
         .key_provider
         .load_private_key(key)
         .map_err(CertificateError::Key)?;
-    Ok(Arc::new(CertifiedKey::new(chain, signing_key)))
+    let key = CertifiedKey::new(chain, signing_key);
+    key.keys_match().map_err(CertificateError::Key)?;
+    Ok(Arc::new(key))
 }
 
 #[cfg(test)]
@@ -187,5 +190,13 @@ mod tests {
         assert_eq!(key.cert.len(), 1);
         assert!(certified_key(b"", issued.key_pem.as_bytes()).is_err());
         assert!(certified_key(issued.cert_pem.as_bytes(), b"nope").is_err());
+        let other = issue(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            &[],
+            NOW,
+            Duration::from_hours(1),
+        )
+        .unwrap();
+        assert!(certified_key(issued.cert_pem.as_bytes(), other.key_pem.as_bytes()).is_err());
     }
 }

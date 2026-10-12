@@ -1,6 +1,8 @@
 //! End to end on a real cluster: Genkan runs as a pod from its image, `kube-config` prepares
 //! kube-apiserver, an admin enrols a passkey from a setup link and signs in, and kube-apiserver
-//! accepts the resulting access token (`kubectl auth whoami`).
+//! accepts the resulting access token (`kubectl auth whoami`). The tail rotates internal CA
+//! trust through overlap, observed successful config reload, actual pod leaf fingerprints,
+//! rollback/reactivation and new-only trust, with fresh authentication at each phase.
 //!
 //! Needs a k3s cluster whose kube-apiserver reads its `AuthenticationConfiguration` from a
 //! directory on this machine, and the image loaded into the cluster. CI sets this up (see the
@@ -14,14 +16,17 @@
 
 #[cfg(test)]
 mod tests {
+    use std::net::IpAddr;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use axum::body::Bytes;
     use axum::http::{HeaderMap, Method, Request, StatusCode, header};
     use genkan_core::clock::{Clock as _, SystemClock};
     use genkan_core::config::BaseUrl;
+    use genkan_core::crypto::{hash_secret, hex, sha256};
     use genkan_k8s::crd::client::{ClientType, OAuthClient, OAuthClientSpec};
     use genkan_k8s::crd::definitions;
     use genkan_k8s::kube_config::{self, DiscoveryMode, Distro};
@@ -33,7 +38,7 @@ mod tests {
     use http_body_util::{BodyExt as _, Full};
     use hyper_util::rt::TokioIo;
     use k8s_openapi::api::apps::v1::Deployment;
-    use k8s_openapi::api::core::v1::{Namespace, Node, Service, ServicePort, ServiceSpec};
+    use k8s_openapi::api::core::v1::{Namespace, Node, Pod, Service, ServicePort, ServiceSpec};
     use kube::api::{
         Api, DeleteParams, DynamicObject, ListParams, ObjectMeta, Patch, PatchParams, PostParams,
     };
@@ -43,8 +48,12 @@ mod tests {
     use kube::{Client, ResourceExt as _};
     use passkey::client::DefaultClientData;
     use passkey::types::webauthn::{CredentialCreationOptions, CredentialRequestOptions};
+    use rustls::pki_types::pem::PemObject as _;
+    use rustls::pki_types::{CertificateDer, ServerName};
+    use rustls::{ClientConfig, RootCertStore};
     use serde_json::{Value, json};
     use tokio::net::TcpStream;
+    use tokio_rustls::TlsConnector;
     use url::Url;
 
     const ISSUER: &str = "https://genkan.e2e.invalid";
@@ -237,6 +246,271 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_owned()
     }
 
+    fn emitted_ca(configuration: &str) -> String {
+        let document: Value = serde_saphyr::from_str(configuration).unwrap();
+        document["jwt"].as_array().unwrap().first().unwrap()["issuer"]["certificateAuthority"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    /// Reads a Prometheus sample by metric name and required labels, not by log wording.
+    fn metric(metrics: &str, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
+        metrics.lines().find_map(|line| {
+            let (sample, value) = line.split_once(' ')?;
+            let (sample_name, fields) = sample.split_once('{')?;
+            let fields = fields.strip_suffix('}')?;
+            if sample_name != name
+                || !labels.iter().all(|(key, value)| {
+                    fields.split(',').any(|field| {
+                        field
+                            .split_once('=')
+                            .is_some_and(|(field_key, field_value)| {
+                                field_key == *key
+                                    && field_value
+                                        .strip_prefix('"')
+                                        .and_then(|value| value.strip_suffix('"'))
+                                        == Some(*value)
+                            })
+                    })
+                })
+            {
+                return None;
+            }
+            value.parse().ok()
+        })
+    }
+
+    async fn authn_metrics(admin: &Client) -> Result<String, kube::Error> {
+        admin
+            .request_text(Request::get("/metrics").body(Vec::new()).unwrap())
+            .await
+    }
+
+    /// This scenario has one direct API server. Require the successful reload counter to
+    /// advance and the exact written configuration's hash to become the applied hash.
+    async fn install_authn(admin: &Client, directory: &Path, configuration: &str) {
+        let counter = "apiserver_authentication_config_controller_automatic_reloads_total";
+        let info = "apiserver_authentication_config_controller_last_config_info";
+        let baseline = metric(
+            &authn_metrics(admin).await.unwrap(),
+            counter,
+            &[("status", "success")],
+        )
+        .unwrap_or(0.0);
+        let hash = hash_secret(configuration.as_bytes());
+        write_authn(directory, configuration);
+        wait_for(
+            "the exact authentication configuration's successful reload",
+            APISERVER_PICKUP,
+            || async {
+                let Ok(metrics) = authn_metrics(admin).await else {
+                    return false;
+                };
+                metric(&metrics, counter, &[("status", "success")])
+                    .is_some_and(|value| value > baseline)
+                    && metric(&metrics, info, &[("hash", &hash)]).is_some_and(|value| value > 0.0)
+            },
+        )
+        .await;
+    }
+
+    /// A fresh TLS connection verifies the emitted CA bundle for the Service IP, consumes
+    /// actual pod discovery, and returns the served leaf's DER fingerprint.
+    async fn served_leaf(address: &str, service_ip: IpAddr, ca: &str) -> std::io::Result<String> {
+        let mut roots = RootCertStore::empty();
+        for certificate in CertificateDer::pem_slice_iter(ca.as_bytes()) {
+            roots
+                .add(certificate.map_err(std::io::Error::other)?)
+                .map_err(std::io::Error::other)?;
+        }
+        let config = ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(std::io::Error::other)?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let tcp = TcpStream::connect(address).await?;
+        let tls = TlsConnector::from(Arc::new(config))
+            .connect(ServerName::IpAddress(service_ip.into()), tcp)
+            .await?;
+        let leaf = tls
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|certificates| certificates.first())
+            .ok_or_else(|| std::io::Error::other("server sent no certificate"))?;
+        let fingerprint = hex(&sha256(leaf.as_ref()));
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+            .await
+            .map_err(std::io::Error::other)?;
+        tokio::spawn(connection);
+        let response = sender
+            .send_request(
+                Request::get("/.well-known/openid-configuration")
+                    .header(header::HOST, service_ip.to_string())
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            )
+            .await
+            .map_err(std::io::Error::other)?;
+        if response.status() != StatusCode::OK {
+            return Err(std::io::Error::other("pod discovery is unavailable"));
+        }
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(std::io::Error::other)?
+            .to_bytes();
+        let discovery: Value = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+        if discovery["issuer"] != ISSUER {
+            return Err(std::io::Error::other(
+                "pod discovery names the wrong issuer",
+            ));
+        }
+        Ok(fingerprint)
+    }
+
+    async fn wait_leaf(address: &str, ip: IpAddr, ca: &str, fingerprint: &str) {
+        wait_for(
+            "the actual served certificate generation",
+            APISERVER_PICKUP,
+            || async {
+                served_leaf(address, ip, ca)
+                    .await
+                    .is_ok_and(|actual| actual == fingerprint)
+            },
+        )
+        .await;
+    }
+
+    /// Mint a fresh default-lifetime token at each phase; multi-minute certificate polling
+    /// must not turn an expired token into a false rotation failure.
+    async fn assert_rotation_authentication(address: &str, device: &mut Device) {
+        let tokens = sign_in(address, device, "openid").await;
+        let kubeconfig = token_kubeconfig(
+            &std::env::temp_dir(),
+            "ca-rotation",
+            tokens["access_token"].as_str().unwrap(),
+        );
+        let whoami = kubectl(&kubeconfig, &["auth", "whoami", "-o", "json"]).unwrap();
+        let document: Value = serde_json::from_str(&whoami).unwrap();
+        assert_eq!(document["status"]["userInfo"]["username"], "genkan:admin");
+        std::fs::remove_file(kubeconfig).unwrap();
+    }
+
+    async fn rotate_internal_ca(
+        admin: &Client,
+        namespace: &str,
+        node_ip: &str,
+        issuer: &BaseUrl,
+        directory: &Path,
+        public_address: &str,
+        device: &mut Device,
+    ) {
+        let services: Api<Service> = Api::namespaced(admin.clone(), namespace);
+        let service_ip: IpAddr = services
+            .get(rbac::NAME)
+            .await
+            .unwrap()
+            .spec
+            .unwrap()
+            .cluster_ip
+            .unwrap()
+            .parse()
+            .unwrap();
+        // One serving pod makes the dedicated NodePort an unambiguous leaf observation.
+        let pods: Api<Pod> = Api::namespaced(admin.clone(), namespace);
+        assert_eq!(
+            pods.list(&ListParams::default().labels("app.kubernetes.io/name=genkan"))
+                .await
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+        let nodeport: Service = serde_json::from_value(json!({
+            "metadata": {"name":"genkan-e2e-internal"},
+            "spec": {"type":"NodePort", "selector":{"app.kubernetes.io/name":rbac::NAME},
+                "ports":[{"port":443,"targetPort":deployment::INTERNAL_PORT}]}
+        }))
+        .unwrap();
+        let port = services
+            .create(&PostParams::default(), &nodeport)
+            .await
+            .unwrap()
+            .spec
+            .unwrap()
+            .ports
+            .unwrap()
+            .first()
+            .unwrap()
+            .node_port
+            .unwrap();
+        let address = format!("{node_ip}:{port}");
+        let mut request = kube_config::Request {
+            namespace: namespace.to_owned(),
+            distro: Distro::K3s,
+            issuer: issuer.clone(),
+            discovery: DiscoveryMode::Internal,
+            audiences: vec!["kubernetes".into()],
+            max_token_lifetime: Duration::from_hours(1),
+            max_elevated_token_lifetime: Duration::from_mins(5),
+            certificate_action: kube_config::CertificateAction::Current,
+            rotation_id: None,
+            certificate_validity: Duration::from_hours(24),
+            now: SystemClock.now(),
+        };
+        let current = kube_config::prepare(admin.clone(), &request).await.unwrap();
+        let old_ca = emitted_ca(&current.configuration);
+        let old_leaf = current.serving_leaf_sha256.unwrap();
+        wait_leaf(&address, service_ip, &old_ca, &old_leaf).await;
+        request.certificate_action = kube_config::CertificateAction::Prepare;
+        let prepared = kube_config::prepare(admin.clone(), &request).await.unwrap();
+        let overlap = emitted_ca(&prepared.configuration);
+        let candidate = prepared.candidate_leaf_sha256.unwrap();
+        request.rotation_id = Some(prepared.rotation.unwrap().id);
+        assert_eq!(
+            served_leaf(&address, service_ip, &old_ca).await.unwrap(),
+            old_leaf
+        );
+        install_authn(admin, directory, &prepared.configuration).await;
+        assert_rotation_authentication(public_address, device).await;
+        assert_eq!(
+            served_leaf(&address, service_ip, &overlap).await.unwrap(),
+            old_leaf
+        );
+        request.certificate_action = kube_config::CertificateAction::Activate;
+        request.now = SystemClock.now();
+        kube_config::prepare(admin.clone(), &request).await.unwrap();
+        wait_leaf(&address, service_ip, &overlap, &candidate).await;
+        assert!(served_leaf(&address, service_ip, &old_ca).await.is_err());
+        assert_rotation_authentication(public_address, device).await;
+        request.certificate_action = kube_config::CertificateAction::Rollback;
+        request.now = SystemClock.now();
+        let rolled_back = kube_config::prepare(admin.clone(), &request).await.unwrap();
+        let rollback_trust = emitted_ca(&rolled_back.configuration);
+        wait_leaf(&address, service_ip, &rollback_trust, &old_leaf).await;
+        assert_rotation_authentication(public_address, device).await;
+        request.certificate_action = kube_config::CertificateAction::Activate;
+        request.now = SystemClock.now();
+        kube_config::prepare(admin.clone(), &request).await.unwrap();
+        wait_leaf(&address, service_ip, &overlap, &candidate).await;
+        assert_rotation_authentication(public_address, device).await;
+        request.certificate_action = kube_config::CertificateAction::Finish;
+        let finished = kube_config::prepare(admin.clone(), &request).await.unwrap();
+        let new_ca = emitted_ca(&finished.configuration);
+        install_authn(admin, directory, &finished.configuration).await;
+        assert_rotation_authentication(public_address, device).await;
+        assert_eq!(
+            served_leaf(&address, service_ip, &new_ca).await.unwrap(),
+            candidate
+        );
+        assert!(served_leaf(&address, service_ip, &old_ca).await.is_err());
+    }
+
     /// Signs in with `device` through Genkan's public listener, as kubectl's OIDC plugin would
     /// (authorization request, passkey, code, token), and returns the token response.
     async fn sign_in(address: &str, device: &mut Device, scope: &str) -> Value {
@@ -342,7 +616,8 @@ mod tests {
                 audiences: vec!["kubernetes".into()],
                 max_token_lifetime: Duration::from_hours(1),
                 max_elevated_token_lifetime: Duration::from_mins(5),
-                renew: false,
+                certificate_action: kube_config::CertificateAction::Current,
+                rotation_id: None,
                 certificate_validity: Duration::from_hours(24),
                 now: SystemClock.now(),
             },
@@ -573,6 +848,16 @@ mod tests {
             working_set <= 30 * 1024 * 1024,
             "working set {working_set} bytes exceeds 30 MiB"
         );
+        rotate_internal_ca(
+            &admin,
+            &namespace,
+            &node_ip,
+            &issuer,
+            &authn_dir,
+            &address,
+            &mut device,
+        )
+        .await;
 
         // Clean up: forget the issuer, remove the namespace.
         write_authn(&authn_dir, EMPTY_AUTHN);

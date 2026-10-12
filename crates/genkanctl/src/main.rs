@@ -116,7 +116,8 @@ fn kube_config(args: &KubeConfigArgs) -> ExitCode {
         audiences: args.audiences.clone(),
         max_token_lifetime: args.max_token_lifetime,
         max_elevated_token_lifetime: args.max_elevated_token_lifetime,
-        renew: args.renew_certificate,
+        certificate_action: args.certificate_action,
+        rotation_id: args.rotation_id.clone(),
         certificate_validity: args.certificate_validity,
         now: genkan_core::clock::SystemClock.now(),
     };
@@ -129,12 +130,59 @@ fn kube_config(args: &KubeConfigArgs) -> ExitCode {
     match result {
         Ok(prepared) => {
             output::stdout(prepared.configuration.trim_end());
+            let outstanding_rotation = prepared.rotation.as_ref().is_some_and(|rotation| {
+                matches!(
+                    rotation.phase.as_str(),
+                    "prepared" | "activated" | "rolled-back"
+                )
+            });
+            if let Some(until) = prepared.expiry_warning {
+                let status = if until <= request.now {
+                    "has expired"
+                } else {
+                    "expires within 30 days"
+                };
+                output::stderr(&format!(
+                    "Warning: the active internal certificate {status} (not-after Unix time {}). Plain kube-config does not replace live trust.",
+                    until.as_secs()
+                ));
+                if outstanding_rotation {
+                    output::stderr(
+                        "Complete the outstanding staged renewal after verifying its rollout prerequisites, or renew through the external issuer.",
+                    );
+                } else {
+                    output::stderr(
+                        "For built-in material, run genkanctl kube-config with --certificate-action prepare and follow docs/get-started.md; external issuers renew their own material.",
+                    );
+                }
+            }
             if let Some(until) = prepared.issued_until {
                 output::stderr(&format!(
-                    "Issued a new internal certificate, valid until Unix time {} ({} days). Re-run this command before then.",
+                    "Issued internal certificate material, valid until Unix time {} ({} days). For renewal, prepare overlap before explicit activation.",
                     until.as_secs(),
                     args.certificate_validity.as_secs() / 86_400
                 ));
+            }
+            if let Some(fingerprint) = &prepared.serving_leaf_sha256 {
+                output::stderr(&format!(
+                    "Active leaf SHA-256 (DER, lowercase hex): {fingerprint}"
+                ));
+            }
+            if let Some(fingerprint) = &prepared.candidate_leaf_sha256 {
+                output::stderr(&format!(
+                    "Candidate leaf SHA-256 (DER, lowercase hex): {fingerprint}"
+                ));
+            }
+            if let Some(rotation) = &prepared.rotation {
+                output::stderr(&format!(
+                    "Rotation id: {}; phase: {}. This id is not a certificate fingerprint.",
+                    rotation.id, rotation.phase
+                ));
+                if outstanding_rotation {
+                    output::stderr(
+                        "Before --certificate-action activate, install the exact overlap file and verify its successful reload on every control plane. Before --certificate-action finish, verify every pod's served leaf fingerprint matches the candidate. The CLI cannot verify external host files; see the renewal procedure in docs/get-started.md.",
+                    );
+                }
             }
             output::stderr(
                 genkan_k8s::kube_config::instructions(args.distro, args.discovery).trim_end(),

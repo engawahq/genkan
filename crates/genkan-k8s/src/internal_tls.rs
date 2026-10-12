@@ -13,9 +13,10 @@
 //! keeps someone who can answer at the ClusterIP from handing kube-apiserver their own keys. The
 //! chain ends in a certificate with `CA:TRUE` because Go's TLS stack, which kube-apiserver uses,
 //! requires that even for a self-signed setup ([Authenticating]). The certificate also names the
-//! Service's DNS names, for clients that can resolve them. A renewed certificate is picked up by
-//! the running server within a minute; because a new CA comes with it, the configuration printed
-//! by `kube-config` must be installed again.
+//! Service's DNS names, for clients that can resolve them. Built-in CA renewal stages an
+//! overlapping trust bundle without changing the live serving pair; explicit activation
+//! follows distribution to every control plane ([`crate::kube_config`]). External issuers
+//! retain ownership of their Secrets.
 //!
 //! # References
 //!
@@ -47,9 +48,9 @@ pub const URL_ANNOTATION: &str = "genkan.engawahq.dev/internal-url";
 pub const NOT_AFTER_ANNOTATION: &str = "genkan.engawahq.dev/not-after";
 
 const TLS_TYPE: &str = "kubernetes.io/tls";
-const CERT_KEY: &str = "tls.crt";
-const KEY_KEY: &str = "tls.key";
-const CA_KEY: &str = "ca.crt";
+pub(crate) const CERT_KEY: &str = "tls.crt";
+pub(crate) const KEY_KEY: &str = "tls.key";
+pub(crate) const CA_KEY: &str = "ca.crt";
 
 /// Why the certificate Secret could not be used.
 #[derive(Debug, Error)]

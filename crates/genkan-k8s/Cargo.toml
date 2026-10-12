@@ -41,3 +41,4 @@ tokio-rustls.workspace = true
 rustls.workspace = true
 time.workspace = true
 proptest.workspace = true
+serde-saphyr.workspace = true

@@ -73,6 +73,7 @@ its container image.
 | Disc. 4, 4.3 | Document at `/.well-known/openid-configuration`; `issuer` identical | MUST | `genkan-oauth/src/metadata.rs` | `genkan-oauth: metadata::tests::both_metadata_locations_serve_the_same_document` | Met |
 | 8414 §3, §3.3 | Well-known location; identical `issuer`; RFC 9068 §4 consistency | MUST | one document at both paths | same | Met |
 | Disc. 7.1 | TLS for discovery | MUST | TLS at the ingress; the internal listener for kube-apiserver uses Genkan's own CA | `genkan: internal::tests::serves_metadata_with_the_issued_certificate_and_renews_in_place` | Met |
+| Project trust-lifecycle requirement; [Kubernetes API updates](https://kubernetes.io/docs/reference/using-api/api-concepts/#updates-to-existing-resources) | Built-in CA renewal prepares overlapping trust before explicit activation, with persisted identity and CAS; no implicit expiry replacement | Design | `genkan-k8s/src/kube_config.rs`, `genkan-tls/src/certificate.rs` | `genkan-k8s: certificate_lifecycle::*` (actual TLS and CLI subprocess; CAS race on cluster); `genkan-e2e: passkey_sign_in_then_kubectl_auth_whoami` (pod-backed CA transition, successful config reload hash/counter, actual leaf and fresh authentication) | Met; HA external-host reload/per-pod rollout checks remain operator prerequisites |
 
 ## JOSE: RFC 7515, 7517, 7518, 7638, 8725
 

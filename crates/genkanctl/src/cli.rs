@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use genkan_core::config::{BaseUrl, ConfigError, parse_duration};
-use genkan_k8s::kube_config::{DiscoveryMode, Distro};
+use genkan_k8s::kube_config::{CertificateAction, DiscoveryMode, Distro};
 
 /// Administer Genkan with your own kubeconfig: install manifests, configure kube-apiserver,
 /// issue setup links and invitations.
@@ -147,9 +147,13 @@ pub(crate) struct KubeConfigArgs {
     /// Longest lifetime kube-apiserver accepts for a token carrying `elevated:` groups.
     #[arg(long, default_value = "5m", value_parser = parse_duration)]
     pub max_elevated_token_lifetime: Duration,
-    /// Issue a new internal certificate even if the current one is still good.
+    /// Built-in CA lifecycle: prepare overlap, activate after verified distribution, then
+    /// finish after verified serving rollout. Current creates only the initial certificate.
+    #[arg(long, value_enum, default_value_t = CertificateAction::Current)]
+    pub certificate_action: CertificateAction,
+    /// Persisted id from prepare; required for activate, rollback, finish and cancel.
     #[arg(long)]
-    pub renew_certificate: bool,
+    pub rotation_id: Option<String>,
     /// Lifetime of a newly issued internal certificate.
     #[arg(long, default_value = "365d", value_parser = parse_duration)]
     pub certificate_validity: Duration,
@@ -188,5 +192,24 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn certificate_lifecycle_is_explicit_and_destructive_renewal_is_removed() {
+        let args = [
+            "genkanctl",
+            "kube-config",
+            "--issuer",
+            "https://login.example.com",
+            "--distro",
+            "k3s",
+        ];
+        assert!(Cli::try_parse_from(args.into_iter().chain(["--renew-certificate"])).is_err());
+        for action in ["prepare", "activate", "rollback", "finish", "cancel"] {
+            assert!(
+                Cli::try_parse_from(args.into_iter().chain(["--certificate-action", action]))
+                    .is_ok()
+            );
+        }
     }
 }

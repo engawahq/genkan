@@ -14,6 +14,13 @@ scenario is `tests/e2e.rs`:
    yields a short token without a refresh token in which the user is `genkan:elevated:admins`,
    and that an ID token is rejected.
 5. Check that the pod's working set after the sign-in is at most 30 MiB.
+6. Prepare overlapping internal CA trust without changing the pod's leaf; install the exact
+   emitted configuration and observe a successful reload counter increase plus its applied-file
+   hash. Activate, observe the pod's actual SHA-256 DER leaf fingerprint through verified TLS,
+   and authenticate a fresh access token. Roll back and reactivate before finishing and
+   reloading new-only trust. Every trust bundle is parsed from emitted YAML, not read directly
+   from the Secret. This scenario uses one direct API server and one serving pod; HA operators
+   must perform the documented per-control-plane and per-pod checks themselves.
 
 ## Running it
 
@@ -39,7 +46,10 @@ The test is `#[ignore]`d by default. It needs:
 
 Then run `cargo nextest run --run-ignored only -E 'binary(e2e)'`. The `kubernetes` job in
 `.github/workflows/ci.yml` does all of this on every change. kube-apiserver re-reads the file
-about once a minute and then fetches discovery, so the test waits up to three minutes for it.
+about once a minute and then fetches discovery, so each bounded poll waits up to three minutes
+for the required observed reload or leaf generation. The CA lifecycle can span several polls;
+fresh passkey sign-ins avoid mistaking token expiry for a trust-rotation failure. Elapsed time
+alone is never accepted as rollout evidence.
 
 ## Place in the workspace
 

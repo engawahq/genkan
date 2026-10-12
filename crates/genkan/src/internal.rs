@@ -122,7 +122,7 @@ fn warn_if_expiring(material: &Material, now: UnixTime) {
     {
         tracing::warn!(
             expires_in_hours = not_after.as_secs().saturating_sub(now.as_secs()) / 3600,
-            "internal listener certificate expires soon; re-run `genkanctl kube-config --renew-certificate`"
+            "internal listener certificate expires soon; prepare overlapping trust with `genkanctl kube-config --certificate-action prepare` before activation (external issuers renew their own material)"
         );
     }
 }

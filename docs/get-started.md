@@ -250,12 +250,114 @@ sudo install -m 600 ~/authn.yaml /etc/rancher/k3s/genkan/.authn.yaml.tmp
 sudo mv /etc/rancher/k3s/genkan/.authn.yaml.tmp /etc/rancher/k3s/genkan/authn.yaml
 ```
 
-Wait for a successful reload:
+Verify the successful load on each control plane, connecting to that API server directly
+rather than a load balancer. For reloads, the success counter/timestamp must advance from its
+value before replacement; `last_config_info` must name `sha256:<sha256sum of the exact file
+bytes>` with value `1`. A counter that was already nonzero does not prove this file loaded.
 
 ```sh
-kubectl get --raw /metrics | grep '^apiserver_authentication_config_controller_automatic_reloads_total'
-# ...{status="success"} 1
+# Repeat using an admin context that points directly at each control plane.
+sha256sum ~/authn.yaml
+kubectl get --raw /metrics | grep '^apiserver_authentication_config_controller_'
+# automatic_reloads_total{...,status="success"} increases on successful reload
+# automatic_reload_last_timestamp_seconds{...,status="success"} advances
+# last_config_info{...,hash="sha256:<file digest>"} 1
 ```
+
+The hash metric records a successfully applied file, including the initial load after
+restart; it is not a host-file presence check or proof that every API server behind a load
+balancer loaded it. The metric definitions and success path are in Kubernetes
+[authenticationconfig metrics](https://github.com/kubernetes/kubernetes/blob/v1.37.1/staging/src/k8s.io/apiserver/pkg/server/options/authenticationconfig/metrics/metrics.go)
+and [authentication options](https://github.com/kubernetes/kubernetes/blob/v1.37.1/pkg/kubeapiserver/options/authentication.go).
+
+### Renew the built-in internal CA without dropping trust
+
+The initial install remains a plain `kube-config` invocation. The built-in CA private key is
+discarded after issuance, so renewal requires distributing new trust **before** changing the
+serving leaf. `--renew-certificate` is removed: it replaced the leaf before that distribution.
+Plain invocation now reuses existing material even near expiry; it warns rather than replacing
+trust. Start renewal while the old certificate remains valid. Unusable or differently addressed
+existing material is an error, not an excuse to overwrite it. An external issuer retains
+ownership and renews its own material; this procedure is a complete built-in renewal path.
+
+1. Prepare the candidate. Keep the same issuer, namespace, audiences and distribution options
+   in **every** invocation. stdout is the overlap configuration; stderr reports the opaque
+   rotation id and the active/candidate **SHA-256 DER leaf** fingerprints. Save all three.
+
+   ```sh
+   genkanctl kube-config --issuer $ISSUER --distro k3s \
+     --certificate-action prepare > ~/authn-overlap.yaml
+   ```
+
+   The active `tls.crt`/`tls.key` are unchanged. `ca.crt` contains old+new trust, and candidate
+   material is persisted in the same Secret. Repeating prepare, including after a lost response
+   or CLI restart, returns that same candidate instead of issuing another. A `409 Conflict`
+   does not activate anything; rerun the command to read the winning persisted generation.
+
+2. Atomically install the **exact overlap file** on every control-plane host using the
+   distribution's instructions above. Before activation, verify the per-control-plane successful
+   authentication reload counter/timestamp and exact-file hash metric as described above, and
+   authenticate an access token directly against each API server. A sleep, existing nonzero
+   counter, or success through one load-balanced endpoint is not evidence for the other hosts.
+   The CLI has no access to external host configuration and cannot perform or certify these checks.
+
+3. Activate only after those checks, supplying the saved id:
+
+   ```sh
+   ROTATION_ID=<opaque-id-from-prepare>
+   genkanctl kube-config --issuer $ISSUER --distro k3s \
+     --certificate-action activate --rotation-id "$ROTATION_ID" > ~/authn-overlap.yaml
+   ```
+
+   Activation changes the serving pair with a `resourceVersion` compare-and-swap and retains
+   overlap plus the previous pair. It is retry-safe after an ambiguous response, but is not an
+   instantaneous rollout: running Genkan pods load it on their next Secret poll. Existing TLS
+   connections may still use the old leaf. Overlap verifies either generation.
+
+4. Verify **each Genkan pod's actual served leaf**, not just the load-balanced Service or its
+   Secret. From a control-plane host that can route to each pod, use the old+new `ca.crt` as the
+   trust file and the Service IP as the certificate identity:
+
+   ```sh
+   # Public trust certificates only; keep this overlap file through rollout/rollback.
+   kubectl -n genkan-system get secret genkan-internal-tls \
+     -o jsonpath='{.data.ca\.crt}' | base64 -d > overlap-ca.pem
+   SERVICE_IP=$(kubectl -n genkan-system get service genkan -o jsonpath='{.spec.clusterIP}')
+   kubectl -n genkan-system get pods -l app.kubernetes.io/name=genkan -o wide
+   set -o pipefail
+   # Repeat with every pod IP, including any old/draining generation still serving.
+   POD_IP=<pod-ip>
+   openssl s_client -connect "$POD_IP:8443" -verify_ip "$SERVICE_IP" \
+     -verify_return_error -CAfile overlap-ca.pem </dev/null 2>/dev/null \
+     | openssl x509 -outform DER | sha256sum
+   ```
+
+   Require the lowercase hex digest to equal the saved **candidate leaf fingerprint** on every
+   pod. The opaque rotation id is not a fingerprint. Also check discovery/JWKS reachability and
+   access-token authentication directly on every control plane; a matching leaf alone does not
+   prove authentication is configured correctly.
+
+5. Finish only once no serving pod presents the old leaf:
+
+   ```sh
+   genkanctl kube-config --issuer $ISSUER --distro k3s \
+     --certificate-action finish --rotation-id "$ROTATION_ID" > ~/authn-new-only.yaml
+   ```
+
+   Finish removes previous/candidate keys and prints new-only trust. It is the **one-way door**
+   for built-in rollback. Atomically install that file on all control planes and again verify
+   successful reload and its exact hash per host. Finished/cancelled id/phase markers remain
+   for safe retries until the next prepare creates a new id.
+
+Before finish, `--certificate-action rollback --rotation-id "$ROTATION_ID"` restores the
+previous **unexpired** serving pair while retaining overlap; wait for the actual old leaf on
+every pod, not a fixed timer. Retry rollback safely or reactivate the same candidate. To abandon
+a prepared or fully rolled-back rotation, use `--certificate-action cancel --rotation-id
+"$ROTATION_ID"` and distribute its old-only output after verifying all pods serve the old leaf.
+Cancel does not rewind an activated rollout; roll back and verify it first. Neither rollback
+nor cancel can undo TLS connections already established, and finish permanently deletes the
+old rollback pair. Back up the Secret securely if your operational policy requires recovery
+outside this lifecycle; it contains serving private keys, never a built-in CA signing key.
 
 ## 7. Register kubectl and enrol the first passkey
 
