@@ -9,9 +9,8 @@ Secret, issuing the internal certificate) therefore happens here, with a human's
 
 - `genkanctl crds`: the custom resource definitions as a Kubernetes `List`, for
   `kubectl apply -f -`.
-- `genkanctl rbac [--scim --scim-group <g>…]`: the namespace, service account, `Role`,
-  `RoleBinding`, the admin bindings and the empty key Secret; with `--scim`, also SCIM's rules and
-  admission policy.
+- `genkanctl rbac`: the namespace, service account, `Role`, `RoleBinding`, the admin bindings and
+  the empty key Secret.
 - `genkanctl manifests --issuer <url> --image <ref>`: everything `rbac` prints plus the Service
   and the single-replica Deployment.
 - `genkanctl kube-config --issuer <url> --distro <k3s|k0s|kubeadm|kubesolo|generic>`: issues the

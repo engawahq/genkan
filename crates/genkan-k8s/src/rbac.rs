@@ -18,8 +18,7 @@
 //!   and redeem (`delete`), but not create.
 //! - **Nothing else.** No cluster-scoped rights, nothing in other namespaces, no RBAC objects, no
 //!   `impersonate`. The admin bindings ([`ADMINS_BINDING`], [`ELEVATED_ADMINS_BINDING`]) are
-//!   applied at install with the cluster admin's rights; Genkan cannot change them. SCIM adds
-//!   writes on `users`, bounded by an admission policy ([`scim_policy`]).
+//!   applied at install with the cluster admin's rights; Genkan cannot change them.
 //!
 //! # References
 //!
@@ -149,116 +148,14 @@ fn meta(name: &str, namespace: Option<&str>) -> ObjectMeta {
     }
 }
 
-/// Rules added to Genkan's Role when SCIM provisioning is enabled: writing `User` objects,
-/// bounded by [`scim_policy`].
-#[must_use]
-pub fn scim_rules() -> Vec<PolicyRule> {
-    vec![rule(
-        &[GROUP],
-        &["users"],
-        &[],
-        &["create", "update", "delete"],
-    )]
-}
-
-/// The admission policy and binding that bound SCIM's writes, whatever Genkan's code does.
-///
-/// Genkan's service account may only create, change or delete users labelled
-/// `genkan.engawahq.dev/source=scim`, with groups from `groups`, and never with elevated groups.
-/// RBAC cannot scope a rule by label, so the boundary is an admission policy:
-/// `ValidatingAdmissionPolicy` (`admissionregistration.k8s.io/v1`, GA in Kubernetes 1.30), which
-/// matches only requests from Genkan's service account and fails closed (`failurePolicy: Fail`).
-/// A bug or a compromise in Genkan's SCIM code therefore cannot touch the bootstrap admin or
-/// grant elevated groups.
-#[must_use]
-pub fn scim_policy(namespace: &str, groups: &[String]) -> Vec<Value> {
-    let name = format!("genkan-scim-{namespace}");
-    let source = super::users::SOURCE_LABEL;
-    let scim = super::users::SCIM_SOURCE;
-    let labelled = |object: &str| {
-        format!(
-            "has({object}.metadata.labels) && '{source}' in {object}.metadata.labels && {object}.metadata.labels['{source}'] == '{scim}'"
-        )
-    };
-    let allowed = groups
-        .iter()
-        .map(|g| format!("'{g}'"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let validation = |expression: String, message: &str| serde_json::json!({ "expression": expression, "message": message });
-    let labels = serde_json::json!({ MANAGED_BY.0: MANAGED_BY.1 });
-    vec![
-        serde_json::json!({
-            "apiVersion": "admissionregistration.k8s.io/v1",
-            "kind": "ValidatingAdmissionPolicy",
-            "metadata": { "name": name, "labels": labels },
-            "spec": {
-                "failurePolicy": "Fail",
-                "matchConstraints": {
-                    "resourceRules": [{
-                        "apiGroups": [GROUP],
-                        "apiVersions": ["*"],
-                        "operations": ["CREATE", "UPDATE", "DELETE"],
-                        "resources": ["users"],
-                    }],
-                },
-                "matchConditions": [{
-                    "name": "genkan-service-account",
-                    "expression": format!("request.userInfo.username == 'system:serviceaccount:{namespace}:{NAME}'"),
-                }],
-                "validations": [
-                    validation(
-                        format!("request.operation == 'CREATE' || ({})", labelled("oldObject")),
-                        "Genkan may only change users created through SCIM",
-                    ),
-                    validation(
-                        format!("request.operation == 'DELETE' || ({})", labelled("object")),
-                        "users written by Genkan must keep the SCIM label",
-                    ),
-                    validation(
-                        format!("request.operation == 'DELETE' || !has(object.spec.groups) || object.spec.groups.all(g, g in [{allowed}])"),
-                        "SCIM may only assign allowlisted groups",
-                    ),
-                    validation(
-                        "request.operation == 'DELETE' || !has(object.spec.elevatedGroups) || size(object.spec.elevatedGroups) == 0".to_owned(),
-                        "SCIM never assigns elevated groups",
-                    ),
-                ],
-            },
-        }),
-        serde_json::json!({
-            "apiVersion": "admissionregistration.k8s.io/v1",
-            "kind": "ValidatingAdmissionPolicyBinding",
-            "metadata": { "name": name, "labels": labels },
-            "spec": { "policyName": name, "validationActions": ["Deny"] },
-        }),
-    ]
-}
-
 /// The objects to install in `namespace`, in apply order.
 ///
 /// # Errors
 ///
 /// Returns an error if serialization fails.
 pub fn manifests(namespace: &str) -> serde_json::Result<Vec<Value>> {
-    manifests_with(namespace, None)
-}
-
-/// [`manifests`], plus SCIM's rules and admission policy when `scim_groups` is given.
-///
-/// # Errors
-///
-/// Returns an error if serialization fails.
-pub fn manifests_with(
-    namespace: &str,
-    scim_groups: Option<&[String]>,
-) -> serde_json::Result<Vec<Value>> {
-    let mut role_rules = rules();
-    if scim_groups.is_some() {
-        role_rules.extend(scim_rules());
-    }
     let ns = Some(namespace);
-    let mut items = vec![
+    Ok(vec![
         serde_json::to_value(Namespace {
             metadata: meta(namespace, None),
             ..Namespace::default()
@@ -270,7 +167,7 @@ pub fn manifests_with(
         })?,
         serde_json::to_value(Role {
             metadata: meta(NAME, ns),
-            rules: Some(role_rules),
+            rules: Some(rules()),
         })?,
         serde_json::to_value(RoleBinding {
             metadata: meta(NAME, ns),
@@ -303,11 +200,7 @@ pub fn manifests_with(
             type_: Some(SECRET_TYPE.to_owned()),
             ..Secret::default()
         })?,
-    ];
-    if let Some(groups) = scim_groups {
-        items.extend(scim_policy(namespace, groups));
-    }
-    Ok(items)
+    ])
 }
 
 /// Renders [`manifests`] as a Kubernetes `List` without a trailing newline.
@@ -316,22 +209,10 @@ pub fn manifests_with(
 ///
 /// Returns an error if serialization fails.
 pub fn manifests_json(namespace: &str) -> serde_json::Result<String> {
-    manifests_json_with(namespace, None)
-}
-
-/// Renders [`manifests_with`] as a Kubernetes `List` without a trailing newline.
-///
-/// # Errors
-///
-/// Returns an error if serialization fails.
-pub fn manifests_json_with(
-    namespace: &str,
-    scim_groups: Option<&[String]>,
-) -> serde_json::Result<String> {
     serde_json::to_string_pretty(&serde_json::json!({
         "apiVersion": "v1",
         "kind": "List",
-        "items": manifests_with(namespace, scim_groups)?,
+        "items": manifests(namespace)?,
     }))
 }
 

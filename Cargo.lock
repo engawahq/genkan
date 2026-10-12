@@ -1296,7 +1296,6 @@ dependencies = [
  "genkan-keys",
  "genkan-mail",
  "genkan-oauth",
- "genkan-scim",
  "genkan-signin",
  "genkan-store",
  "genkan-tls",
@@ -1429,23 +1428,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
- "tokio",
- "tower",
- "tracing",
-]
-
-[[package]]
-name = "genkan-scim"
-version = "0.0.0"
-dependencies = [
- "axum",
- "bytes",
- "form_urlencoded",
- "genkan-core",
- "genkan-store",
- "http-body-util",
- "serde",
- "serde_json",
  "tokio",
  "tower",
  "tracing",

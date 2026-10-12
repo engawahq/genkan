@@ -27,7 +27,7 @@ could not do those things anyway: it cannot create Secrets, users or RBAC bindin
 ## Place in the workspace
 
 Depends on every library crate: `genkan-core`, `genkan-keys`, `genkan-store`, `genkan-tls`,
-`genkan-ui`, `genkan-oauth`, `genkan-signin`, `genkan-mail`, `genkan-scim` and `genkan-k8s`.
+`genkan-ui`, `genkan-oauth`, `genkan-signin`, `genkan-mail` and `genkan-k8s`.
 Nothing depends on it.
 
 ## Key properties

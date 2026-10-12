@@ -9,7 +9,7 @@ use genkan_core::config::{BaseUrl, ConfigError, parse_duration};
 use genkan_keys::rotation::RotationPolicy;
 use genkan_signin::upstream::provider::Kind;
 
-use crate::config::{MailConfig, ScimConfig, ServeConfig, Store, UpstreamConfig};
+use crate::config::{MailConfig, ServeConfig, Store, UpstreamConfig};
 
 /// Log output format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -137,15 +137,6 @@ pub struct ServeArgs {
     #[arg(long, env = "GENKAN_UPSTREAM_CA_FILE")]
     pub upstream_ca_file: Option<PathBuf>,
 
-    /// Enable SCIM provisioning at `/scim/v2`: file holding the bearer token the identity
-    /// provider uses.
-    #[arg(long, env = "GENKAN_SCIM_TOKEN_FILE")]
-    pub scim_token_file: Option<PathBuf>,
-
-    /// A group SCIM may assign (repeatable). SCIM never assigns elevated groups.
-    #[arg(long = "scim-group", env = "GENKAN_SCIM_GROUPS", value_delimiter = ',')]
-    pub scim_groups: Vec<String>,
-
     /// Extra CA (PEM) trusted for the SMTP server, for a private relay.
     #[arg(long, env = "GENKAN_SMTP_CA_FILE")]
     pub smtp_ca_file: Option<PathBuf>,
@@ -228,10 +219,6 @@ impl ServeArgs {
             })
             .collect(),
             upstream_ca_file: self.upstream_ca_file.clone(),
-            scim: self.scim_token_file.clone().map(|token_file| ScimConfig {
-                token_file,
-                groups: self.scim_groups.clone(),
-            }),
             mail: match (&self.smtp_url, &self.mail_from) {
                 (Some(url), Some(from)) => Some(MailConfig {
                     url: url.clone(),

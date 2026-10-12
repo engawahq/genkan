@@ -15,10 +15,7 @@ fn main() -> ExitCode {
     match Cli::parse().command {
         Command::SetupLink(args) => setup_link(&args),
         Command::Crds => print_json(genkan_k8s::crd::definitions_json()),
-        Command::Rbac { namespace, scim } => print_json(genkan_k8s::rbac::manifests_json_with(
-            &namespace,
-            scim.groups(),
-        )),
+        Command::Rbac { namespace } => print_json(genkan_k8s::rbac::manifests_json(&namespace)),
         Command::Manifests(args) => print_json(genkan_k8s::deployment::manifests_json(
             &args.namespace,
             &args.issuer,
@@ -26,7 +23,6 @@ fn main() -> ExitCode {
                 image: args.image.clone(),
                 serve_args: args.serve_args.clone(),
                 config_secret: args.config_secret.clone(),
-                scim_groups: args.scim.groups().map(<[String]>::to_vec),
             },
         )),
         Command::KubeConfig(args) => kube_config(&args),

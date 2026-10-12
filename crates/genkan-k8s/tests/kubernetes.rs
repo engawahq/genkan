@@ -218,6 +218,16 @@ mod tests {
         grant
     }
 
+    fn user_object(name: &str) -> User {
+        User::new(
+            name,
+            UserSpec {
+                username: name.into(),
+                ..UserSpec::default()
+            },
+        )
+    }
+
     fn status_code(error: &kube::Error) -> Option<u16> {
         if let kube::Error::Api(status) = error {
             Some(status.code)
@@ -719,10 +729,7 @@ mod tests {
 
         let env = Env::new().await;
         env.admin_api::<User>()
-            .create(
-                &PostParams::default(),
-                &user_object("alice", "alice", &[], false),
-            )
+            .create(&PostParams::default(), &user_object("alice"))
             .await
             .unwrap();
         let store = KubeGrantStore::new(env.genkan_api());
@@ -1018,7 +1025,7 @@ mod tests {
         let secrets: Api<Secret> = env.genkan_api();
         let credential_store = KubeCredentialStore::new(credentials.clone());
         let grant_store = KubeGrantStore::new(grants.clone());
-        let user = user_object("alice", "alice", &[], false);
+        let user = user_object("alice");
         let pp = PostParams::default();
         let mut uid = users.create(&pp, &user).await.unwrap().uid().unwrap();
         let issuer = BaseUrl::parse("issuer", "https://login.example.com").unwrap();
@@ -1423,170 +1430,6 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(status_code(&error), Some(422), "{error}");
-        env.cleanup().await;
-    }
-
-    /// Server-side apply of any object, as the admin.
-    async fn apply_any(client: &Client, value: serde_json::Value) {
-        use kube::api::{DynamicObject, Patch, PatchParams};
-        use kube::core::GroupVersionKind;
-        use kube::discovery::{Scope, pinned_kind};
-        let object: DynamicObject = serde_json::from_value(value).unwrap();
-        let gvk = GroupVersionKind::try_from(object.types.as_ref().unwrap()).unwrap();
-        let (resource, capabilities) = pinned_kind(client, &gvk).await.unwrap();
-        let api: Api<DynamicObject> = match capabilities.scope {
-            Scope::Namespaced => Api::namespaced_with(
-                client.clone(),
-                object.namespace().as_deref().unwrap(),
-                &resource,
-            ),
-            Scope::Cluster => Api::all_with(client.clone(), &resource),
-        };
-        api.patch(
-            &object.name_any(),
-            &PatchParams::apply("genkan-test").force(),
-            &Patch::Apply(&object),
-        )
-        .await
-        .unwrap();
-    }
-
-    fn user_object(name: &str, username: &str, groups: &[&str], scim: bool) -> User {
-        use genkan_k8s::users::{SCIM_SOURCE, SOURCE_LABEL};
-        let mut user = User::new(
-            name,
-            UserSpec {
-                username: username.into(),
-                groups: groups.iter().map(|g| (*g).into()).collect(),
-                ..UserSpec::default()
-            },
-        );
-        if scim {
-            user.metadata.labels = Some([(SOURCE_LABEL.to_owned(), SCIM_SOURCE.to_owned())].into());
-        }
-        user
-    }
-
-    #[tokio::test]
-    #[ignore = "needs a Kubernetes cluster (KUBECONFIG)"]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one end-to-end scenario reads best top to bottom"
-    )]
-    async fn scim_writes_are_bounded_by_the_admission_policy() {
-        use genkan_k8s::users::KubeUserAdmin;
-        use genkan_store::scim::{ManagedUser, UserAdmin as _, Write};
-
-        let env = Env::new().await;
-        // Install SCIM's extra rules and policy, as `genkanctl rbac --scim --scim-group dev` does.
-        let mut role = env.admin_api::<Role>().get(rbac::NAME).await.unwrap();
-        role.rules = Some(
-            rbac::rules()
-                .into_iter()
-                .chain(rbac::scim_rules())
-                .collect(),
-        );
-        env.admin_api::<Role>()
-            .replace(rbac::NAME, &PostParams::default(), &role)
-            .await
-            .unwrap();
-        for object in rbac::scim_policy(&env.namespace, &["dev".to_owned()]) {
-            apply_any(&env.admin, object).await;
-        }
-        let users: Api<User> = env.genkan_api();
-        let pp = PostParams::default();
-
-        // The policy takes a moment to load; wait until it denies an unlabelled user.
-        let mut denied = None;
-        for _ in 0..60 {
-            if let Err(error) = users
-                .create(&pp, &user_object("probe", "probe", &[], false))
-                .await
-            {
-                denied = status_code(&error);
-                break;
-            }
-            env.admin_api::<User>()
-                .delete("probe", &DeleteParams::default())
-                .await
-                .unwrap();
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-        assert!(matches!(denied, Some(403 | 422)), "{denied:?}");
-
-        // Allowlisted groups on a labelled user: allowed.
-        let admin = KubeUserAdmin::new(env.genkan_api());
-        let Write::Done(created) = admin
-            .create(&ManagedUser {
-                name: "u-1".into(),
-                username: "alice@example.com".into(),
-                groups: vec!["dev".into()],
-                ..ManagedUser::default()
-            })
-            .await
-            .unwrap()
-        else {
-            panic!("create failed");
-        };
-        assert_eq!(created.username, "alice@example.com");
-
-        // Not allowlisted, or elevated: denied even with the label.
-        for forged in [user_object("u-2", "bob", &["admins"], true), {
-            let mut user = user_object("u-3", "carol", &["dev"], true);
-            user.spec.elevated_groups = vec!["admins".into()];
-            user
-        }] {
-            let error = users.create(&pp, &forged).await.unwrap_err();
-            assert!(matches!(status_code(&error), Some(403 | 422)), "{error}");
-        }
-        let widened = ManagedUser {
-            groups: vec!["ops".into()],
-            ..created.clone()
-        };
-        assert!(admin.replace(&widened).await.is_err());
-
-        // Users Genkan did not create through SCIM are out of reach.
-        env.admin_api::<User>()
-            .create(&pp, &user_object("root", "root", &["admins"], false))
-            .await
-            .unwrap();
-        assert!(admin.username_taken("root").await.unwrap());
-        assert!(admin.get("root").await.unwrap().is_none());
-        assert_eq!(admin.delete("root").await.unwrap(), Write::NotFound);
-        let error = users
-            .delete("root", &DeleteParams::default())
-            .await
-            .unwrap_err();
-        assert!(matches!(status_code(&error), Some(403 | 422)), "{error}");
-        let mut root = env.admin_api::<User>().get("root").await.unwrap();
-        root.spec.disabled = true;
-        let error = users.replace("root", &pp, &root).await.unwrap_err();
-        assert!(matches!(status_code(&error), Some(403 | 422)), "{error}");
-
-        // Its own users it can update and delete.
-        let deactivated = ManagedUser {
-            disabled: true,
-            ..created
-        };
-        assert!(matches!(
-            admin.replace(&deactivated).await.unwrap(),
-            Write::Done(_)
-        ));
-        assert!(matches!(admin.delete("u-1").await.unwrap(), Write::Done(_)));
-
-        for object in rbac::scim_policy(&env.namespace, &[]) {
-            let name = object["metadata"]["name"].as_str().unwrap().to_owned();
-            let kind = object["kind"].as_str().unwrap().to_owned();
-            let api: Api<kube::api::DynamicObject> = Api::all_with(
-                env.admin.clone(),
-                &kube::discovery::ApiResource::from_gvk(&kube::core::GroupVersionKind::gvk(
-                    "admissionregistration.k8s.io",
-                    "v1",
-                    &kind,
-                )),
-            );
-            drop(api.delete(&name, &DeleteParams::default()).await);
-        }
         env.cleanup().await;
     }
 }

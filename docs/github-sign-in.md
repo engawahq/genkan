@@ -47,7 +47,7 @@ kubectl -n genkan-system create secret generic genkan-config \
 unset GITHUB_SECRET
 ```
 
-If `genkan-config` already exists (SMTP, SCIM or Google files), add the key to it instead:
+If `genkan-config` already exists (SMTP or Google files), add the key to it instead:
 `kubectl -n genkan-system edit secret genkan-config`, or recreate it with every
 `--from-literal`/`--from-file`.
 

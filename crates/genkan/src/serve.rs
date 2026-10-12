@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use axum::serve::Listener as _;
 use genkan_core::clock::SystemClock;
-use genkan_core::crypto::{Sealer, hash_secret};
+use genkan_core::crypto::Sealer;
 use genkan_k8s::crd::grant::Grant;
 use genkan_k8s::crd::invitation::Invitation;
 use genkan_k8s::credentials::KubeCredentialStore;
@@ -22,20 +22,17 @@ use genkan_k8s::gc;
 use genkan_k8s::grants::KubeGrantStore;
 use genkan_k8s::keys::SecretKeyStore;
 use genkan_k8s::setup::KubeSetupStore;
-use genkan_k8s::users::KubeUserAdmin;
 use genkan_keys::manager::{KeyManager, ManagerError};
 use genkan_keys::store::{KeyStore, MemoryKeyStore};
 use genkan_mail::Mailer;
 use genkan_oauth::discovery::ProviderMetadata;
 use genkan_oauth::metadata::{AppState, router};
 use genkan_oauth::{AuthorizationServer, OneTimeIds, endpoints};
-use genkan_scim::Scim;
 use genkan_signin::passkeys::Passkeys;
 use genkan_signin::upstream::http::HyperClient;
 use genkan_signin::upstream::provider::{Endpoints, Kind, Provider};
 use genkan_signin::upstream::{self, Upstream};
 use genkan_signin::{SignIn, pages};
-use genkan_store::scim::{MemoryUserAdmin, UserAdmin};
 use genkan_store::{
     CredentialStore, Directory, GrantStore, MemoryCredentialStore, MemoryDirectory,
     MemoryGrantStore, MemorySetupStore, SetupStore,
@@ -105,8 +102,7 @@ pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
                 MemoryCredentialStore::default(),
                 MemorySetupStore::default(),
             );
-            let scim = scim_router(&config, MemoryUserAdmin::default())?;
-            run(&config, stores, Vec::new(), None, scim, shutdown_tx).await
+            run(&config, stores, Vec::new(), None, shutdown_tx).await
         }
         Store::Kubernetes {
             namespace,
@@ -156,10 +152,6 @@ pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
                 }
             }
             let internal_secrets = Api::namespaced(client.clone(), &namespace);
-            let scim = scim_router(
-                &config,
-                KubeUserAdmin::new(Api::namespaced(client.clone(), &namespace)),
-            )?;
             let gc = tokio::spawn({
                 let shutdown = shutdown_rx.clone();
                 async move { gc::run::<Grant, _>(client, &namespace, SystemClock, shutdown).await }
@@ -169,37 +161,11 @@ pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
                 (keys, directory, grants, credentials, setup),
                 background.into_iter().chain([gc]).collect(),
                 Some((internal_listener, resolver, internal_secrets)),
-                scim,
                 shutdown_tx,
             )
             .await
         }
     }
-}
-
-/// The SCIM routes, if SCIM is enabled: reads the token file and keeps only its hash.
-fn scim_router<A: UserAdmin>(
-    config: &ServeConfig,
-    users: A,
-) -> Result<Option<axum::Router>, ServeError> {
-    let Some(scim) = &config.scim else {
-        return Ok(None);
-    };
-    let token = std::fs::read_to_string(&scim.token_file)
-        .map_err(|error| ServeError::Config(format!("{}: {error}", scim.token_file.display())))?;
-    let token = token.trim();
-    if token.len() < 32 {
-        return Err(ServeError::Config(
-            "the SCIM token must be at least 32 characters".to_owned(),
-        ));
-    }
-    tracing::info!(groups = ?scim.groups, "SCIM provisioning enabled");
-    Ok(Some(genkan_scim::router(Arc::new(Scim {
-        users,
-        token_hash: hash_secret(token.as_bytes()),
-        groups: scim.groups.clone(),
-        base: config.issuer.join(genkan_scim::BASE_PATH),
-    }))))
 }
 
 /// The configured upstream providers, with their client secrets read from files.
@@ -264,7 +230,6 @@ async fn run<S: KeyStore, D: Directory, G: GrantStore, K: CredentialStore, T: Se
     (keys, directory, grants, credentials, setup): (S, D, G, K, T),
     mut background: Vec<JoinHandle<()>>,
     internal_listener: Option<(TlsListener, Arc<Resolver>, Api<Secret>)>,
-    scim: Option<axum::Router>,
     shutdown_tx: watch::Sender<bool>,
 ) -> Result<(), ServeError> {
     let manager = Arc::new(KeyManager::new(keys, SystemClock, config.rotation));
@@ -340,9 +305,6 @@ async fn run<S: KeyStore, D: Directory, G: GrantStore, K: CredentialStore, T: Se
             http,
             used_states: OneTimeIds::default(),
         })));
-    }
-    if let Some(scim) = scim {
-        app = app.merge(scim);
     }
     let app = limits(app);
     let listener = TcpListener::bind(config.listen).await?;

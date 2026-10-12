@@ -1,6 +1,6 @@
 ---
 name: genkan-spec-work
-description: Implement or change a protocol behaviour in Genkan (OAuth, OpenID Connect, WebAuthn, SCIM, Kubernetes authentication) the way the codebase expects — from the specification text, with citations, adversarial tests and a conformance entry. Use for any security-relevant feature or fix.
+description: Implement or change a protocol behaviour in Genkan (OAuth, OpenID Connect, WebAuthn, Kubernetes authentication) the way the codebase expects — from the specification text, with citations, adversarial tests and a conformance entry. Use for any security-relevant feature or fix.
 ---
 
 # Specification-driven work

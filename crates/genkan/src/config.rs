@@ -20,15 +20,6 @@ pub enum Store {
     Memory,
 }
 
-/// SCIM provisioning.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScimConfig {
-    /// File holding the bearer token.
-    pub token_file: std::path::PathBuf,
-    /// Groups SCIM may assign.
-    pub groups: Vec<String>,
-}
-
 /// An upstream identity provider's client registration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamConfig {
@@ -72,8 +63,6 @@ pub struct ServeConfig {
     pub upstream: Vec<UpstreamConfig>,
     /// Extra CA trusted for the providers (tests and private mirrors).
     pub upstream_ca_file: Option<std::path::PathBuf>,
-    /// SCIM provisioning, if enabled.
-    pub scim: Option<ScimConfig>,
     /// Where the internal TLS listener binds (Kubernetes store only).
     pub internal_listen: SocketAddr,
     /// Overrides the internal base URL recorded in the certificate Secret.

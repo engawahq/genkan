@@ -36,7 +36,6 @@ its container image.
 | RFC 9457 Problem Details | RFC | Met for the sign-in endpoints |
 | RFC 8176 Authentication Method Reference values | RFC | Met (`swk`, `mfa` for passkeys) |
 | WCAG 2.2 AA | W3C Recommendation | Partial: contrast computed and met for every colour pair used; no automated browser audit or screen-reader pass yet |
-| RFC 7643 / RFC 7644 SCIM 2.0 | RFC | Partial: Users and Groups with GET/POST/PUT/PATCH/DELETE and `eq` filters; no bulk, sorting or ETags (advertised as unsupported) |
 | RFC 6409, RFC 8314, RFC 3207, RFC 4616 mail submission | RFC | Met for what the invitation mailer uses |
 | OpenID Connect RP-Initiated Logout 1.0 | Final | Not implemented (no sessions) |
 | OpenID Connect Back-Channel Logout 1.0 | Final | Not implemented |
@@ -179,20 +178,6 @@ Tests are in `genkan-signin/tests/upstream.rs`.
 | RFC 7636 | PKCE towards the provider | `upstream/provider.rs` | `a_linked_github_account_signs_in_and_gets_a_code` (fake provider checks the verifier) | Met |
 | OIDC Core §3.1.3.7 | ID token: signature from the provider's JWK set, `iss`, `aud` exactly the client ID (no other audience trusted), `azp` if present equal to it, `exp`, `iat`, `nonce` | `upstream/provider.rs` | `google_id_tokens_are_validated` | Met |
 | Project requirement | Only linked accounts sign in; linking only through an enrolment link, once | `upstream.rs` | `an_invitation_links_an_account_once`, `unlinked_disabled_and_replayed_sign_ins_fail` | Met |
-
-## SCIM 2.0 (RFC 7643, RFC 7644)
-
-Tests are in `genkan-scim/tests/scim.rs` unless noted.
-
-| § | Requirement | Code | Test | Status |
-|---|---|---|---|---|
-| 7644 §2 | Authenticated requests (bearer token) | `genkan-scim/src/lib.rs` | `requires_the_bearer_token` | Met |
-| 7644 §3.3, §3.4.1, §3.5.1, §3.6 | Create, retrieve, replace, delete Users; `userName` unique | `lib.rs` | `user_lifecycle` | Met |
-| 7644 §3.4.2 | List with `filter` (`eq` only) and pagination | `lib.rs`, `model.rs` | `user_lifecycle`, `genkan-scim: model::tests::*` | Partial: `eq` on `userName`, `externalId`, `id`, `displayName` |
-| 7644 §3.5.2 | PATCH add/remove/replace | `model.rs` | `genkan-scim: model::tests::*`, `groups_are_allowlisted_and_map_to_user_groups` | Met |
-| 7644 §3.12 | Error responses with `scimType` | `model.rs` | `user_lifecycle` | Met |
-| 7643 §5–7 | `ServiceProviderConfig`, `ResourceTypes`, `Schemas` | `model.rs` | `requires_the_bearer_token` | Met |
-| Project requirement | SCIM cannot touch users it did not create, assign non-allowlisted or elevated groups, even if Genkan is compromised | `lib.rs`, `genkan-k8s/src/users.rs`, `rbac.rs` `scim_policy` | `groups_are_allowlisted_and_map_to_user_groups`, `scim_writes_are_bounded_by_the_admission_policy` *(cluster)* | Met |
 
 ## Sign-in pages
 
