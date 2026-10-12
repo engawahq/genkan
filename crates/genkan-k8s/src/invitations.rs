@@ -10,7 +10,7 @@ use genkan_core::clock::UnixTime;
 use genkan_core::config::BaseUrl;
 use genkan_core::crypto::{hash_secret, hex, random};
 use kube::api::{Api, ObjectMeta, PostParams};
-use kube::{Client, ResourceExt as _};
+use kube::{Client, Resource as _, ResourceExt as _};
 use thiserror::Error;
 
 use super::MANAGED_BY;
@@ -93,7 +93,9 @@ pub async fn invite(
 ) -> Result<Invited, InviteError> {
     let pp = PostParams::default();
     let users: Api<User> = Api::namespaced(client.clone(), namespace);
-    let created_user = if users.get_opt(&invitee.username).await?.is_none() {
+    let (user, created_user) = if let Some(user) = users.get_opt(&invitee.username).await? {
+        (user, false)
+    } else {
         let user = User::new(
             &invitee.username,
             UserSpec {
@@ -104,10 +106,7 @@ pub async fn invite(
                 ..UserSpec::default()
             },
         );
-        users.create(&pp, &user).await?;
-        true
-    } else {
-        false
+        (users.create(&pp, &user).await?, true)
     };
 
     let name = format!(
@@ -123,6 +122,7 @@ pub async fn invite(
         metadata: ObjectMeta {
             name: Some(name.clone()),
             namespace: Some(namespace.to_owned()),
+            owner_references: user.owner_ref(&()).map(|owner| vec![owner]),
             labels: Some(BTreeMap::from([
                 (MANAGED_BY.0.to_owned(), MANAGED_BY.1.to_owned()),
                 (USER_LABEL.to_owned(), invitee.username.clone()),
