@@ -239,8 +239,8 @@ Secret instead of mkcert.
 
 ### Limit unauthenticated traffic at the ingress
 
-Apply per-source-IP rate limits to `/authorize`, `/token`, `/par`, `/login*`, `/setup*` and
-`/upstream/*` before exposing Genkan publicly. Genkan normally sees the ingress address,
+Apply per-source-IP rate limits to `/authorize`, `/token`, `/par`, `/revoke`, `/login*`,
+`/setup*` and `/upstream/*` before exposing Genkan publicly. Genkan normally sees the ingress address,
 not the browser's address; it does not trust arbitrary forwarded headers or implement
 in-process per-IP limiting. At the ingress, preserve the source IP and, when another proxy
 is in front, configure forwarded-header trust only for that proxy's addresses. Otherwise
@@ -271,6 +271,7 @@ spec:
     - path: {type: Exact, value: /authorize}
     - path: {type: Exact, value: /token}
     - path: {type: Exact, value: /par}
+    - path: {type: Exact, value: /revoke}
     - path: {type: PathPrefix, value: /login}
     - path: {type: PathPrefix, value: /setup}
     - path: {type: PathPrefix, value: /upstream}
