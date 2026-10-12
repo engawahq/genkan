@@ -1393,4 +1393,211 @@ mod tests {
         assert_eq!(status_code(&error), Some(422), "{error}");
         env.cleanup().await;
     }
+
+    /// Runs `kubectl` with `stdin`; returns whether it succeeded and its stderr.
+    fn kubectl(args: &[&str], stdin: &str) -> (bool, String) {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("kubectl")
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("kubectl must be on PATH");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
+    /// The RBAC and admission policy in `docs/provisioning-users.md`, applied as written (with
+    /// this test's namespace), bound a sync tool that writes with server-side apply and merge
+    /// patches: PATCH reaches admission as CREATE or UPDATE.
+    #[tokio::test]
+    #[ignore = "needs a Kubernetes cluster (KUBECONFIG)"]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one end-to-end scenario reads best top to bottom"
+    )]
+    async fn provisioning_guide_policy_bounds_the_sync_tool() {
+        let env = Env::new().await;
+        let ns = env.namespace.clone();
+        let policy = format!("genkan-user-sync-{ns}");
+        let guide = include_str!("../../../docs/provisioning-users.md");
+        let manifests = guide
+            .split("```yaml\n")
+            .skip(1)
+            .filter_map(|block| block.split("\n```").next())
+            .collect::<Vec<_>>()
+            .join("\n---\n")
+            .replace("genkan-system", &ns)
+            .replace("genkan-user-sync", &policy);
+        let (ok, stderr) = kubectl(&["apply", "-f", "-"], &manifests);
+        assert!(ok, "{stderr}");
+
+        // A user created by an admin, outside the tool's reach.
+        env.admin_api::<User>()
+            .create(
+                &PostParams::default(),
+                &User::new(
+                    "root",
+                    UserSpec {
+                        username: "root".into(),
+                        groups: vec!["admins".into()],
+                        ..UserSpec::default()
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+
+        let as_tool = format!("--as=system:serviceaccount:{ns}:user-sync");
+        let user = |name: &str, username: &str, labelled: bool, spec: &str| {
+            let labels = if labelled {
+                "\n  labels: {genkan.engawahq.dev/source: directory}"
+            } else {
+                ""
+            };
+            format!(
+                "apiVersion: genkan.engawahq.dev/v1alpha1\nkind: User\nmetadata:\n  name: {name}\n  namespace: {ns}{labels}\nspec: {{username: {username}{spec}}}\n"
+            )
+        };
+
+        // `--force-conflicts`, as a compromised tool would: field ownership is not the boundary,
+        // admission is.
+        let apply = |manifest: &str| {
+            kubectl(
+                &[
+                    "apply",
+                    "--server-side",
+                    "--force-conflicts",
+                    "--field-manager=user-sync",
+                    &as_tool,
+                    "-f",
+                    "-",
+                ],
+                manifest,
+            )
+        };
+
+        // The policy takes a moment to reach the admission plugin: wait until it refuses.
+        let mallory = user("mallory", "mallory", true, ", elevatedGroups: [admins]");
+        let mut refused = None;
+        for _ in 0..60 {
+            let (ok, stderr) = apply(&mallory);
+            if !ok {
+                refused = Some(stderr);
+                break;
+            }
+            kubectl(&["-n", &ns, "delete", "gkuser", "mallory"], "");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        let refused = refused.expect("the policy never took effect");
+        assert!(
+            refused.contains("never assigns elevated groups"),
+            "{refused}"
+        );
+
+        // Server-side apply: create (CREATE) and change (UPDATE) a managed user.
+        let (ok, stderr) = apply(&user("ana", "ana", true, ", groups: [dev]"));
+        assert!(ok, "{stderr}");
+        let (ok, stderr) = apply(&user(
+            "ana",
+            "ana",
+            true,
+            ", groups: [dev, ops], disabled: true",
+        ));
+        assert!(ok, "{stderr}");
+
+        for (manifest, message) in [
+            (
+                user("ana", "ana", true, ", groups: [admins]"),
+                "only assign allowlisted groups",
+            ),
+            (
+                user("ana", "ana", false, ", groups: [dev]"),
+                "must keep the label",
+            ),
+            (user("bob", "bob", false, ""), "must keep the label"),
+            (user("eve", "root", true, ""), "must equal the username"),
+            (
+                user("root", "root", true, ", groups: [dev]"),
+                "only change users it created",
+            ),
+        ] {
+            let (ok, stderr) = apply(&manifest);
+            assert!(!ok && stderr.contains(message), "{manifest}\n{stderr}");
+        }
+
+        // A merge patch is admitted as UPDATE too.
+        let (ok, stderr) = kubectl(
+            &[
+                "-n",
+                &ns,
+                "patch",
+                "gkuser",
+                "root",
+                &as_tool,
+                "--type=merge",
+                "-p",
+                r#"{"spec":{"disabled":true}}"#,
+            ],
+            "",
+        );
+        assert!(
+            !ok && stderr.contains("only change users it created"),
+            "{stderr}"
+        );
+        let (ok, stderr) = kubectl(
+            &[
+                "-n",
+                &ns,
+                "patch",
+                "gkuser",
+                "ana",
+                &as_tool,
+                "--type=merge",
+                "-p",
+                r#"{"spec":{"elevatedGroups":["admins"]}}"#,
+            ],
+            "",
+        );
+        assert!(
+            !ok && stderr.contains("never assigns elevated groups"),
+            "{stderr}"
+        );
+
+        // RBAC: no delete, nothing but users.
+        for args in [
+            vec!["-n", &ns, "delete", "gkuser", "ana", &as_tool],
+            vec!["-n", &ns, "get", "gkcred", &as_tool],
+            vec!["-n", &ns, "get", "gkinvite", &as_tool],
+            vec!["-n", &ns, "get", "secrets", &as_tool],
+        ] {
+            let (ok, stderr) = kubectl(&args, "");
+            assert!(!ok && stderr.contains("Forbidden"), "{args:?}\n{stderr}");
+        }
+
+        let root = env.admin_api::<User>().get("root").await.unwrap();
+        assert!(!root.spec.disabled);
+        let ana = env.admin_api::<User>().get("ana").await.unwrap();
+        assert_eq!(ana.spec.groups, ["dev", "ops"]);
+        assert_eq!(ana.spec.elevated_groups, Vec::<String>::new());
+
+        for kind in [
+            "validatingadmissionpolicybinding",
+            "validatingadmissionpolicy",
+        ] {
+            kubectl(&["delete", kind, &policy], "");
+        }
+        env.cleanup().await;
+    }
 }
