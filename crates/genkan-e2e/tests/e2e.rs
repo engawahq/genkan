@@ -318,7 +318,8 @@ mod tests {
     }
 
     /// Exercises proof-gated deletion through the deployed server and Kubernetes grant store.
-    async fn guessed_refresh_secrets_preserve_session(address: &str, issued: &str) {
+    /// Returns the latest rotated token so later reset checks exercise a live family.
+    async fn guessed_refresh_secrets_preserve_session(address: &str, issued: &str) -> String {
         let (grant, _) = issued.split_once('.').unwrap();
         let guessed = format!("{grant}.{}", "A".repeat(43));
         assert_ne!(guessed, issued);
@@ -370,7 +371,10 @@ mod tests {
         )
         .await;
         assert_eq!(refreshed.status, StatusCode::OK);
-        assert!(refreshed.json()["refresh_token"].is_string());
+        refreshed.json()["refresh_token"]
+            .as_str()
+            .unwrap()
+            .to_owned()
     }
 
     #[tokio::test]
@@ -556,7 +560,7 @@ mod tests {
         // Sign in as kubectl would: authorization request, passkey, code, token.
         let tokens = sign_in(&address, &mut device, "openid").await;
         assert!(tokens["refresh_token"].is_string());
-        guessed_refresh_secrets_preserve_session(
+        let latest_refresh = guessed_refresh_secrets_preserve_session(
             &address,
             tokens["refresh_token"].as_str().unwrap(),
         )
@@ -667,7 +671,7 @@ mod tests {
 
         // A partial reset can remove credentials while leaving a usable refresh-token family.
         // Prove the family's current token works, then retry reset with no credentials left.
-        let refreshed = refresh(&address, tokens["refresh_token"].as_str().unwrap()).await;
+        let refreshed = refresh(&address, &latest_refresh).await;
         assert_eq!(refreshed.status, StatusCode::OK, "{:?}", refreshed.body);
         let refreshed = refreshed.json();
         let current_refresh = refreshed["refresh_token"].as_str().unwrap();
