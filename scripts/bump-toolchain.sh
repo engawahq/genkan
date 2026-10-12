@@ -42,6 +42,9 @@ restore() {
   printf '%s\n' "$toolchain_orig" > rust-toolchain.toml
   printf '%s\n' "$flake_orig" > flake.nix
 }
+# Only a nightly that passed every check stays written; any other exit puts the files back.
+keep=false
+trap '$keep || restore' EXIT
 
 for days_ago in 0 1 2 3 4 5 6; do
   date="$(date -u -d "$days_ago days ago" +%F)"
@@ -60,16 +63,26 @@ for days_ago in 0 1 2 3 4 5 6; do
   printf '%s\n' "$flake_orig" |
     sed "s|^\( *sha256 = \"\)sha256-[^\"]*\";$|\1$hash\";|" > flake.nix
 
-  lacking="$(missing "$(jq -r .storePath <<< "$manifest")")"
+  if ! lacking="$(missing "$(jq -r .storePath <<< "$manifest")")"; then
+    echo "nightly-$date: could not read the manifest" >&2
+    restore
+    continue
+  fi
   if [[ -n $lacking ]]; then
     echo "nightly-$date: missing" "$lacking" >&2
     restore
     continue
   fi
-  # Every dev shell must still evaluate (this also checks the hash fenix fetches with).
+  # Every dev shell must still evaluate with the current fenix and nixpkgs (this also checks the
+  # hash fenix fetches with); an older nightly may still work when this one does not.
   for system in "${systems[@]}"; do
-    nix eval --raw ".#devShells.$system.default.drvPath" > /dev/null
+    if ! nix eval --raw ".#devShells.$system.default.drvPath" > /dev/null; then
+      echo "nightly-$date: the $system dev shell does not evaluate" >&2
+      restore
+      continue 2
+    fi
   done
+  keep=true
   echo "nightly-$current -> nightly-$date"
   exit 0
 done
