@@ -40,9 +40,11 @@ server, the `genkanctl` admin CLI and the `genkan-e2e` tests.
   arrive. Known clients and users are read directly on every request: secrets, permissions and
   disabled flags are never cached. A subject lookup verifies the directly read user's UID, so
   deleting and recreating an object under the same name cannot substitute a different user.
-  Watch errors are logged and retry with backoff, never a per-ID GET fallback. Each actual
-  directory API GET emits `kubernetes_directory_lookup` with `resource`, `operation`, `outcome`
-  and `latency_ms`, never raw client or user names.
+  Watch errors are logged and retry with backoff, never a per-ID GET fallback. Every directory
+  GET attempt increments a process-wide counter; the first and every 64th emit a sampled
+  `kubernetes_directory_lookup` event with `resource`, `operation`, `outcome`, `lookup_total`
+  and `latency_ms`, never raw client or user names. Unsampled GETs do not read the latency clock
+  or emit INFO logs, so admitted traffic does not amplify logs one-for-one.
 - **Single use is decided by the API server.** Create with a deterministic name, update with
   `resourceVersion`, delete with `uid` and `resourceVersion` preconditions ([API concepts],
   [DeleteOptions]). Ambiguous answers fail closed. The integration tests race 64 concurrent

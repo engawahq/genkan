@@ -16,6 +16,7 @@
 //! [UID]: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#uids
 
 use std::fmt::Debug;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt as _;
@@ -105,9 +106,9 @@ impl KubeDirectory {
     }
 
     async fn read_user(&self, name: &str) -> Result<Option<User>, StoreError> {
-        let started = Instant::now();
+        let sample = sample_lookup();
         let result = self.users.get_opt(name).await;
-        record_lookup("user", started.elapsed(), &result);
+        record_lookup("user", sample, &result);
         Ok(result.map_err(|e| backend(&e))?.and_then(convert))
     }
 }
@@ -174,12 +175,22 @@ async fn run_index<K>(
     }
 }
 
+/// Count every attempted GET; only the first and every 64th need a clock read and log event.
+fn sample_lookup() -> Option<(u64, Instant)> {
+    static LOOKUPS: AtomicU64 = AtomicU64::new(0);
+    let total = LOOKUPS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    (total == 1 || total.is_multiple_of(64)).then(|| (total, Instant::now()))
+}
+
 /// Only bounded resource and outcome labels are logged; object names and errors may carry PII.
 fn record_lookup<T>(
     resource: &'static str,
-    elapsed: Duration,
+    sample: Option<(u64, Instant)>,
     result: &Result<Option<T>, kube::Error>,
 ) {
+    let Some((lookup_total, started)) = sample else {
+        return;
+    };
     let outcome = match result {
         Ok(Some(_)) => "found",
         Ok(None) => "not_found",
@@ -190,7 +201,8 @@ fn record_lookup<T>(
         resource,
         operation = "get",
         outcome,
-        latency_ms = elapsed.as_secs_f64() * 1000.0,
+        lookup_total,
+        latency_ms = started.elapsed().as_secs_f64() * 1000.0,
         "Kubernetes directory API lookup"
     );
 }
@@ -209,9 +221,9 @@ impl Directory for KubeDirectory {
         {
             return Ok(None);
         }
-        let started = Instant::now();
+        let sample = sample_lookup();
         let result = self.clients.get_opt(id).await;
-        record_lookup("client", started.elapsed(), &result);
+        record_lookup("client", sample, &result);
         Ok(result.map_err(|e| backend(&e))?.map(|object| {
             let id = object.name_any();
             let spec = object.spec;

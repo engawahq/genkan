@@ -292,8 +292,9 @@ Full services immediately return `503` with `Retry-After: 1`, without queuing ah
 ten-second handler timeout. Health/readiness probes and discovery/keys do not share those
 slots. These are per-process concurrency limits, not per-IP rate limits. Structured
 `request_overload` events expose cumulative rejection counts at power-of-two milestones, not
-one warning per rejection; `kubernetes_directory_lookup`
-events expose resource, operation, outcome and API latency in milliseconds.
+one warning per rejection. `kubernetes_directory_lookup` events sample the first and every
+64th directory GET attempt, exposing resource, operation, outcome, process-wide `lookup_total`
+and API latency in milliseconds instead of writing an INFO event for each GET.
 Aggregate them in your log backend.
 
 Kubernetes directory metadata is watched before the public listener starts. Unknown client
