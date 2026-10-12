@@ -298,9 +298,11 @@ Kubernetes directory metadata is watched before the public listener starts. Unkn
 names are rejected locally, including a flood of distinct random IDs; known clients still
 use a direct GET so secret, redirect URI and audience changes take effect on the next request.
 UserInfo resolves `sub` from watched user metadata and directly reads the user to verify its
-UID and enabled state. Access-token claims do not change. New objects become visible after
-their watch events arrive; watch lag can delay sign-ins, never authorize stale client/user
-data. There is no per-ID API-read fallback for unknown index entries.
+UID and enabled state. Access-token claims do not change. New client names and UserInfo subjects
+become visible after their watch events arrive; watch lag can delay those lookups, never authorize
+stale client/user data. Unknown entries in these indexes never fall back to per-ID API reads.
+Name-based user lookups used by setup, sign-in and refresh remain uncached direct GETs after
+initial synchronization, including absent names; they do not await individual user watch events.
 
 ## 6. Let kube-apiserver trust Genkan
 

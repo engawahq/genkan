@@ -1,15 +1,17 @@
 //! [`Directory`] backed by `User` and `OAuthClient` objects.
 //!
-//! Metadata-only watches index client names and user UIDs; arbitrary unknown identifiers never
-//! cause per-request API reads. The initial snapshots must complete before any lookup. Relists
-//! replace each index atomically, and watch errors retry with backoff without falling back to
-//! per-identifier reads.
+//! Metadata-only watches index client names and user UIDs; arbitrary unknown client names and
+//! subjects never cause per-request API reads. The initial snapshots must complete before any
+//! lookup. Relists replace each index atomically, and watch errors retry with backoff without
+//! falling back to per-identifier reads for indexed lookups.
 //!
 //! An index is only a locator, never authorization data: known clients and users are read directly
 //! on every request. Watch lag may temporarily deny a new object, but cannot retain a revoked
 //! permission or client secret. Subject lookups also compare the fetched UID, because Kubernetes
 //! permits a deleted object's name to be reused but assigns every new object a distinct [UID].
 //! Ambiguous subjects fail closed.
+//! Name-based user lookups always GET directly after initial synchronization, including absent
+//! names. Setup, sign-in and refresh therefore do not wait for individual user watch events.
 //!
 //! [UID]: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#uids
 
