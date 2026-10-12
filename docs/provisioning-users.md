@@ -158,7 +158,7 @@ EOF
 
 Any language with a Kubernetes client works; this is the shape of it in shell, run as the
 `user-sync` service account (a `CronJob`, or outside the cluster with a token from
-`kubectl create token user-sync`). `directory-export` stands for whatever lists people from
+`kubectl -n genkan-system create token user-sync`). `directory-export` stands for whatever lists people from
 your directory as JSON lines `{"id", "username", "name", "groups", "active"}`.
 
 ```sh
