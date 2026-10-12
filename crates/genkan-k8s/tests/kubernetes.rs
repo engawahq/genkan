@@ -827,7 +827,7 @@ mod tests {
     async fn oauth_flow_on_kubernetes_storage() {
         use genkan_core::config::BaseUrl;
         use genkan_core::crypto::Sealer;
-        use genkan_k8s::directory::KubeDirectory;
+        use genkan_k8s::directory::{INITIAL_SYNC_TIMEOUT, KubeDirectory};
         use genkan_k8s::grants::KubeGrantStore;
         use genkan_oauth::authorize::Authentication;
         use genkan_oauth::endpoints::{FLOW_COOKIE, complete_authorization, router};
@@ -878,7 +878,7 @@ mod tests {
         let (directory_shutdown, directory_shutdown_rx) = watch::channel(false);
         let (directory, directory_task) =
             KubeDirectory::new(env.genkan_api(), env.genkan_api(), directory_shutdown_rx);
-        tokio::time::timeout(Duration::from_secs(30), directory.wait_until_ready())
+        tokio::time::timeout(INITIAL_SYNC_TIMEOUT, directory.wait_until_ready())
             .await
             .unwrap()
             .unwrap();

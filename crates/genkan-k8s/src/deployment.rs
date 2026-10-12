@@ -328,6 +328,25 @@ mod tests {
     }
 
     #[test]
+    fn startup_cannot_restart_before_directory_sync_deadline() {
+        let issuer = BaseUrl::parse("issuer", "https://login.example.com").unwrap();
+        let container = container(&issuer, &Options::default());
+        let startup = container.startup_probe.unwrap();
+        // A kubelet may probe immediately. Even if every probe fails instantly, the last
+        // allowed failure must occur after the initialization deadline, not at/before it.
+        // Kubernetes defaults are included so omitting a field cannot silently weaken the guard.
+        let failures = u64::try_from(startup.failure_threshold.unwrap_or(3)).unwrap();
+        let period = u64::try_from(startup.period_seconds.unwrap_or(10)).unwrap();
+        let delay = u64::try_from(startup.initial_delay_seconds.unwrap_or(0)).unwrap();
+        let earliest_restart =
+            std::time::Duration::from_secs(delay + failures.saturating_sub(1) * period);
+        assert!(
+            earliest_restart > crate::directory::INITIAL_SYNC_TIMEOUT,
+            "startup may restart at {earliest_restart:?}, before metadata initialization finishes"
+        );
+    }
+
+    #[test]
     fn service_exposes_both_listeners() {
         let service = serde_json::to_value(service("ns")).unwrap();
         let ports = service["spec"]["ports"].as_array().unwrap();

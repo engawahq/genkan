@@ -35,6 +35,11 @@ use tokio::task::JoinHandle;
 use crate::crd::client::OAuthClient;
 use crate::crd::user::User as UserObject;
 
+/// Maximum startup wait for complete directory metadata snapshots.
+///
+/// Deployment startup protection must outlast this deadline before liveness may restart a pod.
+pub const INITIAL_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Locates clients and user subjects through metadata, then reads current API objects.
 #[derive(Clone)]
 pub struct KubeDirectory {

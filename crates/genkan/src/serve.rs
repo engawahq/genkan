@@ -20,7 +20,7 @@ use genkan_core::crypto::Sealer;
 use genkan_k8s::crd::grant::Grant;
 use genkan_k8s::crd::invitation::Invitation;
 use genkan_k8s::credentials::KubeCredentialStore;
-use genkan_k8s::directory::KubeDirectory;
+use genkan_k8s::directory::{INITIAL_SYNC_TIMEOUT, KubeDirectory};
 use genkan_k8s::gc;
 use genkan_k8s::grants::KubeGrantStore;
 use genkan_k8s::keys::SecretKeyStore;
@@ -135,7 +135,7 @@ pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
                 shutdown_rx.clone(),
             );
             background.push(watcher);
-            tokio::time::timeout(Duration::from_secs(30), directory.wait_until_ready())
+            tokio::time::timeout(INITIAL_SYNC_TIMEOUT, directory.wait_until_ready())
                 .await
                 .map_err(|_elapsed| {
                     ServeError::Config("directory metadata initial synchronization timed out".into())
