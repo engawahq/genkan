@@ -1,5 +1,4 @@
-//! Invitations: the admin's side (`genkanctl invite`). Genkan's server mails links for
-//! invitations that name an address.
+//! Invitations: the admin's side (`genkanctl invite`).
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -10,7 +9,7 @@ use genkan_core::clock::UnixTime;
 use genkan_core::config::BaseUrl;
 use genkan_core::crypto::{hash_secret, hex, random};
 use kube::api::{Api, ObjectMeta, PostParams};
-use kube::{Client, ResourceExt as _};
+use kube::{Client, Resource as _, ResourceExt as _};
 use thiserror::Error;
 
 use super::MANAGED_BY;
@@ -43,10 +42,6 @@ pub struct Invitee {
     pub groups: Vec<String>,
     /// Elevated groups, for a new user.
     pub elevated_groups: Vec<String>,
-    /// Mail the link here instead of returning it.
-    pub email: Option<String>,
-    /// Language of the mail.
-    pub language: Option<String>,
 }
 
 /// What was created.
@@ -54,8 +49,8 @@ pub struct Invitee {
 pub struct Invited {
     /// The `Invitation` object name.
     pub name: String,
-    /// The link, unless Genkan will mail it.
-    pub url: Option<String>,
+    /// The link.
+    pub url: String,
     /// Whether the `User` was created now.
     pub created_user: bool,
     /// When the link stops working.
@@ -93,7 +88,9 @@ pub async fn invite(
 ) -> Result<Invited, InviteError> {
     let pp = PostParams::default();
     let users: Api<User> = Api::namespaced(client.clone(), namespace);
-    let created_user = if users.get_opt(&invitee.username).await?.is_none() {
+    let (user, created_user) = if let Some(user) = users.get_opt(&invitee.username).await? {
+        (user, false)
+    } else {
         let user = User::new(
             &invitee.username,
             UserSpec {
@@ -104,10 +101,7 @@ pub async fn invite(
                 ..UserSpec::default()
             },
         );
-        users.create(&pp, &user).await?;
-        true
-    } else {
-        false
+        (users.create(&pp, &user).await?, true)
     };
 
     let name = format!(
@@ -115,14 +109,12 @@ pub async fn invite(
         hex(&random::<8>().map_err(|_crypto| InviteError::Crypto)?)
     );
     let expires_at = now.saturating_add(valid_for);
-    let token = match invitee.email {
-        Some(_) => None,
-        None => Some(new_token(&name)?),
-    };
+    let token = new_token(&name)?;
     let invitation = Invitation {
         metadata: ObjectMeta {
             name: Some(name.clone()),
             namespace: Some(namespace.to_owned()),
+            owner_references: user.owner_ref(&()).map(|owner| vec![owner]),
             labels: Some(BTreeMap::from([
                 (MANAGED_BY.0.to_owned(), MANAGED_BY.1.to_owned()),
                 (USER_LABEL.to_owned(), invitee.username.clone()),
@@ -139,18 +131,15 @@ pub async fn invite(
         },
         spec: InvitationSpec {
             user: invitee.username.clone(),
-            email: invitee.email.clone(),
-            token_hash: token.as_deref().map(|t| hash_secret(t.as_bytes())),
-            language: invitee.language.clone(),
+            token_hash: hash_secret(token.as_bytes()),
             expires_at: i64::try_from(expires_at.as_secs()).unwrap_or(i64::MAX),
         },
-        status: None,
     };
     let invitations: Api<Invitation> = Api::namespaced(client, namespace);
     let created = invitations.create(&pp, &invitation).await?;
     Ok(Invited {
         name: created.name_any(),
-        url: token.map(|token| link(issuer, &token)),
+        url: link(issuer, &token),
         created_user,
         expires_at,
     })

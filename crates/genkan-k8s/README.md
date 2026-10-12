@@ -11,7 +11,7 @@ garbage collection of expired objects, the install manifests, and the kube-apise
 - [`objects`](crate::objects): the three single-use primitives behind every security-relevant
   write.
 - [`keys`](crate::keys), [`directory`](crate::directory), [`credentials`](crate::credentials),
-  [`grants`](crate::grants), [`setup`](crate::setup), [`users`](crate::users): the
+  [`grants`](crate::grants), [`setup`](crate::setup): the
   `genkan-keys` and `genkan-store` traits implemented on Kubernetes objects.
 - [`gc`](crate::gc): deletes expired grants and invitations, driven by a metadata-only watch.
 - [`rbac`](crate::rbac), [`deployment`](crate::deployment): the install manifests, generated

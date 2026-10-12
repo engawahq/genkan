@@ -140,7 +140,6 @@ pub struct Messages {
     pub error_title: &'static str,
     pub error_body: &'static str,
     pub error_detail_label: &'static str,
-    pub mail_subject: &'static str,
     pub continue_with: &'static str,
     pub upstream_or: &'static str,
     pub upstream_linked_title: &'static str,
@@ -148,7 +147,6 @@ pub struct Messages {
     pub upstream_not_linked: &'static str,
     pub upstream_failed: &'static str,
     pub upstream_already_linked: &'static str,
-    pub mail_body: &'static str,
 }
 
 /// English.
@@ -183,7 +181,6 @@ pub const EN: Messages = Messages {
     error_title: "This sign-in cannot continue",
     error_body: "Return to the application and start again. If this keeps happening, contact your administrator.",
     error_detail_label: "Details",
-    mail_subject: "Set up your passkey",
     continue_with: "Continue with",
     upstream_or: "or",
     upstream_linked_title: "Account linked",
@@ -191,7 +188,6 @@ pub const EN: Messages = Messages {
     upstream_not_linked: "This account is not linked to any user here. Ask your administrator for an invitation, then link the account from it.",
     upstream_failed: "Signing in with the provider did not work. Start again from your application.",
     upstream_already_linked: "This account is already linked to a user.",
-    mail_body: "You have been invited to sign in with a passkey.\n\nOpen this link on the device that will keep your passkey, and follow the steps:\n\n%LINK%\n\nThe link works once and expires in %DAYS% day(s). If you did not expect this message, ignore it.\n",
 };
 
 /// Traditional Chinese (Taiwan).
@@ -226,7 +222,6 @@ pub const ZH_TW: Messages = Messages {
     error_title: "無法繼續這次登入",
     error_body: "請回到應用程式重新開始。如果問題持續發生，請聯絡管理員。",
     error_detail_label: "詳細資訊",
-    mail_subject: "設定你的通行密鑰",
     continue_with: "使用以下帳號繼續：",
     upstream_or: "或",
     upstream_linked_title: "帳號已連結",
@@ -234,7 +229,6 @@ pub const ZH_TW: Messages = Messages {
     upstream_not_linked: "這個帳號尚未連結到任何使用者。請向管理員索取邀請，再從邀請中連結帳號。",
     upstream_failed: "透過外部帳號登入沒有成功。請從你的應用程式重新開始。",
     upstream_already_linked: "這個帳號已經連結到某位使用者。",
-    mail_body: "你受邀以通行密鑰登入。\n\n請在要保存通行密鑰的裝置上開啟以下連結，並依照步驟完成設定：\n\n%LINK%\n\n此連結只能使用一次，將於 %DAYS% 天後失效。若你並未預期收到這封信，請忽略。\n",
 };
 
 /// Simplified Chinese.
@@ -269,7 +263,6 @@ pub const ZH_CN: Messages = Messages {
     error_title: "无法继续此次登录",
     error_body: "请返回应用重新开始。如果问题持续出现，请联系管理员。",
     error_detail_label: "详细信息",
-    mail_subject: "设置你的通行密钥",
     continue_with: "使用以下账号继续：",
     upstream_or: "或",
     upstream_linked_title: "账号已关联",
@@ -277,7 +270,6 @@ pub const ZH_CN: Messages = Messages {
     upstream_not_linked: "这个账号尚未关联到任何用户。请向管理员索取邀请，再从邀请中关联账号。",
     upstream_failed: "通过外部账号登录没有成功。请从你的应用重新开始。",
     upstream_already_linked: "这个账号已经关联到某个用户。",
-    mail_body: "你受邀使用通行密钥登录。\n\n请在要保存通行密钥的设备上打开以下链接，并按照步骤完成设置：\n\n%LINK%\n\n此链接只能使用一次，将在 %DAYS% 天后失效。如果你没有预期收到这封邮件，请忽略。\n",
 };
 
 #[cfg(test)]

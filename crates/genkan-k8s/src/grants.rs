@@ -16,6 +16,7 @@ use kube::ResourceExt as _;
 use kube::api::{Api, DeleteParams, ObjectMeta};
 
 use super::objects::{CreateOutcome, ReplaceOutcome, create_once, replace_status_if_unchanged};
+use super::users::user_owner;
 use crate::crd::grant::{Grant as GrantObject, GrantSpec, GrantStatus};
 use crate::crd::{CLIENT_LABEL, EXPIRES_AT_ANNOTATION, EXPIRY_BUCKET_LABEL, USER_LABEL};
 
@@ -128,8 +129,11 @@ impl GrantStore for KubeGrantStore {
         idle_expires_at: UnixTime,
     ) -> impl Future<Output = Result<CreateGrant, StoreError>> + Send {
         let api = self.api.clone();
-        let object = to_object(grant, idle_expires_at);
+        let mut object = to_object(grant, idle_expires_at);
         async move {
+            object.metadata.owner_references = user_owner(&api, &object.spec.user)
+                .await?
+                .map(|owner| vec![owner]);
             match create_once(&api, &object).await.map_err(|e| backend(&e))? {
                 CreateOutcome::Created(_) => Ok(CreateGrant::Created),
                 CreateOutcome::AlreadyExists => Ok(CreateGrant::AlreadyExists),

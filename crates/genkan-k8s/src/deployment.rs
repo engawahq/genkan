@@ -101,8 +101,6 @@ pub struct Options {
     pub serve_args: Vec<String>,
     /// Secret mounted read-only at [`CONFIG_DIR`].
     pub config_secret: Option<String>,
-    /// SCIM's group allowlist, when SCIM is enabled (adds RBAC and an admission policy).
-    pub scim_groups: Option<Vec<String>>,
 }
 
 /// Where `config_secret` is mounted.
@@ -250,7 +248,7 @@ pub fn manifests(
     issuer: &BaseUrl,
     options: &Options,
 ) -> serde_json::Result<Vec<Value>> {
-    let mut items = super::rbac::manifests_with(namespace, options.scim_groups.as_deref())?;
+    let mut items = super::rbac::manifests(namespace)?;
     items.push(serde_json::to_value(service(namespace))?);
     items.push(serde_json::to_value(deployment(
         namespace, issuer, options,
@@ -286,7 +284,6 @@ mod tests {
             image: "genkan:test".into(),
             serve_args: vec!["--invitations".into()],
             config_secret: Some("genkan-config".into()),
-            scim_groups: None,
         };
         let deployment = serde_json::to_value(deployment("ns", &issuer, &options)).unwrap();
         let spec = &deployment["spec"];

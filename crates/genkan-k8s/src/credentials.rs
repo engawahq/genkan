@@ -10,6 +10,7 @@ use kube::api::{Api, ObjectMeta};
 
 use super::MANAGED_BY;
 use super::objects::{CreateOutcome, create_once};
+use super::users::user_owner;
 use crate::crd::USER_LABEL;
 use crate::crd::credential::{
     Credential, CredentialSpec, CredentialType, ExternalIdentity, Passkey,
@@ -45,7 +46,7 @@ impl CredentialStore for KubeCredentialStore {
         passkey: &NewPasskey,
     ) -> impl Future<Output = Result<CreateCredential, StoreError>> + Send {
         let api = self.api.clone();
-        let object = Credential {
+        let mut object = Credential {
             metadata: ObjectMeta {
                 name: Some(passkey.name.clone()),
                 labels: Some(BTreeMap::from([
@@ -68,6 +69,9 @@ impl CredentialStore for KubeCredentialStore {
             },
         };
         async move {
+            object.metadata.owner_references = user_owner(&api, &object.spec.user)
+                .await?
+                .map(|owner| vec![owner]);
             match create_once(&api, &object).await.map_err(|e| backend(&e))? {
                 CreateOutcome::Created(_) => Ok(CreateCredential::Created),
                 CreateOutcome::AlreadyExists => Ok(CreateCredential::AlreadyExists),
@@ -100,7 +104,7 @@ impl CredentialStore for KubeCredentialStore {
         external: &NewExternal,
     ) -> impl Future<Output = Result<CreateCredential, StoreError>> + Send {
         let api = self.api.clone();
-        let object = Credential {
+        let mut object = Credential {
             metadata: ObjectMeta {
                 name: Some(external.name.clone()),
                 labels: Some(BTreeMap::from([
@@ -120,6 +124,9 @@ impl CredentialStore for KubeCredentialStore {
             },
         };
         async move {
+            object.metadata.owner_references = user_owner(&api, &object.spec.user)
+                .await?
+                .map(|owner| vec![owner]);
             match create_once(&api, &object).await.map_err(|e| backend(&e))? {
                 CreateOutcome::Created(_) => Ok(CreateCredential::Created),
                 CreateOutcome::AlreadyExists => Ok(CreateCredential::AlreadyExists),

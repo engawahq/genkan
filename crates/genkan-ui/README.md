@@ -17,7 +17,7 @@ caller.
 - `harden` and `CSP`: the response headers below.
 
 Depends only on `genkan-core`. Used by `genkan-oauth` (the error page), `genkan-signin` (the
-page routes) and the `genkan` server (invitation mail text).
+page routes) and the `genkan` server.
 
 ## Frontend source and build
 

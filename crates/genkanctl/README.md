@@ -9,9 +9,8 @@ Secret, issuing the internal certificate) therefore happens here, with a human's
 
 - `genkanctl crds`: the custom resource definitions as a Kubernetes `List`, for
   `kubectl apply -f -`.
-- `genkanctl rbac [--scim --scim-group <g>…]`: the namespace, service account, `Role`,
-  `RoleBinding`, the admin bindings and the empty key Secret; with `--scim`, also SCIM's rules and
-  admission policy.
+- `genkanctl rbac`: the namespace, service account, `Role`, `RoleBinding`, the admin bindings and
+  the empty key Secret.
 - `genkanctl manifests --issuer <url> --image <ref>`: everything `rbac` prints plus the Service
   and the single-replica Deployment.
 - `genkanctl kube-config --issuer <url> --distro <k3s|k0s|kubeadm|kubesolo|generic>`: issues the
@@ -20,8 +19,8 @@ Secret, issuing the internal certificate) therefore happens here, with a human's
 - `genkanctl setup-link --issuer <url> [--username admin] [--reset]`: a one-time link that
   enrols a passkey for the first admin (group `admins`, elevated group `admins`), or recovers
   the account with `--reset`. It expires after 60 minutes by default.
-- `genkanctl invite --issuer <url> --username <name> [--email <addr>]`: creates the `User` if
-  needed and a one-time enrolment link (7 days by default), printed, or mailed by the server.
+- `genkanctl invite --issuer <url> --username <name>`: creates the `User` if needed and a
+  one-time enrolment link (7 days by default), printed for you to send.
 
 Results (JSON, YAML or a link) go to stdout and messages to stderr, so commands compose with
 `kubectl apply -f -`.

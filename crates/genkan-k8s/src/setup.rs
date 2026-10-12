@@ -34,7 +34,7 @@ use genkan_store::{Consume, SetupStore, SetupToken, StoreError, invitation_name}
 use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::Secret;
 use kube::api::{Api, DeleteParams, ListParams, ObjectMeta, PostParams};
-use kube::{Client, ResourceExt as _};
+use kube::{Client, Resource as _, ResourceExt as _};
 use thiserror::Error;
 
 use super::MANAGED_BY;
@@ -135,18 +135,9 @@ async fn load_invitation(
     let (Some(uid), Some(rv)) = (invitation.uid(), invitation.resource_version()) else {
         return Ok(None);
     };
-    // A mailed invitation has no hash until Genkan has generated and sent its token.
-    let Some(token_hash) = invitation.spec.token_hash.clone().or_else(|| {
-        invitation
-            .status
-            .as_ref()
-            .and_then(|s| s.token_hash.clone())
-    }) else {
-        return Ok(None);
-    };
     Ok(Some(SetupToken {
         user: invitation.spec.user.clone(),
-        token_hash,
+        token_hash: invitation.spec.token_hash.clone(),
         expires_at: UnixTime::from_secs(u64::try_from(invitation.spec.expires_at).unwrap_or(0)),
         version: format!("{INVITATION_VERSION}{name}/{uid}/{rv}"),
     }))
@@ -253,7 +244,9 @@ pub async fn issue_setup_link(
 ) -> Result<SetupLink, SetupLinkError> {
     let pp = PostParams::default();
     let users: Api<User> = Api::namespaced(client.clone(), namespace);
-    if users.get_opt(username).await?.is_none() {
+    let user = if let Some(user) = users.get_opt(username).await? {
+        user
+    } else {
         let user = User::new(
             username,
             UserSpec {
@@ -264,8 +257,8 @@ pub async fn issue_setup_link(
                 disabled: false,
             },
         );
-        users.create(&pp, &user).await?;
-    }
+        users.create(&pp, &user).await?
+    };
 
     let selector = ListParams::default().labels(&format!("{USER_LABEL}={username}"));
     let credentials: Api<Credential> = Api::namespaced(client.clone(), namespace);
@@ -293,6 +286,7 @@ pub async fn issue_setup_link(
     let mut secret = Secret {
         metadata: ObjectMeta {
             name: Some(SETUP_SECRET.to_owned()),
+            owner_references: user.owner_ref(&()).map(|owner| vec![owner]),
             labels: Some(BTreeMap::from([(
                 MANAGED_BY.0.to_owned(),
                 MANAGED_BY.1.to_owned(),

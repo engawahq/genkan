@@ -1,7 +1,5 @@
 #![doc = include_str!("../README.md")]
 
-pub mod scim;
-
 use std::collections::HashMap;
 use std::future::{self, Future};
 use std::sync::{Mutex, PoisonError};

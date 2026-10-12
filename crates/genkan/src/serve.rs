@@ -1,9 +1,10 @@
 //! `genkan`: wires configuration, storage, keys and HTTP together.
 //!
-//! Startup refuses to bind the public port until Kubernetes directory metadata watches publish
-//! their initial snapshots and signing keys are reconciled. Background tasks watch directory
-//! metadata, rotate keys, collect expired grants and invitations, send mail and serve the internal
-//! listener. Startup failure signals shutdown to any tasks already running.
+//! Kubernetes mode binds the internal port first, failing immediately if it is unavailable.
+//! Startup refuses to bind the public port until directory metadata watches publish their initial
+//! snapshots and signing keys are reconciled. Background tasks watch metadata, rotate keys,
+//! collect expired grants and invitations, and serve internal TLS. Startup failure signals
+//! shutdown to any tasks already running.
 //! With the Kubernetes store, if the API server becomes unreachable, Genkan keeps serving the
 //! last published keys; logins and refreshes that need a write fail closed, and the background
 //! tasks retry.
@@ -13,8 +14,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use axum::serve::Listener as _;
 use genkan_core::clock::SystemClock;
-use genkan_core::crypto::{Sealer, hash_secret};
+use genkan_core::crypto::Sealer;
 use genkan_k8s::crd::grant::Grant;
 use genkan_k8s::crd::invitation::Invitation;
 use genkan_k8s::credentials::KubeCredentialStore;
@@ -23,24 +25,21 @@ use genkan_k8s::gc;
 use genkan_k8s::grants::KubeGrantStore;
 use genkan_k8s::keys::SecretKeyStore;
 use genkan_k8s::setup::KubeSetupStore;
-use genkan_k8s::users::KubeUserAdmin;
 use genkan_keys::manager::{KeyManager, ManagerError};
 use genkan_keys::store::{KeyStore, MemoryKeyStore};
-use genkan_mail::Mailer;
 use genkan_oauth::discovery::ProviderMetadata;
 use genkan_oauth::metadata::{AppState, router};
 use genkan_oauth::{AuthorizationServer, OneTimeIds, endpoints};
-use genkan_scim::Scim;
 use genkan_signin::passkeys::Passkeys;
 use genkan_signin::upstream::http::HyperClient;
 use genkan_signin::upstream::provider::{Endpoints, Kind, Provider};
 use genkan_signin::upstream::{self, Upstream};
 use genkan_signin::{SignIn, pages};
-use genkan_store::scim::{MemoryUserAdmin, UserAdmin};
 use genkan_store::{
     CredentialStore, Directory, GrantStore, MemoryCredentialStore, MemoryDirectory,
     MemoryGrantStore, MemorySetupStore, SetupStore,
 };
+use genkan_tls::listener::{Resolver, TlsListener, server_config};
 use k8s_openapi::api::core::v1::Secret;
 use kube::Client;
 use kube::api::Api;
@@ -49,7 +48,7 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::config::{MailConfig, ServeConfig, Store};
+use crate::config::{ServeConfig, Store};
 use crate::internal::{self, InternalConfig};
 
 /// How often signing keys are reconciled. Rotation timings are hours to days, so a minute of
@@ -109,13 +108,17 @@ pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
                 MemoryCredentialStore::default(),
                 MemorySetupStore::default(),
             );
-            let scim = scim_router(&config, MemoryUserAdmin::default())?;
-            run(&config, stores, Vec::new(), None, scim, shutdown_tx.clone()).await
+            run(&config, stores, Vec::new(), None, shutdown_tx.clone()).await
         }
         Store::Kubernetes {
             namespace,
             key_secret,
         } => {
+            let internal_listener = TcpListener::bind(config.internal_listen).await?;
+            let resolver = Arc::new(Resolver::default());
+            let tls = server_config(Arc::clone(&resolver)).map_err(io::Error::other)?;
+            let internal_listener = TlsListener::new(internal_listener, tls)?;
+            tracing::info!(address = %internal_listener.local_addr()?, "internal listener bound");
             let client = Client::try_default().await?;
             let namespace = namespace
                 .clone()
@@ -149,23 +152,8 @@ pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
                         gc::run::<Invitation, _>(client, &namespace, SystemClock, shutdown).await;
                     }
                 }));
-                if let Some(mail) = &config.mail {
-                    let mailer = mailer(mail)?;
-                    tracing::info!(?mailer, "mailing invitation links");
-                    background.push(tokio::spawn(crate::mailer::run_mailer(
-                        Api::namespaced(client.clone(), &namespace),
-                        mailer,
-                        config.issuer.clone(),
-                        SystemClock,
-                        shutdown_rx.clone(),
-                    )));
-                }
             }
             let internal_secrets = Api::namespaced(client.clone(), &namespace);
-            let scim = scim_router(
-                &config,
-                KubeUserAdmin::new(Api::namespaced(client.clone(), &namespace)),
-            )?;
             let gc = tokio::spawn({
                 let shutdown = shutdown_rx.clone();
                 async move { gc::run::<Grant, _>(client, &namespace, SystemClock, shutdown).await }
@@ -174,8 +162,7 @@ pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
                 &config,
                 (keys, directory, grants, credentials, setup),
                 background.into_iter().chain([gc]).collect(),
-                Some(internal_secrets),
-                scim,
+                Some((internal_listener, resolver, internal_secrets)),
                 shutdown_tx.clone(),
             )
             .await
@@ -185,31 +172,6 @@ pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
     // Startup failures must also terminate any watchers already spawned.
     shutdown_tx.send_replace(true);
     outcome
-}
-
-/// The SCIM routes, if SCIM is enabled: reads the token file and keeps only its hash.
-fn scim_router<A: UserAdmin>(
-    config: &ServeConfig,
-    users: A,
-) -> Result<Option<axum::Router>, ServeError> {
-    let Some(scim) = &config.scim else {
-        return Ok(None);
-    };
-    let token = std::fs::read_to_string(&scim.token_file)
-        .map_err(|error| ServeError::Config(format!("{}: {error}", scim.token_file.display())))?;
-    let token = token.trim();
-    if token.len() < 32 {
-        return Err(ServeError::Config(
-            "the SCIM token must be at least 32 characters".to_owned(),
-        ));
-    }
-    tracing::info!(groups = ?scim.groups, "SCIM provisioning enabled");
-    Ok(Some(genkan_scim::router(Arc::new(Scim {
-        users,
-        token_hash: hash_secret(token.as_bytes()),
-        groups: scim.groups.clone(),
-        base: config.issuer.join(genkan_scim::BASE_PATH),
-    }))))
 }
 
 /// The configured upstream providers, with their client secrets read from files.
@@ -239,23 +201,6 @@ fn upstream_providers(config: &ServeConfig) -> Result<Vec<Provider>, ServeError>
             ))
         })
         .collect()
-}
-
-/// Builds the mailer: reads the password file and the trusted CAs.
-fn mailer(config: &MailConfig) -> Result<Mailer, ServeError> {
-    let password = config
-        .password_file
-        .as_ref()
-        .map(|path| {
-            std::fs::read_to_string(path)
-                .map(|p| p.trim_end_matches(['\r', '\n']).to_owned())
-                .map_err(|error| ServeError::Config(format!("{}: {error}", path.display())))
-        })
-        .transpose()?;
-    let roots = genkan_tls::trust::roots(config.ca_file.as_deref())
-        .map_err(|error| ServeError::Config(error.to_string()))?;
-    Mailer::new(&config.url, password, &config.from, roots)
-        .map_err(|error| ServeError::Config(error.to_string()))
 }
 
 /// Maps load shedding to an immediate retryable response without logging request secrets.
@@ -327,8 +272,7 @@ async fn run<S: KeyStore, D: Directory, G: GrantStore, K: CredentialStore, T: Se
     config: &ServeConfig,
     (keys, directory, grants, credentials, setup): (S, D, G, K, T),
     mut background: Vec<JoinHandle<()>>,
-    internal_secrets: Option<Api<Secret>>,
-    scim: Option<axum::Router>,
+    internal_listener: Option<(TlsListener, Arc<Resolver>, Api<Secret>)>,
     shutdown_tx: watch::Sender<bool>,
 ) -> Result<(), ServeError> {
     let manager = Arc::new(KeyManager::new(keys, SystemClock, config.rotation));
@@ -341,14 +285,15 @@ async fn run<S: KeyStore, D: Directory, G: GrantStore, K: CredentialStore, T: Se
         async move { manager.run(RECONCILE_INTERVAL, shutdown).await }
     });
 
-    if let Some(secrets) = internal_secrets {
+    if let Some((listener, resolver, secrets)) = internal_listener {
         let internal = InternalConfig {
-            listen: config.internal_listen,
             issuer: config.issuer.clone(),
             url: config.internal_url.clone(),
             max_age: config.metadata_max_age,
         };
         background.push(tokio::spawn(internal::run(
+            listener,
+            resolver,
             internal,
             secrets,
             manager.subscribe(),
@@ -415,9 +360,6 @@ async fn run<S: KeyStore, D: Directory, G: GrantStore, K: CredentialStore, T: Se
             })),
             "upstream",
         ));
-    }
-    if let Some(scim) = scim {
-        app = app.merge(business_limits(scim, "scim"));
     }
     let app = limits(app);
     let listener = TcpListener::bind(config.listen).await?;

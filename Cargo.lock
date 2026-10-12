@@ -1288,15 +1288,12 @@ name = "genkan"
 version = "0.0.0"
 dependencies = [
  "axum",
- "base64 0.22.1",
  "bytes",
  "clap",
  "genkan-core",
  "genkan-k8s",
  "genkan-keys",
- "genkan-mail",
  "genkan-oauth",
- "genkan-scim",
  "genkan-signin",
  "genkan-store",
  "genkan-tls",
@@ -1304,7 +1301,6 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "rustls",
- "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
@@ -1398,20 +1394,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "genkan-mail"
-version = "0.0.0"
-dependencies = [
- "base64 0.22.1",
- "genkan-core",
- "genkan-tls",
- "rustls",
- "thiserror 2.0.21",
- "time",
- "tokio",
- "tokio-rustls",
-]
-
-[[package]]
 name = "genkan-oauth"
 version = "0.0.0"
 dependencies = [
@@ -1429,23 +1411,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
- "tokio",
- "tower",
- "tracing",
-]
-
-[[package]]
-name = "genkan-scim"
-version = "0.0.0"
-dependencies = [
- "axum",
- "bytes",
- "form_urlencoded",
- "genkan-core",
- "genkan-store",
- "http-body-util",
- "serde",
- "serde_json",
  "tokio",
  "tower",
  "tracing",

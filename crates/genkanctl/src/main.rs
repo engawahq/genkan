@@ -15,10 +15,7 @@ fn main() -> ExitCode {
     match Cli::parse().command {
         Command::SetupLink(args) => setup_link(&args),
         Command::Crds => print_json(genkan_k8s::crd::definitions_json()),
-        Command::Rbac { namespace, scim } => print_json(genkan_k8s::rbac::manifests_json_with(
-            &namespace,
-            scim.groups(),
-        )),
+        Command::Rbac { namespace } => print_json(genkan_k8s::rbac::manifests_json(&namespace)),
         Command::Manifests(args) => print_json(genkan_k8s::deployment::manifests_json(
             &args.namespace,
             &args.issuer,
@@ -26,7 +23,6 @@ fn main() -> ExitCode {
                 image: args.image.clone(),
                 serve_args: args.serve_args.clone(),
                 config_secret: args.config_secret.clone(),
-                scim_groups: args.scim.groups().map(<[String]>::to_vec),
             },
         )),
         Command::KubeConfig(args) => kube_config(&args),
@@ -43,8 +39,6 @@ fn invite(args: &InviteArgs) -> ExitCode {
         display_name: args.display_name.clone(),
         groups: args.groups.clone(),
         elevated_groups: args.elevated_groups.clone(),
-        email: args.email.clone(),
-        language: args.language.clone(),
     };
     let result = runtime.block_on(async {
         let client = kube::Client::try_default().await?;
@@ -67,21 +61,12 @@ fn invite(args: &InviteArgs) -> ExitCode {
                     args.username
                 ));
             }
-            match (&created.url, &args.email) {
-                (Some(url), _) => {
-                    output::stdout(url);
-                    output::stderr(&format!(
-                        "Send this link to {}. It works once and expires in {} days.",
-                        args.username,
-                        args.valid_for.as_secs() / 86_400
-                    ));
-                }
-                (None, Some(email)) => output::stderr(&format!(
-                    "Genkan will mail the link to {email} (invitation {}).",
-                    created.name
-                )),
-                (None, None) => {}
-            }
+            output::stdout(&created.url);
+            output::stderr(&format!(
+                "Send this link to {}. It works once and expires in {} days.",
+                args.username,
+                args.valid_for.as_secs() / 86_400
+            ));
             ExitCode::SUCCESS
         }
         Err(error) => {

@@ -19,7 +19,7 @@ Primitives every Genkan crate shares. Nothing here performs I/O.
 
 `genkan-core` depends on no other workspace crate. Nearly every other crate depends on it:
 `genkan-keys`, `genkan-store`, `genkan-ui`, `genkan-oauth`, `genkan-signin`, `genkan-tls`,
-`genkan-mail`, `genkan-scim`, `genkan-k8s`, and the `genkan` and `genkanctl` binaries.
+`genkan-k8s`, and the `genkan` and `genkanctl` binaries.
 
 ## Cryptographic backend
 

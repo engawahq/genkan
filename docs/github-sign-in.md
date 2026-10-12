@@ -47,7 +47,7 @@ kubectl -n genkan-system create secret generic genkan-config \
 unset GITHUB_SECRET
 ```
 
-If `genkan-config` already exists (SMTP, SCIM or Google files), add the key to it instead:
+If `genkan-config` already exists (for example with Google's secret), add the key to it instead:
 `kubectl -n genkan-system edit secret genkan-config`, or recreate it with every
 `--from-literal`/`--from-file`.
 
@@ -109,17 +109,24 @@ Open the link and choose **Continue with GitHub**.
 
 When you know the person's GitHub account, create the `Credential` yourself. Its name must be
 derived from the issuer and the numeric ID exactly as Genkan derives it, because Genkan looks
-the account up by name:
+the account up by name. Give it an owner reference to the User's current UID, as Genkan does
+for credentials it creates, so that deleting the User also deletes the credential; without
+one, the credential outlives the User and signs in as any later User given the same name:
 
 ```sh
 LOGIN=octocat
 USER_NAME=alice                                   # an existing User object
+USER_UID=$(kubectl -n genkan-system get users.genkan.engawahq.dev "$USER_NAME" -o jsonpath='{.metadata.uid}')
 GH_ID=$(curl -fsS https://api.github.com/users/$LOGIN | jq -r .id)
 NAME=c-$(printf 'genkan/external/v1/https://github.com\0%s' "$GH_ID" | sha256sum | cut -d' ' -f1)
 kubectl apply -f - <<EOF
 apiVersion: genkan.engawahq.dev/v1alpha1
 kind: Credential
-metadata: {name: $NAME, namespace: genkan-system}
+metadata:
+  name: $NAME
+  namespace: genkan-system
+  ownerReferences:
+    - {apiVersion: genkan.engawahq.dev/v1alpha1, kind: User, name: $USER_NAME, uid: $USER_UID}
 spec:
   type: GitHub
   user: $USER_NAME

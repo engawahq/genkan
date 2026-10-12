@@ -31,9 +31,6 @@ pub(crate) enum Command {
         /// Namespace to install into.
         #[arg(long, default_value = genkan_k8s::rbac::DEFAULT_NAMESPACE)]
         namespace: String,
-        /// SCIM options.
-        #[command(flatten)]
-        scim: ScimInstallArgs,
     },
     /// Print everything to install (the `rbac` objects, the Service and the Deployment) as a
     /// Kubernetes `List` (JSON), for `genkanctl manifests … | kubectl apply -f -`.
@@ -43,7 +40,7 @@ pub(crate) enum Command {
     /// `AuthenticationConfiguration` (stdout) and how to install it (stderr).
     KubeConfig(KubeConfigArgs),
     /// Invite a user, using your own kubeconfig (admin): creates the `User` if needed and a
-    /// one-time enrolment link, printed, or mailed by Genkan with --email.
+    /// one-time enrolment link, printed for you to send.
     Invite(InviteArgs),
 }
 
@@ -66,12 +63,6 @@ pub(crate) struct InviteArgs {
     /// sign-in with the `elevate` scope.
     #[arg(long = "elevated-group")]
     pub elevated_groups: Vec<String>,
-    /// Have Genkan mail the link to this address (needs `genkan --smtp-url`).
-    #[arg(long)]
-    pub email: Option<String>,
-    /// Language of the mail.
-    #[arg(long, value_parser = ["en", "zh-TW", "zh-CN"])]
-    pub language: Option<String>,
     /// How long the link works.
     #[arg(long, default_value = "7d", value_parser = parse_duration)]
     pub valid_for: Duration,
@@ -95,32 +86,9 @@ pub(crate) struct ManifestsArgs {
     /// An argument for `genkan` (repeatable), for example `--serve-arg=--invitations`.
     #[arg(long = "serve-arg", allow_hyphen_values = true)]
     pub serve_args: Vec<String>,
-    /// A Secret mounted read-only at /etc/genkan, for files such as client secrets, the SMTP
-    /// password or the SCIM token.
+    /// A Secret mounted read-only at /etc/genkan, for files such as client secrets.
     #[arg(long)]
     pub config_secret: Option<String>,
-    /// SCIM options.
-    #[command(flatten)]
-    pub scim: ScimInstallArgs,
-}
-
-/// SCIM options of `genkanctl rbac` and `genkanctl manifests`.
-#[derive(Debug, Args)]
-pub(crate) struct ScimInstallArgs {
-    /// Install the RBAC rules and admission policy SCIM provisioning needs.
-    #[arg(long)]
-    pub scim: bool,
-    /// A group SCIM may assign (repeatable); must match `genkan --scim-group`.
-    #[arg(long = "scim-group", requires = "scim")]
-    pub scim_groups: Vec<String>,
-}
-
-impl ScimInstallArgs {
-    /// The allowlist when SCIM is enabled.
-    #[must_use]
-    pub(crate) fn groups(&self) -> Option<&[String]> {
-        self.scim.then_some(self.scim_groups.as_slice())
-    }
 }
 
 /// Arguments of `genkanctl kube-config`.

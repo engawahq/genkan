@@ -11,7 +11,6 @@ resources, live in `genkan-k8s`.
   token means.
 - `CredentialStore`: passkeys and linked upstream accounts.
 - `SetupStore`: the one-time setup token and invitations.
-- `scim::UserAdmin`: users created through SCIM provisioning.
 
 Each port has a `Memory*` adapter in this crate.
 
@@ -19,7 +18,7 @@ Each port has a `Memory*` adapter in this crate.
 
 Depends on `genkan-core` (clock, constant-time comparison, hashing) and `genkan-keys` (the
 signing algorithm of a client's ID tokens). Used by `genkan-oauth`, `genkan-signin`,
-`genkan-scim`, `genkan-k8s` and `genkan`.
+`genkan-k8s` and `genkan`.
 
 ## Design rules
 

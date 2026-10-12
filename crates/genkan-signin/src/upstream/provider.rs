@@ -5,9 +5,9 @@
 //!
 //! Google's ID token is validated as OpenID Connect Core 1.0 §3.1.3.7 requires of a client:
 //! signature with a key from Google's published JWK set, `iss` one of Google's issuer strings,
-//! `aud` containing the client ID (and `azp` equal to it when there are several audiences), not
-//! expired, and `nonce` equal to the one sent. Codes are exchanged with PKCE (RFC 7636) for both
-//! providers, and the client authenticates with `client_secret_post` (RFC 6749 §2.3.1).
+//! `aud` exactly the client ID (no other audience is trusted) and `azp`, if present, equal to it,
+//! not expired, and `nonce` equal to the one sent. Codes are exchanged with PKCE (RFC 7636) for
+//! both providers, and the client authenticates with `client_secret_post` (RFC 6749 §2.3.1).
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -434,14 +434,18 @@ impl Provider {
         if !self.endpoints.issuers.contains(&claims.iss) {
             return Err(UpstreamError::IdToken("issuer"));
         }
+        // This client trusts no other audience, so the only acceptable `aud` is its own client ID
+        // (§3.1.3.7 step 3), and an `azp` naming another party is refused (step 5).
         let audience_ok = match &claims.aud {
             Audience::One(aud) => *aud == self.client_id,
-            Audience::Many(auds) => {
-                auds.contains(&self.client_id)
-                    && (auds.len() == 1 || claims.azp.as_deref() == Some(&self.client_id))
-            }
+            Audience::Many(auds) => matches!(auds.as_slice(), [aud] if *aud == self.client_id),
         };
-        if !audience_ok {
+        if !audience_ok
+            || claims
+                .azp
+                .as_deref()
+                .is_some_and(|azp| azp != self.client_id)
+        {
             return Err(UpstreamError::IdToken("audience"));
         }
         if claims.exp.saturating_add(LEEWAY) <= now.as_secs() {

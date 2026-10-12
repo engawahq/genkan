@@ -20,15 +20,6 @@ pub enum Store {
     Memory,
 }
 
-/// SCIM provisioning.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScimConfig {
-    /// File holding the bearer token.
-    pub token_file: std::path::PathBuf,
-    /// Groups SCIM may assign.
-    pub groups: Vec<String>,
-}
-
 /// An upstream identity provider's client registration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamConfig {
@@ -38,19 +29,6 @@ pub struct UpstreamConfig {
     pub client_id: String,
     /// File holding the client secret (a mounted Secret).
     pub client_secret_file: std::path::PathBuf,
-}
-
-/// How invitation mail is sent.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MailConfig {
-    /// `smtps://` or `smtp://` URL of the submission server.
-    pub url: String,
-    /// File holding the password.
-    pub password_file: Option<std::path::PathBuf>,
-    /// Extra CA for the server.
-    pub ca_file: Option<std::path::PathBuf>,
-    /// Sender address.
-    pub from: String,
 }
 
 /// Configuration for `genkan`.
@@ -66,14 +44,10 @@ pub struct ServeConfig {
     pub metadata_max_age: Duration,
     /// Whether invitations are accepted.
     pub invitations: bool,
-    /// How invitation links are mailed, if they are.
-    pub mail: Option<MailConfig>,
     /// Enabled upstream identity providers.
     pub upstream: Vec<UpstreamConfig>,
     /// Extra CA trusted for the providers (tests and private mirrors).
     pub upstream_ca_file: Option<std::path::PathBuf>,
-    /// SCIM provisioning, if enabled.
-    pub scim: Option<ScimConfig>,
     /// Where the internal TLS listener binds (Kubernetes store only).
     pub internal_listen: SocketAddr,
     /// Overrides the internal base URL recorded in the certificate Secret.
@@ -114,9 +88,6 @@ impl ServeConfig {
             return Err(ConfigError::BadRotationPolicy(
                 "elevated token lifetime must be between 1m and 15m",
             ));
-        }
-        if self.mail.is_some() && !self.invitations {
-            return Err(ConfigError::Incomplete("--smtp-url needs --invitations"));
         }
         if self.lifetimes.refresh_idle > self.lifetimes.refresh_absolute {
             return Err(ConfigError::BadRotationPolicy(
