@@ -4,7 +4,7 @@
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Duration;
 
     use axum::Router;
@@ -21,13 +21,16 @@ mod tests {
     use genkan_keys::store::MemoryKeyStore;
     use genkan_oauth::authorize::Authentication;
     use genkan_oauth::endpoints::{FLOW_COOKIE, complete_authorization, router};
-    use genkan_oauth::{AuthorizationServer, Lifetimes, OneTimeIds};
-    use genkan_store::{Client, ClientType, MemoryDirectory, MemoryGrantStore, User};
+    use genkan_oauth::{AuthorizationServer, CodeRedemptions, Lifetimes, OneTimeIds};
+    use genkan_store::{
+        Client, ClientType, CreateGrant, Grant, GrantStore, MemoryDirectory, MemoryGrantStore,
+        NewGrant, Rotation, StoreError, User,
+    };
     use http_body_util::BodyExt as _;
     use jsonwebtoken::jwk::JwkSet;
     use jsonwebtoken::{DecodingKey, Validation, decode, decode_header};
     use serde_json::Value;
-    use tokio::sync::Barrier;
+    use tokio::sync::{Barrier, Semaphore};
     use tower::ServiceExt as _;
 
     const ISSUER: &str = "https://login.example.com";
@@ -52,10 +55,10 @@ mod tests {
         }
     }
 
-    type Server = AuthorizationServer<MemoryDirectory, MemoryGrantStore, TestClock>;
+    type Server<G = MemoryGrantStore> = AuthorizationServer<MemoryDirectory, G, TestClock>;
 
-    struct Harness {
-        server: Arc<Server>,
+    struct Harness<G = MemoryGrantStore> {
+        server: Arc<Server<G>>,
         app: Router,
         clock: TestClock,
         jwks: JwkSet,
@@ -66,6 +69,10 @@ mod tests {
     }
 
     async fn harness_with(lifetimes: Lifetimes) -> Harness {
+        harness_with_store(lifetimes, MemoryGrantStore::default()).await
+    }
+
+    async fn harness_with_store<G: GrantStore>(lifetimes: Lifetimes, grants: G) -> Harness<G> {
         let clock = TestClock::default();
         clock.0.store(START, Ordering::SeqCst);
         let manager = KeyManager::new(
@@ -111,11 +118,11 @@ mod tests {
             issuer: BaseUrl::parse("issuer", ISSUER).unwrap(),
             lifetimes,
             directory,
-            grants: MemoryGrantStore::default(),
+            grants,
             clock: clock.clone(),
             keys,
             sealer: Sealer::ephemeral().unwrap(),
-            used_codes: OneTimeIds::default(),
+            used_codes: CodeRedemptions::default(),
             used_request_uris: OneTimeIds::default(),
         });
         let app = router(Arc::clone(&server));
@@ -225,12 +232,17 @@ mod tests {
     }
 
     /// Runs `/authorize` and the sign-in for `user`, and returns the code.
-    async fn sign_in(h: &Harness, user: &str, authorize_uri: &str) -> String {
+    async fn sign_in<G: GrantStore>(h: &Harness<G>, user: &str, authorize_uri: &str) -> String {
         sign_in_with(h, user, authorize_uri, &["hwk", "user"]).await
     }
 
     /// [`sign_in`] with the given authentication methods.
-    async fn sign_in_with(h: &Harness, user: &str, authorize_uri: &str, amr: &[&str]) -> String {
+    async fn sign_in_with<G: GrantStore>(
+        h: &Harness<G>,
+        user: &str,
+        authorize_uri: &str,
+        amr: &[&str],
+    ) -> String {
         let reply = get(&h.app, authorize_uri).await;
         assert_eq!(
             reply.status,
@@ -247,7 +259,7 @@ mod tests {
         param(&location, "code").unwrap()
     }
 
-    async fn exchange(h: &Harness, code: &str) -> Reply {
+    async fn exchange<G: GrantStore>(h: &Harness<G>, code: &str) -> Reply {
         post(
             &h.app,
             "/token",
@@ -263,7 +275,7 @@ mod tests {
         .await
     }
 
-    async fn refresh(h: &Harness, token: &str) -> Reply {
+    async fn refresh<G: GrantStore>(h: &Harness<G>, token: &str) -> Reply {
         post(
             &h.app,
             "/token",
@@ -457,6 +469,166 @@ mod tests {
         assert_eq!(second.error(), "invalid_grant");
         // RFC 6749 §4.1.2: tokens issued from the reused code are revoked.
         assert_eq!(refresh(&h, &refresh_token).await.error(), "invalid_grant");
+    }
+
+    #[derive(Debug)]
+    struct Pause {
+        first: AtomicBool,
+        entered: Semaphore,
+        release: Semaphore,
+        completed: Semaphore,
+    }
+
+    impl Pause {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                first: AtomicBool::new(true),
+                entered: Semaphore::new(0),
+                release: Semaphore::new(0),
+                completed: Semaphore::new(0),
+            })
+        }
+
+        async fn wait(&self) {
+            if self.first.swap(false, Ordering::SeqCst) {
+                self.entered.add_permits(1);
+                self.release.acquire().await.unwrap().forget();
+            }
+        }
+
+        async fn started(&self) {
+            self.entered.acquire().await.unwrap().forget();
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct PausedGrants {
+        inner: MemoryGrantStore,
+        create: Option<Arc<Pause>>,
+        revoke: Option<Arc<Pause>>,
+    }
+
+    impl GrantStore for PausedGrants {
+        async fn create(
+            &self,
+            grant: &NewGrant,
+            idle_expires_at: UnixTime,
+        ) -> Result<CreateGrant, StoreError> {
+            if let Some(pause) = &self.create {
+                pause.wait().await;
+            }
+            self.inner.create(grant, idle_expires_at).await
+        }
+
+        async fn get(&self, name: &str) -> Result<Option<Grant>, StoreError> {
+            self.inner.get(name).await
+        }
+
+        async fn rotate(
+            &self,
+            name: &str,
+            presented_hash: &str,
+            next_hash: &str,
+            now: UnixTime,
+            idle_expires_at: UnixTime,
+        ) -> Result<Rotation, StoreError> {
+            self.inner
+                .rotate(name, presented_hash, next_hash, now, idle_expires_at)
+                .await
+        }
+
+        async fn revoke(&self, name: &str) -> Result<(), StoreError> {
+            if let Some(pause) = &self.revoke {
+                pause.wait().await;
+            }
+            let result = self.inner.revoke(name).await;
+            if let Some(pause) = &self.revoke {
+                pause.completed.add_permits(1);
+            }
+            result
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_waits_for_pending_create_and_revokes_the_issued_family() {
+        let pause = Pause::new();
+        let h = Arc::new(
+            harness_with_store(
+                Lifetimes::DEFAULT,
+                PausedGrants {
+                    create: Some(Arc::clone(&pause)),
+                    ..PausedGrants::default()
+                },
+            )
+            .await,
+        );
+        let code = sign_in(&h, "alice", &kubectl_authorize(&[])).await;
+        let first = {
+            let h = Arc::clone(&h);
+            let code = code.clone();
+            tokio::spawn(async move { exchange(&h, &code).await })
+        };
+        pause.started().await;
+        let mut replay = Box::pin(exchange(&h, &code));
+        std::future::poll_fn(|cx| {
+            assert!(
+                replay.as_mut().poll(cx).is_pending(),
+                "replay must not revoke before the first create finishes"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        // A blocked redemption serializes only its own code, not the token endpoint.
+        let unrelated = sign_in(&h, "alice", &kubectl_authorize(&[])).await;
+        assert_eq!(exchange(&h, &unrelated).await.status, StatusCode::OK);
+        pause.release.add_permits(1);
+        let first = first.await.unwrap();
+        assert_eq!(first.status, StatusCode::OK);
+        assert_eq!(replay.await.error(), "invalid_grant");
+        assert_eq!(
+            refresh(&h, first.json()["refresh_token"].as_str().unwrap())
+                .await
+                .error(),
+            "invalid_grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_replay_request_does_not_cancel_family_revocation() {
+        let pause = Pause::new();
+        let h = Arc::new(
+            harness_with_store(
+                Lifetimes::DEFAULT,
+                PausedGrants {
+                    revoke: Some(Arc::clone(&pause)),
+                    ..PausedGrants::default()
+                },
+            )
+            .await,
+        );
+        let code = sign_in(&h, "alice", &kubectl_authorize(&[])).await;
+        let token = exchange(&h, &code).await.json()["refresh_token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let replay = {
+            let h = Arc::clone(&h);
+            let code = code.clone();
+            tokio::spawn(async move { exchange(&h, &code).await })
+        };
+        pause.started().await;
+        replay.abort();
+        assert!(matches!(replay.await, Err(error) if error.is_cancelled()));
+        pause.release.add_permits(1);
+        // Wait for the original detached delete, without issuing a second replay that could
+        // perform the deletion itself and hide cancellation of the first request.
+        tokio::time::timeout(Duration::from_secs(5), pause.completed.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        assert_eq!(refresh(&h, &token).await.error(), "invalid_grant");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

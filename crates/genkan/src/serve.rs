@@ -27,7 +27,7 @@ use genkan_keys::store::{KeyStore, MemoryKeyStore};
 use genkan_mail::Mailer;
 use genkan_oauth::discovery::ProviderMetadata;
 use genkan_oauth::metadata::{AppState, router};
-use genkan_oauth::{AuthorizationServer, OneTimeIds, endpoints};
+use genkan_oauth::{AuthorizationServer, CodeRedemptions, OneTimeIds, endpoints};
 use genkan_scim::Scim;
 use genkan_signin::passkeys::Passkeys;
 use genkan_signin::upstream::http::HyperClient;
@@ -299,7 +299,7 @@ async fn run<S: KeyStore, D: Directory, G: GrantStore, K: CredentialStore, T: Se
         clock: SystemClock,
         keys: manager.subscribe(),
         sealer: Sealer::ephemeral().map_err(|_crypto| ServeError::Crypto)?,
-        used_codes: OneTimeIds::default(),
+        used_codes: CodeRedemptions::default(),
         used_request_uris: OneTimeIds::default(),
     });
     let sign_in = Arc::new(SignIn {

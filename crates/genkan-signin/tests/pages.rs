@@ -16,7 +16,7 @@ mod tests {
     use genkan_keys::rotation::RotationPolicy;
     use genkan_keys::store::MemoryKeyStore;
     use genkan_oauth::endpoints::{self, FLOW_COOKIE};
-    use genkan_oauth::{AuthorizationServer, Lifetimes, OneTimeIds};
+    use genkan_oauth::{AuthorizationServer, CodeRedemptions, Lifetimes, OneTimeIds};
     use genkan_signin::pages;
     use genkan_signin::upstream::provider::Kind;
     use genkan_store::{Client, ClientType, MemoryDirectory, MemoryGrantStore};
@@ -55,7 +55,7 @@ mod tests {
             clock: SystemClock,
             keys: manager.subscribe(),
             sealer: Sealer::ephemeral().unwrap(),
-            used_codes: OneTimeIds::default(),
+            used_codes: CodeRedemptions::default(),
             used_request_uris: OneTimeIds::default(),
         });
         endpoints::router(Arc::clone(&server)).merge(pages::router(server, providers))

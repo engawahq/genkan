@@ -27,8 +27,10 @@ page). Used by `genkan` (the server), `genkan-signin` (which calls `complete_aut
 - No request writes to storage before the user has authenticated. The validated request and
   the code are sealed under a key that exists only in the process; a restart fails closed.
 - PKCE S256 is required for every client; `plain` is rejected (RFC 9700 §2.1.1, RFC 7636).
-- Codes live 60 seconds and are single-use; a replayed code revokes what it issued
-  (RFC 6749 §4.1.2).
+- Codes live 60 seconds and are single-use. Redemption and replay are ordered per code, even
+  across pending storage operations or HTTP request cancellation; unrelated codes proceed
+  independently. A replay revokes the refresh family (RFC 6749 §4.1.2). Already-issued signed
+  tokens cannot be recalled and expire normally.
 - Refresh tokens rotate; a replayed one revokes its whole family (RFC 9700 §4.14.2). Only
   SHA-256 hashes of refresh secrets are stored.
 - Access tokens (RFC 9068) and ID tokens differ in their claims, not only in `typ`, because

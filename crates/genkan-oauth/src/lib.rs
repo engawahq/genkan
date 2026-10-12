@@ -14,7 +14,7 @@ pub mod tokens;
 pub mod userinfo;
 
 use std::collections::HashMap;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use genkan_core::clock::{Clock, UnixTime};
@@ -91,9 +91,8 @@ pub struct AuthorizationServer<D, G, C> {
     /// Seals flows, codes and PAR request URIs. Its key exists only in this process, so a restart
     /// invalidates everything in flight (fail closed).
     pub sealer: Sealer,
-    /// Codes redeemed so far, until they expire. Sealed codes are self-contained, so this set
-    /// is what makes them single-use (RFC 6749 §4.1.2).
-    pub used_codes: OneTimeIds,
+    /// Per-code ordering and single-use state, retained until codes expire.
+    pub used_codes: CodeRedemptions,
     /// PAR request URIs used so far, until they expire (one-time use, RFC 9126 §4).
     pub used_request_uris: OneTimeIds,
 }
@@ -116,9 +115,9 @@ pub enum Use {
 
 /// A set of single-use identifiers that remembers each one until it expires.
 ///
-/// Used for sealed codes and request URIs: the sealing key is per-process, so this in-memory set
-/// is complete for everything this process can open. Memory is bounded by the number of
-/// successful redemptions within one code lifetime, and nothing is written to storage.
+/// Used for PAR request URIs: the sealing key is per-process, so this in-memory set is complete
+/// for everything this process can open. Memory is bounded by redemptions within one URI
+/// lifetime, and nothing is written to storage.
 #[derive(Debug, Default)]
 pub struct OneTimeIds {
     seen: Mutex<HashMap<String, (UnixTime, String)>>,
@@ -135,6 +134,51 @@ impl OneTimeIds {
         }
         seen.insert(id.to_owned(), (expires_at, note.to_owned()));
         Use::First
+    }
+}
+
+/// Orders redemption and replay of each code without blocking unrelated codes.
+///
+/// A replay must wait for the first grant creation to finish before deleting its family
+/// ([RFC 6749 §4.1.2]). The endpoint keeps this lock in a detached task so cancellation of the
+/// HTTP request cannot release it while a storage operation is pending. Runtime shutdown still
+/// cancels tasks; the process-local sealing key then disappears, so old codes cannot reopen.
+///
+/// Expired entries with active holders or waiters are retained until those operations finish.
+/// No global lock is held across an await. Memory is bounded by unexpired codes plus unfinished
+/// operations.
+///
+/// [RFC 6749 §4.1.2]: https://www.rfc-editor.org/rfc/rfc6749#section-4.1.2
+#[derive(Debug, Default)]
+pub struct CodeRedemptions {
+    entries: Mutex<HashMap<String, CodeEntry>>,
+}
+
+#[derive(Debug)]
+struct CodeEntry {
+    expires_at: UnixTime,
+    redeemed: Arc<tokio::sync::Mutex<bool>>,
+}
+
+impl CodeRedemptions {
+    /// The single-use state and operation lock for one authenticated, unexpired code.
+    pub(crate) fn entry(
+        &self,
+        id: &str,
+        expires_at: UnixTime,
+        now: UnixTime,
+    ) -> Arc<tokio::sync::Mutex<bool>> {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        entries.retain(|_, entry| entry.expires_at > now || Arc::strong_count(&entry.redeemed) > 1);
+        Arc::clone(
+            &entries
+                .entry(id.to_owned())
+                .or_insert_with(|| CodeEntry {
+                    expires_at,
+                    redeemed: Arc::new(tokio::sync::Mutex::new(false)),
+                })
+                .redeemed,
+        )
     }
 }
 

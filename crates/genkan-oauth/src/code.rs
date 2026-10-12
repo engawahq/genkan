@@ -6,20 +6,30 @@
 //! whereas a stored code costs a write per sign-in ([Kanidm], [Dex]).
 //!
 //! The token endpoint checks expiry, client, `redirect_uri` and the PKCE verifier first, and
-//! only then records the code's random 128-bit id in [`super::OneTimeIds`]. Checking PKCE first
-//! means a stolen code without its verifier cannot be burnt to lock out the legitimate client.
+//! only then enters [`super::CodeRedemptions`]. Checking PKCE first means a stolen code without
+//! its verifier cannot be burnt to lock out the legitimate client.
 //!
-//! The code's [`grant_name`] is deterministic. A second redemption in this process finds the
-//! name in the single-use set and revokes that grant; a redemption racing in another process
-//! fails to create the grant (`AlreadyExists`) and revokes it too. Either way RFC 6749 §4.1.2 is
-//! met: the reuse is denied and what the code issued is revoked. Redeeming a code is the first
-//! storage write of a sign-in.
+//! The code's [`grant_name`] is deterministic. Redemption and replay are ordered per code across
+//! the entire awaited storage operation: a replay waits for the first create before revoking
+//! the family. Unrelated codes proceed independently. A detached operation owns the lock, so
+//! cancelling its HTTP request does not cancel creation or revocation. Failed issuance still
+//! consumes the code and returns no tokens; a replay attempts revocation. Storage errors are
+//! reported, not treated as successful revocation.
+//! Ordering covers completion of storage futures, not a remote write that commits after an
+//! ambiguous backend error or timeout; no distributed transaction guarantee is implied.
+//!
+//! RFC 6749 §4.1.2 requires denying reuse and recommends revoking previously issued tokens
+//! ([RFC 6749]). Genkan revokes the refresh family; signed access and ID tokens cannot be
+//! recalled and remain usable until their short expiry. Another process cannot open this
+//! process's codes; the create-once grant operation additionally refuses any name collision.
+//! Redeeming a code is the first storage write of a sign-in.
 //!
 //! The key exists only in this process: a restart, or a code presented to another replica,
 //! fails closed with `invalid_grant`.
 //!
 //! [Kanidm]: https://github.com/kanidm/kanidm/tree/3331b8ed7f1541901ffe0c722f2a04c82897809c
 //! [Dex]: https://github.com/dexidp/dex/tree/05a275057112ba93e17db21f600b756f000f1c21
+//! [RFC 6749]: https://www.rfc-editor.org/rfc/rfc6749#section-4.1.2
 
 use genkan_core::clock::UnixTime;
 use genkan_core::crypto::{CryptoError, Sealer, hex, random, sha256};

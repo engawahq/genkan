@@ -120,7 +120,7 @@ Tests are in `genkan-oauth/tests/oauth.rs` unless noted.
 | 6749 §3.1, §3.2 | Parameters not repeated | MUST | `params.rs` | `authorization_endpoint_errors` | Met |
 | 6749 §3.1.2.3; 9700 §2.1 | Exact redirect URI match (loopback port excepted) | MUST | `authorize.rs` | `genkan-oauth: authorize::tests::redirect_uri_rules` | Met |
 | 6749 §4.1.2.1 | No redirect for an invalid client or redirect URI | MUST NOT | `endpoints.rs` (HTML error page) | `authorization_endpoint_errors`; `genkan-signin/tests/pages.rs: untrusted_authorization_requests_show_an_error_page` | Met |
-| 6749 §4.1.2 | Codes short-lived and single use; reuse revokes issued tokens | MUST | `code.rs`, `endpoints.rs` | `code_is_single_use_and_reuse_revokes_what_it_issued`, `exactly_one_concurrent_redemption_succeeds` | Met |
+| 6749 §4.1.2 | Codes short-lived and single use; deny reuse and revoke issued refresh families (signed tokens expire normally) | MUST / SHOULD | `code.rs`, `endpoints.rs`, `CodeRedemptions` | `code_is_single_use_and_reuse_revokes_what_it_issued`, `exactly_one_concurrent_redemption_succeeds`, `replay_waits_for_pending_create_and_revokes_the_issued_family`, `cancelling_replay_request_does_not_cancel_family_revocation` | Met |
 | 6749 §4.1.3 | Code bound to client and `redirect_uri` | MUST | `endpoints.rs` | `pkce_and_code_binding_are_enforced` | Met |
 | 6749 §2.3.1, §5.2 | Client authentication; `WWW-Authenticate` for Basic | MUST | `client_auth.rs` | `confidential_client_gets_rs256_id_tokens_and_must_authenticate` | Met |
 | 6749 §5.1 | `Cache-Control: no-store` | MUST | `error.rs` `no_store` | `code_flow_issues_tokens_kubernetes_can_use` | Met |

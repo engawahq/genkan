@@ -817,7 +817,7 @@ mod tests {
         use genkan_k8s::grants::KubeGrantStore;
         use genkan_oauth::authorize::Authentication;
         use genkan_oauth::endpoints::{FLOW_COOKIE, complete_authorization, router};
-        use genkan_oauth::{AuthorizationServer, Lifetimes, OneTimeIds};
+        use genkan_oauth::{AuthorizationServer, CodeRedemptions, Lifetimes, OneTimeIds};
 
         let env = Env::new().await;
         let pp = PostParams::default();
@@ -869,7 +869,7 @@ mod tests {
             clock: SystemClock,
             keys: manager.subscribe(),
             sealer: Sealer::ephemeral().unwrap(),
-            used_codes: OneTimeIds::default(),
+            used_codes: CodeRedemptions::default(),
             used_request_uris: OneTimeIds::default(),
         });
         let app = router(Arc::clone(&server));

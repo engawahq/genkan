@@ -400,7 +400,7 @@ fn store_error(error: impl std::fmt::Display) -> OAuthError {
 }
 
 async fn exchange_code<D: Directory, G: GrantStore, C: Clock>(
-    server: &AuthorizationServer<D, G, C>,
+    server: &Shared<D, G, C>,
     client: &Client,
     params: &Params,
 ) -> Result<TokenResponse, OAuthError> {
@@ -428,23 +428,45 @@ async fn exchange_code<D: Directory, G: GrantStore, C: Clock>(
         return Err(INVALID_GRANT);
     }
 
+    let entry = server.used_codes.entry(&claims.id, claims.expires_at, now);
+    let server = Arc::clone(server);
+    let client = client.clone();
+    // Keep the operation and its per-code lock alive if the HTTP request is cancelled. In
+    // particular, a replay cannot revoke a missing grant while its first create is pending.
+    tokio::spawn(async move {
+        let mut redeemed = entry.lock().await;
+        let result = if *redeemed {
+            tracing::warn!(client = %client.id, "authorization code reused; revoking its grant");
+            server
+                .grants
+                .revoke(&code::grant_name(&claims.id))
+                .await
+                .map_err(store_error)
+                .and(Err(INVALID_GRANT))
+        } else {
+            *redeemed = true;
+            redeem_code(&server, &client, &claims, now).await
+        };
+        drop(redeemed);
+        result
+    })
+    .await
+    .map_err(store_error)?
+}
+
+async fn redeem_code<D: Directory, G: GrantStore, C: Clock>(
+    server: &AuthorizationServer<D, G, C>,
+    client: &Client,
+    claims: &CodeClaims,
+    now: UnixTime,
+) -> Result<TokenResponse, OAuthError> {
     let grant_name = code::grant_name(&claims.id);
-    if let Use::Again(issued) =
-        server
-            .used_codes
-            .first_use(&claims.id, claims.expires_at, &grant_name, now)
-    {
-        // RFC 6749 §4.1.2: deny, and revoke what the first redemption produced.
-        tracing::warn!(client = %client.id, "authorization code reused; revoking its grant");
-        server.grants.revoke(&issued).await.map_err(store_error)?;
-        return Err(INVALID_GRANT);
-    }
 
     let user = active_user(server, &claims.user)
         .await?
         .ok_or(INVALID_GRANT)?;
     if claims.request.is_elevated() {
-        return elevated_tokens(server, client, &user, &claims, now);
+        return elevated_tokens(server, client, &user, claims, now);
     }
     let refresh_token =
         RefreshToken::generate(&grant_name).map_err(|_crypto| OAuthError::server())?;

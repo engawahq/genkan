@@ -237,9 +237,16 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_owned()
     }
 
-    /// Signs in with `device` through Genkan's public listener, as kubectl's OIDC plugin would
-    /// (authorization request, passkey, code, token), and returns the token response.
+    /// Signs in and exchanges the authorization code through Genkan's public listener.
     async fn sign_in(address: &str, device: &mut Device, scope: &str) -> Value {
+        let code = sign_in_code(address, device, scope).await;
+        let reply = exchange_code(address, &code).await;
+        assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
+        reply.json()
+    }
+
+    /// Performs the public authorization and software-passkey ceremony without redeeming.
+    async fn sign_in_code(address: &str, device: &mut Device, scope: &str) -> String {
         let origin = Url::parse(ISSUER).unwrap();
         let authorize = format!(
             "/authorize?client_id=kubectl&redirect_uri=http%3A%2F%2F127.0.0.1%3A8000%2F&response_type=code&scope={scope}&code_challenge={CHALLENGE}&code_challenge_method=S256&state=e2e"
@@ -263,30 +270,31 @@ mod tests {
         .await;
         assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
         let location = reply.json()["redirect_to"].as_str().unwrap().to_owned();
-        let code = form_urlencoded::parse(location.split_once('?').unwrap().1.as_bytes())
+        form_urlencoded::parse(location.split_once('?').unwrap().1.as_bytes())
             .find(|(k, _)| k == "code")
             .unwrap()
             .1
-            .into_owned();
+            .into_owned()
+    }
+
+    async fn exchange_code(address: &str, code: &str) -> Reply {
         let form = form_urlencoded::Serializer::new(String::new())
             .extend_pairs([
                 ("grant_type", "authorization_code"),
-                ("code", code.as_str()),
+                ("code", code),
                 ("code_verifier", VERIFIER),
                 ("client_id", "kubectl"),
                 ("redirect_uri", REDIRECT),
             ])
             .finish();
-        let reply = http(
+        http(
             address,
             Method::POST,
             "/token",
             &[],
             Some(("application/x-www-form-urlencoded", form)),
         )
-        .await;
-        assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
-        reply.json()
+        .await
     }
 
     #[tokio::test]
@@ -541,6 +549,49 @@ mod tests {
         // ID tokens are for the client, not for the cluster.
         let as_id_token = token_kubeconfig(&scratch, "id", id_token);
         assert!(kubectl(&as_id_token, &["auth", "whoami"]).is_err());
+
+        // Race the real public token endpoint against its Kubernetes grant creation. The
+        // winner must not leave a usable refresh family after all replays have completed.
+        let code = sign_in_code(&address, &mut device, "openid").await;
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(64));
+        let mut redemptions = tokio::task::JoinSet::new();
+        for _ in 0..64 {
+            let address = address.clone();
+            let code = code.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            redemptions.spawn(async move {
+                barrier.wait().await;
+                exchange_code(&address, &code).await
+            });
+        }
+        let mut winners = Vec::new();
+        while let Some(reply) = redemptions.join_next().await {
+            let reply = reply.unwrap();
+            if reply.status == StatusCode::OK {
+                winners.push(reply.json()["refresh_token"].as_str().unwrap().to_owned());
+            } else {
+                assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{:?}", reply.body);
+                assert_eq!(reply.json()["error"], "invalid_grant");
+            }
+        }
+        assert_eq!(winners.len(), 1, "exactly one redemption must issue tokens");
+        let form = form_urlencoded::Serializer::new(String::new())
+            .extend_pairs([
+                ("grant_type", "refresh_token"),
+                ("refresh_token", winners[0].as_str()),
+                ("client_id", "kubectl"),
+            ])
+            .finish();
+        let reply = http(
+            &address,
+            Method::POST,
+            "/token",
+            &[],
+            Some(("application/x-www-form-urlencoded", form)),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{:?}", reply.body);
+        assert_eq!(reply.json()["error"], "invalid_grant");
 
         // Memory as the kubelet sees it (working set), after a full sign-in. The budget is
         // 30 MiB; the value is also written for CI's job summary.
