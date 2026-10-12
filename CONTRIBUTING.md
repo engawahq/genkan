@@ -40,7 +40,10 @@ and the Nix flake reads it through fenix `fromToolchainFile`, so both paths buil
 compiler. The toolchain is a pinned nightly for the parallel front end (`-Zthreads`), current
 clippy lints and rustfmt's import ordering. No `#![feature]` is used, so moving to stable is a
 configuration change: drop `-Zthreads` from `.cargo/config.toml` and the nightly-only options
-from `rustfmt.toml`. A toolchain bump updates the `sha256` in `flake.nix` in the same change.
+from `rustfmt.toml`. A toolchain bump updates the `sha256` in `flake.nix` in the same change;
+`scripts/bump-toolchain.sh` does both, moving to the newest nightly of the last week that has every
+listed component and target. `.github/workflows/update-toolchain.yml` runs it with
+`nix flake update` on the 1st and 15th of each month and opens one pull request.
 
 Release binaries are built with `trim-paths = "all"`, so they carry no build-host paths.
 
@@ -78,6 +81,11 @@ Cargo does not pick a release younger than seven days unless it is already in th
 (`registry.global-min-publish-age` in `.cargo/config.toml`), which gives the community time to
 catch a compromised release. An urgent security update overrides it for one command:
 `CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE="0 days" cargo update -p <crate>`.
+
+[Renovate](https://docs.renovatebot.com/) (`renovate.json`) opens the weekly crate, action digest
+and k3s updates under the same seven-day delay; compatible crate updates share one pull request.
+A crate update that brings in new `unsafe` or native code fails `unsafe-report` until the
+allowlist entry below is added and reviewed, so those pull requests are never merged unread.
 
 A dependency that reaches the shipped binaries and contains `unsafe` code or builds native code
 needs an entry in `supply-chain/unsafe-allowlist.toml` with a reason and the date a maintainer
