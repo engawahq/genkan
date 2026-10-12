@@ -122,8 +122,15 @@ struct Pending {
     nonce: String,
     verifier: String,
     /// The enrolment token, when linking.
-    link: Option<String>,
+    link: Option<Enrollment>,
     expires_at: UnixTime,
+}
+
+/// Pins an in-flight linking ceremony to the token's original user incarnation.
+#[derive(Debug, Serialize, Deserialize)]
+struct Enrollment {
+    token: String,
+    user: genkan_store::UserReference,
 }
 
 #[derive(Debug, Deserialize)]
@@ -167,9 +174,14 @@ where
             .ok_or(UNKNOWN_PROVIDER)?;
         let request: StartRequest = parse(&body)?;
         let now = sign_in.oauth.now();
-        if let Some(token) = &request.token {
-            // Linking: check the link now, so a bad one fails before the user leaves.
-            valid_setup_token(&sign_in.setup, token, now).await?;
+        let link = if let Some(token) = &request.token {
+            // Linking: capture ownership before leaving for the provider.
+            let (stored, _) =
+                valid_setup_token(&sign_in.setup, &sign_in.oauth.directory, token, now).await?;
+            Some(Enrollment {
+                token: token.clone(),
+                user: stored.user,
+            })
         } else {
             // Signing in: there must be a pending request, and it must not ask for elevation.
             let flow = cookie(&headers, FLOW_COOKIE)
@@ -178,14 +190,15 @@ where
             if flow.request.is_elevated() {
                 return Err(NEEDS_PASSKEY);
             }
-        }
+            None
+        };
         let pending = Pending {
             id: hex(&random::<16>().map_err(internal)?),
             provider: provider.kind().id().to_owned(),
             state: random_text::<32>()?,
             nonce: random_text::<32>()?,
             verifier: random_text::<32>()?,
-            link: request.token,
+            link,
             expires_at: now.saturating_add(LIFETIME),
         };
         let challenge = URL_SAFE_NO_PAD.encode(sha256(pending.verifier.as_bytes()));
@@ -308,7 +321,8 @@ where
             );
             return failure(lang, m.upstream_not_linked);
         };
-        let active = matches!(oauth.directory.user(&user).await, Ok(Some(u)) if !u.disabled);
+        let active =
+            matches!(oauth.directory.user_by_reference(&user).await, Ok(Some(u)) if !u.disabled);
         let Some(flow) = cookie(&headers, FLOW_COOKIE).filter(|_| active) else {
             return failure(lang, m.upstream_failed);
         };
@@ -320,7 +334,7 @@ where
         return complete_authorization(oauth, flow, authentication).map_or_else(
             |_| failure(lang, m.upstream_failed),
             |location| {
-                tracing::info!(%user, provider = provider.kind().id(), "signed in upstream");
+                tracing::info!(user = %user.name, provider = provider.kind().id(), "signed in upstream");
                 let mut response = StatusCode::SEE_OTHER.into_response();
                 if let Ok(value) = HeaderValue::try_from(location) {
                     response.headers_mut().insert(header::LOCATION, value);
@@ -339,9 +353,14 @@ where
     if linked.is_some() {
         return failure(lang, m.upstream_already_linked);
     }
-    let Ok(stored) = valid_setup_token(&sign_in.setup, &token, now).await else {
+    let Ok((stored, _)) =
+        valid_setup_token(&sign_in.setup, &oauth.directory, &token.token, now).await
+    else {
         return failure(lang, m.setup_invalid);
     };
+    if stored.user != token.user {
+        return failure(lang, m.setup_invalid);
+    }
     match sign_in.setup.consume(&stored).await {
         Ok(Consume::Consumed) => {}
         Ok(Consume::AlreadyUsed) => return failure(lang, m.setup_invalid),
@@ -359,7 +378,7 @@ where
     };
     match sign_in.credentials.link(&external).await {
         Ok(CreateCredential::Created) => {
-            tracing::info!(user = %stored.user, provider = provider.kind().id(), "upstream account linked");
+            tracing::info!(user = %stored.user.name, provider = provider.kind().id(), "upstream account linked");
             let mut response = notice_page(lang, m.upstream_linked_title, m.upstream_linked_body);
             clear_cookie(&mut response, UPSTREAM_COOKIE, "Lax");
             response

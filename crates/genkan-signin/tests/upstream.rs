@@ -30,8 +30,9 @@ mod tests {
     use genkan_signin::upstream::provider::{Endpoints, Kind, Provider};
     use genkan_signin::upstream::{self, UPSTREAM_COOKIE, Upstream};
     use genkan_store::{
-        Client, ClientType, CredentialStore as _, MemoryCredentialStore, MemoryDirectory,
-        MemoryGrantStore, MemorySetupStore, NewExternal, User, external_credential_name,
+        Client, ClientType, CredentialStore as _, Directory as _, MemoryCredentialStore,
+        MemoryDirectory, MemoryGrantStore, MemorySetupStore, NewExternal, User,
+        external_credential_name,
     };
     use http_body_util::BodyExt as _;
     use serde_json::{Value, json};
@@ -224,9 +225,10 @@ mod tests {
             used_request_uris: OneTimeIds::default(),
         });
         let setup = MemorySetupStore::default();
+        let invited_user = oauth.directory.user("dana").await.unwrap().unwrap();
         setup.put_invitation(
             "inv-1",
-            "dana",
+            &invited_user.reference(),
             &hash_secret(INVITATION.as_bytes()),
             genkan_core::clock::UnixTime::from_secs(SystemClock.now().as_secs() + 3600),
         );
@@ -365,7 +367,16 @@ mod tests {
             .credentials
             .link(&NewExternal {
                 name: external_credential_name(kind.issuer(), subject),
-                user: user.into(),
+                user: h
+                    .service
+                    .sign_in
+                    .oauth
+                    .directory
+                    .user(user)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .reference(),
                 kind: kind.credential_type(),
                 issuer: kind.issuer().into(),
                 subject: subject.into(),
@@ -527,8 +538,11 @@ mod tests {
                 .linked_user(&name)
                 .await
                 .unwrap()
-                .as_deref(),
-            Some("dana")
+                .as_ref(),
+            Some(&genkan_store::UserReference {
+                name: "dana".into(),
+                uid: "uid-dana".into()
+            })
         );
         // The invitation is used up.
         let again = start(&h, "google", &json!({ "token": INVITATION }), "").await;
@@ -570,5 +584,51 @@ mod tests {
         *h.fake.google_key.lock().unwrap() = Some(rogue);
         let reply = sign_in(&h, "google", "code-rogue").await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    }
+    async fn replace_user(h: &Harness, name: &str) {
+        let directory = &h.service.sign_in.oauth.directory;
+        let mut user = directory.user(name).await.unwrap().unwrap();
+        directory.remove_user(name);
+        user.subject = format!("replacement-{name}");
+        user.groups = vec!["replacement-admins".into()];
+        directory.put_user(user);
+    }
+
+    #[tokio::test]
+    async fn linked_external_identity_rejects_same_name_replacement() {
+        for (kind, provider, subject) in [
+            (Kind::GitHub, "github", "42"),
+            (Kind::Google, "google", GOOGLE_SUB),
+        ] {
+            let h = harness().await;
+            link(&h, kind, subject, "alice").await;
+            replace_user(&h, "alice").await;
+            let reply = sign_in(&h, provider, "old-link").await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+            assert!(!reply.headers.contains_key(header::LOCATION));
+        }
+    }
+
+    #[tokio::test]
+    async fn invitation_cannot_link_external_account_to_same_name_replacement() {
+        for provider in ["github", "google"] {
+            let h = harness().await;
+            let started = start(&h, provider, &json!({ "token": INVITATION }), "").await;
+            assert_eq!(started.status, StatusCode::OK);
+            let url = started.json()["redirect_to"].as_str().unwrap().to_owned();
+            let query = provider_issues_code(&h, &url, "old-invitation");
+            replace_user(&h, "dana").await;
+            let reply = callback(
+                &h,
+                provider,
+                &query,
+                &format!("{UPSTREAM_COOKIE}={}", started.cookie(UPSTREAM_COOKIE)),
+            )
+            .await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+            assert!(!reply.body.contains("Account linked"));
+            let reply = sign_in(&h, provider, "must-remain-unlinked").await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+        }
     }
 }

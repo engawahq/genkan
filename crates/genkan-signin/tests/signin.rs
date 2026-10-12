@@ -146,12 +146,24 @@ mod tests {
         let setup = MemorySetupStore::default();
         setup.put_invitation(
             "inv-1",
-            "dana",
+            &oauth
+                .directory
+                .user("dana")
+                .await
+                .unwrap()
+                .unwrap()
+                .reference(),
             &hash_secret(INVITATION.as_bytes()),
             UnixTime::from_secs(START + 3600),
         );
         setup.put(
-            "admin",
+            &oauth
+                .directory
+                .user("admin")
+                .await
+                .unwrap()
+                .unwrap()
+                .reference(),
             &hash_secret(SETUP_TOKEN.as_bytes()),
             UnixTime::from_secs(START + 3600),
         );
@@ -270,6 +282,10 @@ mod tests {
 
     /// Opens an authorization request and signs in with `device`; returns the reply to `/login`.
     async fn sign_in(h: &Harness, device: &mut Device) -> Reply {
+        sign_in_with_handle(h, device, None).await
+    }
+
+    async fn sign_in_with_handle(h: &Harness, device: &mut Device, handle: Option<&str>) -> Reply {
         let authorize = format!(
             "/authorize?client_id=kubectl&redirect_uri=http%3A%2F%2F127.0.0.1%3A8000%2F&response_type=code&scope=openid&code_challenge={CHALLENGE}&code_challenge_method=S256&state=xyz"
         );
@@ -283,6 +299,14 @@ mod tests {
             .authenticate(&origin(), options, DefaultClientData)
             .await
             .unwrap();
+        let mut assertion = serde_json::to_value(assertion).unwrap();
+        if let Some(handle) = handle {
+            let uid = webauthn_rs::prelude::Uuid::parse_str(handle).unwrap();
+            assertion["response"]["userHandle"] = json!(base64::Engine::encode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                uid.as_bytes(),
+            ));
+        }
         post(
             &h.app,
             "/login",
@@ -487,7 +511,14 @@ mod tests {
         let mut device = device();
         let (credential, ceremony) = start_enrolment(&h, &mut device, SETUP_TOKEN).await;
         h.service.setup.put(
-            "admin",
+            &h.service
+                .oauth
+                .directory
+                .user("admin")
+                .await
+                .unwrap()
+                .unwrap()
+                .reference(),
             &hash_secret(b"a-newer-token"),
             UnixTime::from_secs(START + 3600),
         );
@@ -669,5 +700,59 @@ mod tests {
         )
         .await;
         assert_eq!(reply.status, StatusCode::OK);
+    }
+    async fn replace_user(h: &Harness, name: &str) {
+        let mut replacement = h.service.oauth.directory.user(name).await.unwrap().unwrap();
+        h.service.oauth.directory.remove_user(name);
+        replacement.subject = "a91812a3-6972-4e9c-a94e-3ed6c22e7b41".into();
+        replacement.groups = vec!["replacement-admins".into()];
+        h.service.oauth.directory.put_user(replacement);
+    }
+
+    #[tokio::test]
+    async fn old_passkey_cannot_authenticate_same_name_replacement() {
+        let h = harness().await;
+        let mut device = device();
+        enrol(&h, &mut device).await;
+        replace_user(&h, "admin").await;
+        let reply = sign_in(&h, &mut device).await;
+        assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(reply.kind(), "urn:genkan:problem:passkey-failed");
+        // userHandle is not signed: rewriting it must not transfer the old credential.
+        let reply = sign_in_with_handle(
+            &h,
+            &mut device,
+            Some("a91812a3-6972-4e9c-a94e-3ed6c22e7b41"),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(reply.kind(), "urn:genkan:problem:passkey-failed");
+        assert!(reply.body.get("redirect_to").is_none());
+    }
+
+    #[tokio::test]
+    async fn old_setup_and_invitation_cannot_enrol_same_name_replacement() {
+        for (token, name) in [(SETUP_TOKEN, "admin"), (INVITATION, "dana")] {
+            let h = harness().await;
+            let mut device = device();
+            let (credential, ceremony) = start_enrolment(&h, &mut device, token).await;
+            replace_user(&h, name).await;
+            let reply = post(&h.app, "/setup/options", json!({ "token": token }), &[]).await;
+            assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+            assert_eq!(reply.kind(), "urn:genkan:problem:setup-invalid");
+            let reply = post(
+                &h.app,
+                "/setup",
+                json!({ "token": token, "credential": credential }),
+                &[(CEREMONY_COOKIE, &ceremony)],
+            )
+            .await;
+            assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+            assert_eq!(reply.kind(), "urn:genkan:problem:setup-invalid");
+            assert_eq!(
+                sign_in(&h, &mut device).await.status,
+                StatusCode::UNAUTHORIZED
+            );
+        }
     }
 }

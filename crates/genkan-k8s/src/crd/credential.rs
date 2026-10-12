@@ -48,6 +48,9 @@ pub struct CredentialSpec {
     /// Name of the `User` object.
     #[schemars(length(min = 1, max = 253))]
     pub user: String,
+    /// Immutable UID of the original owner. Required; never inferred from the current user.
+    #[schemars(length(min = 1, max = 128))]
+    pub user_uid: String,
     /// Kind of credential.
     #[serde(rename = "type")]
     pub kind: CredentialType,

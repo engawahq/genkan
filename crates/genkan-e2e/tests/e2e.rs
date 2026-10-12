@@ -24,12 +24,13 @@ mod tests {
     use genkan_core::config::BaseUrl;
     use genkan_k8s::crd::client::{ClientType, OAuthClient, OAuthClientSpec};
     use genkan_k8s::crd::definitions;
+    use genkan_k8s::crd::user::User;
     use genkan_k8s::kube_config::{self, DiscoveryMode, Distro};
     use genkan_k8s::setup::issue_setup_link;
     use genkan_k8s::{deployment, rbac};
     use genkan_oauth::endpoints::FLOW_COOKIE;
     use genkan_signin::CEREMONY_COOKIE;
-    use genkan_test_support::{Device, device};
+    use genkan_test_support::{Device, device as new_device};
     use http_body_util::{BodyExt as _, Full};
     use hyper_util::rt::TokioIo;
     use k8s_openapi::api::apps::v1::Deployment;
@@ -449,7 +450,7 @@ mod tests {
         let origin = Url::parse(ISSUER).unwrap();
 
         // Enrol a passkey from the link.
-        let mut device = device();
+        let mut device = new_device();
         let reply = post_json(&address, "/setup/options", &json!({ "token": token }), "").await;
         assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
         let options: CredentialCreationOptions = serde_json::from_value(reply.json()).unwrap();
@@ -573,6 +574,115 @@ mod tests {
             working_set <= 30 * 1024 * 1024,
             "working set {working_set} bytes exceeds 30 MiB"
         );
+
+        // Recreating the same User name is a different person. The refresh family fails closed.
+        // The old passkey is presented with `userHandle` rewritten to the replacement UID:
+        // that field is not signed, and matching it to the current UID is not ownership.
+        let users: Api<User> = Api::namespaced(admin.clone(), &namespace);
+        let original = users.get("admin").await.unwrap();
+        let original_uid = original.uid().unwrap();
+        let stale = sign_in(&address, &mut device, "openid").await;
+        let stale_refresh = stale["refresh_token"].as_str().unwrap().to_owned();
+        let authorize = format!(
+            "/authorize?client_id=kubectl&redirect_uri=http%3A%2F%2F127.0.0.1%3A8000%2F&response_type=code&scope=openid&code_challenge={CHALLENGE}&code_challenge_method=S256&state=e2e"
+        );
+        let pending = http(&address, Method::GET, &authorize, &[], None).await;
+        let flow = pending.cookie(FLOW_COOKIE);
+        users
+            .delete("admin", &DeleteParams::default())
+            .await
+            .unwrap();
+        let replacement = users
+            .create(
+                &PostParams::default(),
+                &User::new("admin", original.spec.clone()),
+            )
+            .await
+            .unwrap();
+        assert_ne!(replacement.uid().as_deref(), Some(original_uid.as_str()));
+        let ceremony = post_json(&address, "/login/options", &json!({}), "").await;
+        let options: CredentialRequestOptions = serde_json::from_value(ceremony.json()).unwrap();
+        let assertion = device
+            .authenticate(&origin, options, DefaultClientData)
+            .await
+            .unwrap();
+        let mut assertion = serde_json::to_value(assertion).unwrap();
+        let replacement_uid =
+            webauthn_rs::prelude::Uuid::parse_str(replacement.uid().as_deref().unwrap()).unwrap();
+        assertion["response"]["userHandle"] = json!(base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            replacement_uid.as_bytes(),
+        ));
+        let old_passkey = post_json(
+            &address,
+            "/login",
+            &json!({ "credential": assertion }),
+            &format!(
+                "{FLOW_COOKIE}={flow}; {CEREMONY_COOKIE}={}",
+                ceremony.cookie(CEREMONY_COOKIE)
+            ),
+        )
+        .await;
+        assert_eq!(old_passkey.status, StatusCode::UNAUTHORIZED);
+        let old_refresh = http(
+            &address,
+            Method::POST,
+            "/token",
+            &[],
+            Some((
+                "application/x-www-form-urlencoded",
+                form_urlencoded::Serializer::new(String::new())
+                    .extend_pairs([
+                        ("grant_type", "refresh_token"),
+                        ("client_id", "kubectl"),
+                        ("refresh_token", stale_refresh.as_str()),
+                    ])
+                    .finish(),
+            )),
+        )
+        .await;
+        assert_eq!(old_refresh.json()["error"], "invalid_grant");
+        // Recovery explicitly removes the stale credentials; their presence still requires
+        // admin-authorized reset even though they cannot authenticate the replacement.
+        let recovery = issue_setup_link(
+            admin.clone(),
+            &namespace,
+            &issuer,
+            "admin",
+            Duration::from_mins(10),
+            true,
+            SystemClock.now(),
+        )
+        .await
+        .unwrap();
+        let recovery_token = recovery.url.split_once("#token=").unwrap().1;
+        let options = post_json(
+            &address,
+            "/setup/options",
+            &json!({ "token": recovery_token }),
+            "",
+        )
+        .await;
+        assert_eq!(options.status, StatusCode::OK, "{:?}", options.body);
+        let mut replacement_device = new_device();
+        let credential = replacement_device
+            .register(
+                &origin,
+                serde_json::from_value(options.json()).unwrap(),
+                DefaultClientData,
+            )
+            .await
+            .unwrap();
+        let enrolled = post_json(
+            &address,
+            "/setup",
+            &json!({ "token": recovery_token, "credential": credential }),
+            &format!("{CEREMONY_COOKIE}={}", options.cookie(CEREMONY_COOKIE)),
+        )
+        .await;
+        assert_eq!(enrolled.status, StatusCode::CREATED, "{:?}", enrolled.body);
+        let fresh = sign_in(&address, &mut replacement_device, "openid").await;
+        assert!(fresh["access_token"].is_string());
 
         // Clean up: forget the issuer, remove the namespace.
         write_authn(&authn_dir, EMPTY_AUTHN);

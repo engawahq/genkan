@@ -320,8 +320,8 @@ pub struct Flow {
 /// account).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Authentication {
-    /// `User` object name.
-    pub user: String,
+    /// Original authenticated user incarnation, not a reusable name.
+    pub user: genkan_store::UserReference,
     /// When the user authenticated.
     pub auth_time: UnixTime,
     /// Authentication methods (RFC 8176).

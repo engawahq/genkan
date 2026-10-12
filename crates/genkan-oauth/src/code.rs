@@ -38,8 +38,8 @@ pub struct CodeClaims {
     pub id: String,
     /// The request the user approved.
     pub request: AuthorizationRequest,
-    /// `User` object name.
-    pub user: String,
+    /// Original authenticated user incarnation.
+    pub user: genkan_store::UserReference,
     /// When the user authenticated.
     pub auth_time: UnixTime,
     /// Authentication methods.
@@ -110,7 +110,10 @@ mod tests {
     fn codes_round_trip_and_are_unique() {
         let sealer = Sealer::ephemeral().unwrap();
         let auth = Authentication {
-            user: "alice".into(),
+            user: genkan_store::UserReference {
+                name: "alice".into(),
+                uid: "uid-alice".into(),
+            },
             auth_time: UnixTime::from_secs(5),
             amr: vec!["hwk".into()],
         };

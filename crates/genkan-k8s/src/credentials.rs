@@ -49,13 +49,14 @@ impl CredentialStore for KubeCredentialStore {
             metadata: ObjectMeta {
                 name: Some(passkey.name.clone()),
                 labels: Some(BTreeMap::from([
-                    (USER_LABEL.to_owned(), passkey.user.clone()),
+                    (USER_LABEL.to_owned(), passkey.user.name.clone()),
                     (MANAGED_BY.0.to_owned(), MANAGED_BY.1.to_owned()),
                 ])),
                 ..ObjectMeta::default()
             },
             spec: CredentialSpec {
-                user: passkey.user.clone(),
+                user: passkey.user.name.clone(),
+                user_uid: passkey.user.uid.clone(),
                 kind: CredentialType::Passkey,
                 passkey: Some(Passkey {
                     credential_id: passkey.credential_id.clone(),
@@ -88,7 +89,10 @@ impl CredentialStore for KubeCredentialStore {
                 spec.passkey
                     .filter(|_| spec.kind == CredentialType::Passkey)
                     .map(|passkey| StoredPasskey {
-                        user: spec.user,
+                        user: genkan_store::UserReference {
+                            name: spec.user,
+                            uid: spec.user_uid,
+                        },
                         record: passkey.record,
                     })
             }))
@@ -104,13 +108,14 @@ impl CredentialStore for KubeCredentialStore {
             metadata: ObjectMeta {
                 name: Some(external.name.clone()),
                 labels: Some(BTreeMap::from([
-                    (USER_LABEL.to_owned(), external.user.clone()),
+                    (USER_LABEL.to_owned(), external.user.name.clone()),
                     (MANAGED_BY.0.to_owned(), MANAGED_BY.1.to_owned()),
                 ])),
                 ..ObjectMeta::default()
             },
             spec: CredentialSpec {
-                user: external.user.clone(),
+                user: external.user.name.clone(),
+                user_uid: external.user.uid.clone(),
                 kind: external.kind,
                 passkey: None,
                 external: Some(ExternalIdentity {
@@ -130,14 +135,17 @@ impl CredentialStore for KubeCredentialStore {
     fn linked_user(
         &self,
         name: &str,
-    ) -> impl Future<Output = Result<Option<String>, StoreError>> + Send {
+    ) -> impl Future<Output = Result<Option<genkan_store::UserReference>, StoreError>> + Send {
         let api = self.api.clone();
         let name = name.to_owned();
         async move {
             let object = api.get_opt(&name).await.map_err(|e| backend(&e))?;
             Ok(object
                 .filter(|o| o.spec.kind != CredentialType::Passkey && o.spec.external.is_some())
-                .map(|o| o.spec.user))
+                .map(|o| genkan_store::UserReference {
+                    name: o.spec.user,
+                    uid: o.spec.user_uid,
+                }))
         }
     }
 }

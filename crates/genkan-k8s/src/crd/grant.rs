@@ -45,6 +45,9 @@ pub struct GrantSpec {
     /// Name of the `User` object.
     #[schemars(length(min = 1, max = 253))]
     pub user: String,
+    /// Immutable UID of the originally authenticated user. Required, with no legacy backfill.
+    #[schemars(length(min = 1, max = 128))]
+    pub user_uid: String,
     /// Name of the `OAuthClient` object (the `client_id`).
     #[schemars(length(min = 1, max = 253))]
     pub client: String,

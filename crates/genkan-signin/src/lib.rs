@@ -193,7 +193,7 @@ struct Ceremony<T> {
     id: String,
     state: T,
     /// For registration: the user the setup token was for.
-    user: Option<String>,
+    user: Option<genkan_store::UserReference>,
     expires_at: UnixTime,
 }
 
@@ -201,7 +201,7 @@ fn seal<T: Serialize, D, G, C>(
     oauth: &AuthorizationServer<D, G, C>,
     purpose: &str,
     state: T,
-    user: Option<String>,
+    user: Option<genkan_store::UserReference>,
     now: UnixTime,
 ) -> Result<String, Problem> {
     let ceremony = Ceremony {
@@ -251,12 +251,13 @@ struct SetupResponse<'a> {
     username: &'a str,
 }
 
-/// Checks a presented setup token against the stored one. Returns the stored token.
-pub(crate) async fn valid_setup_token<S: SetupStore>(
+/// Checks the token and resolves only its original, enabled user incarnation.
+pub(crate) async fn valid_setup_token<S: SetupStore, D: Directory>(
     setup: &S,
+    directory: &D,
     presented: &str,
     now: UnixTime,
-) -> Result<genkan_store::SetupToken, Problem> {
+) -> Result<(genkan_store::SetupToken, genkan_store::User), Problem> {
     let stored = setup
         .load(presented)
         .await
@@ -269,7 +270,13 @@ pub(crate) async fn valid_setup_token<S: SetupStore>(
     if !matches || stored.expires_at <= now {
         return Err(SETUP_INVALID);
     }
-    Ok(stored)
+    let user = directory
+        .user_by_reference(&stored.user)
+        .await
+        .map_err(internal)?
+        .filter(|user| !user.disabled)
+        .ok_or(SETUP_INVALID)?;
+    Ok((stored, user))
 }
 
 async fn setup_options<D, G, C, K, S>(
@@ -288,17 +295,33 @@ where
         check_request(&headers, service.oauth.issuer.as_str())?;
         let request: SetupOptionsRequest = parse(&body)?;
         let now = service.oauth.now();
-        let token = valid_setup_token(&service.setup, &request.token, now).await?;
-        let user = service.oauth.directory.user(&token.user).await.map_err(internal)?.ok_or_else(|| {
-            tracing::error!(user = %token.user, "the setup token names a user that does not exist");
-            SETUP_INVALID
-        })?;
+        let (token, user) = valid_setup_token(
+            &service.setup,
+            &service.oauth.directory,
+            &request.token,
+            now,
+        )
+        .await?;
         let handle = Uuid::parse_str(&user.subject).map_err(internal)?;
         let display = user.display_name.as_deref().unwrap_or(&user.username);
-        let (options, state) = service.passkeys.begin_registration(handle, &user.username, display).map_err(internal)?;
-        let sealed = seal::<PasskeyRegistration, _, _, _>(&service.oauth, REGISTRATION_PURPOSE, state, Some(user.name), now)?;
+        let (options, state) = service
+            .passkeys
+            .begin_registration(handle, &user.username, display)
+            .map_err(internal)?;
+        let sealed = seal::<PasskeyRegistration, _, _, _>(
+            &service.oauth,
+            REGISTRATION_PURPOSE,
+            state,
+            Some(token.user),
+            now,
+        )?;
         let mut response = json(StatusCode::OK, &options);
-        set_cookie(&mut response, CEREMONY_COOKIE, &sealed, CEREMONY_LIFETIME.as_secs());
+        set_cookie(
+            &mut response,
+            CEREMONY_COOKIE,
+            &sealed,
+            CEREMONY_LIFETIME.as_secs(),
+        );
         Ok(response)
     }
     .await;
@@ -323,9 +346,15 @@ where
         let now = service.oauth.now();
         let ceremony: Ceremony<PasskeyRegistration> =
             open(&service.oauth, &headers, REGISTRATION_PURPOSE, now)?;
-        let token = valid_setup_token(&service.setup, &request.token, now).await?;
+        let (token, _) = valid_setup_token(
+            &service.setup,
+            &service.oauth.directory,
+            &request.token,
+            now,
+        )
+        .await?;
         // The ceremony must have been started with this token's user.
-        if ceremony.user.as_deref() != Some(token.user.as_str()) {
+        if ceremony.user.as_ref() != Some(&token.user) {
             return Err(SETUP_INVALID);
         }
         let passkey: Passkey = service
@@ -373,11 +402,11 @@ where
                 ));
             }
         }
-        tracing::info!(user = %token.user, "passkey enrolled with a setup link");
+        tracing::info!(user = %token.user.name, "passkey enrolled with a setup link");
         let mut response = json(
             StatusCode::CREATED,
             &SetupResponse {
-                username: &token.user,
+                username: &token.user.name,
             },
         );
         clear_cookie(&mut response, CEREMONY_COOKIE, "Strict");
@@ -466,11 +495,12 @@ where
         let user = service
             .oauth
             .directory
-            .user(&stored.user)
+            .user_by_reference(&stored.user)
             .await
             .map_err(internal)?
             .ok_or(PASSKEY_FAILED)?;
-        // The user handle in the assertion must be the credential owner's (WebAuthn Level 3 §7.2).
+        // §7.2 requires the account to own this record as well as matching the user handle.
+        // userHandle is not part of the assertion signature and cannot transfer ownership.
         if user.disabled || user.subject != handle.to_string() {
             return Err(PASSKEY_FAILED);
         }
@@ -492,7 +522,7 @@ where
         }
 
         let authentication = Authentication {
-            user: user.name.clone(),
+            user: stored.user,
             auth_time: now,
             amr: PASSKEY_AMR.iter().map(|m| (*m).to_owned()).collect(),
         };

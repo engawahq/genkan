@@ -22,7 +22,9 @@ mod tests {
     use genkan_oauth::authorize::Authentication;
     use genkan_oauth::endpoints::{FLOW_COOKIE, complete_authorization, router};
     use genkan_oauth::{AuthorizationServer, Lifetimes, OneTimeIds};
-    use genkan_store::{Client, ClientType, MemoryDirectory, MemoryGrantStore, User};
+    use genkan_store::{
+        Client, ClientType, Directory as _, MemoryDirectory, MemoryGrantStore, User,
+    };
     use http_body_util::BodyExt as _;
     use jsonwebtoken::jwk::JwkSet;
     use jsonwebtoken::{DecodingKey, Validation, decode, decode_header};
@@ -239,7 +241,14 @@ mod tests {
             String::from_utf8_lossy(&reply.body)
         );
         let auth = Authentication {
-            user: user.into(),
+            user: h
+                .server
+                .directory
+                .user(user)
+                .await
+                .unwrap()
+                .unwrap()
+                .reference(),
             auth_time: h.clock.now(),
             amr: amr.iter().map(|m| (*m).to_owned()).collect(),
         };
@@ -301,7 +310,14 @@ mod tests {
         }
 
         let auth = Authentication {
-            user: "alice".into(),
+            user: h
+                .server
+                .directory
+                .user("alice")
+                .await
+                .unwrap()
+                .unwrap()
+                .reference(),
             auth_time: h.clock.now(),
             amr: vec!["hwk".into(), "user".into()],
         };
@@ -767,7 +783,14 @@ mod tests {
 
         // A forged or expired flow cannot be completed.
         let auth = Authentication {
-            user: "alice".into(),
+            user: h
+                .server
+                .directory
+                .user("alice")
+                .await
+                .unwrap()
+                .unwrap()
+                .reference(),
             auth_time: h.clock.now(),
             amr: vec![],
         };
@@ -827,7 +850,14 @@ mod tests {
         let reply = get(&h.app, &authorize("kubectl")).await;
         assert_eq!(reply.status, StatusCode::SEE_OTHER);
         let auth = Authentication {
-            user: "alice".into(),
+            user: h
+                .server
+                .directory
+                .user("alice")
+                .await
+                .unwrap()
+                .unwrap()
+                .reference(),
             auth_time: h.clock.now(),
             amr: vec![],
         };
@@ -987,7 +1017,14 @@ mod tests {
         let h = harness_with(elevating()).await;
         let reply = get(&h.app, &elevate_uri()).await;
         let auth = Authentication {
-            user: "alice".into(),
+            user: h
+                .server
+                .directory
+                .user("alice")
+                .await
+                .unwrap()
+                .unwrap()
+                .reference(),
             auth_time: h.clock.now(),
             amr: vec![],
         };
@@ -1150,5 +1187,89 @@ mod tests {
             .body(Body::from("{}"))
             .unwrap();
         assert_eq!(send(&h.app, request).await.status, StatusCode::BAD_REQUEST);
+    }
+    fn replace_alice(h: &Harness) {
+        h.server.directory.remove_user("alice");
+        h.server.directory.put_user(User {
+            name: "alice".into(),
+            subject: "uid-replacement".into(),
+            username: "alice".into(),
+            groups: vec!["replacement-admins".into()],
+            elevated_groups: vec!["replacement-cluster-admins".into()],
+            ..User::default()
+        });
+    }
+
+    #[tokio::test]
+    async fn authorization_code_rejects_same_name_replacement() {
+        let h = harness().await;
+        let code = sign_in(&h, "alice", &kubectl_authorize(&[])).await;
+        replace_alice(&h);
+        let reply = exchange(&h, &code).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+        assert_eq!(reply.error(), "invalid_grant");
+        assert!(reply.json().get("access_token").is_none());
+    }
+
+    #[tokio::test]
+    async fn authentication_remains_pinned_before_code_issuance() {
+        let h = harness().await;
+        let reply = get(&h.app, &kubectl_authorize(&[])).await;
+        let authentication = Authentication {
+            user: genkan_store::UserReference {
+                name: "alice".into(),
+                uid: "uid-alice".into(),
+            },
+            auth_time: h.clock.now(),
+            amr: vec!["swk".into(), "mfa".into()],
+        };
+        replace_alice(&h);
+        let location =
+            complete_authorization(&h.server, &flow_cookie(&reply), authentication).unwrap();
+        let code = param(&location, "code").unwrap();
+        let reply = exchange(&h, &code).await;
+        assert_eq!(reply.error(), "invalid_grant");
+        assert!(reply.json().get("access_token").is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_rejects_same_name_replacement() {
+        let h = harness().await;
+        let code = sign_in(&h, "alice", &kubectl_authorize(&[])).await;
+        let tokens = exchange(&h, &code).await.json();
+        replace_alice(&h);
+        let reply = refresh(&h, tokens["refresh_token"].as_str().unwrap()).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+        assert_eq!(reply.error(), "invalid_grant");
+        assert!(reply.json().get("access_token").is_none());
+        // Fresh authentication of the new incarnation is still usable.
+        let code = sign_in(&h, "alice", &kubectl_authorize(&[])).await;
+        let tokens = exchange(&h, &code).await.json();
+        let (_, claims) = verify(&h, tokens["access_token"].as_str().unwrap(), "kubernetes");
+        assert_eq!(claims["sub"], "uid-replacement");
+        assert_eq!(claims["groups"], serde_json::json!(["replacement-admins"]));
+    }
+
+    #[tokio::test]
+    async fn elevated_code_and_normal_refresh_reject_same_name_replacement() {
+        let h = harness_with(elevating()).await;
+        let elevated_code = sign_in_with(&h, "alice", &elevate_uri(), PASSKEY).await;
+        let normal_code = sign_in_with(&h, "alice", &kubectl_authorize(&[]), PASSKEY).await;
+        let normal = exchange(&h, &normal_code).await.json();
+        replace_alice(&h);
+        let reply = exchange(&h, &elevated_code).await;
+        assert_eq!(reply.error(), "invalid_grant");
+        assert!(reply.json().get("access_token").is_none());
+        let reply = refresh(&h, normal["refresh_token"].as_str().unwrap()).await;
+        assert_eq!(reply.error(), "invalid_grant");
+        assert!(reply.json().get("access_token").is_none());
+        let fresh = sign_in_with(&h, "alice", &elevate_uri(), PASSKEY).await;
+        let tokens = exchange(&h, &fresh).await.json();
+        let (_, claims) = verify(&h, tokens["access_token"].as_str().unwrap(), "kubernetes");
+        assert_eq!(claims["sub"], "uid-replacement");
+        assert_eq!(
+            claims["groups"],
+            serde_json::json!(["replacement-admins", "elevated:replacement-cluster-admins"]),
+        );
     }
 }

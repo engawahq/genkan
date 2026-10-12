@@ -48,6 +48,9 @@ pub struct InvitationSpec {
     /// Name of the `User` object the invitation enrols a passkey for.
     #[schemars(length(min = 1, max = 253))]
     pub user: String,
+    /// Immutable UID of the original invitee. Required; a reused name is not the invitee.
+    #[schemars(length(min = 1, max = 128))]
+    pub user_uid: String,
     /// Address Genkan mails the link to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(

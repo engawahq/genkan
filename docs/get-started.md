@@ -276,7 +276,36 @@ genkanctl setup-link --issuer $ISSUER --username admin
 ```
 
 Open the printed link on the Mac and create a passkey. The link works once and expires in 60
-minutes; run the command again for a new one.
+minutes; run the command again for a new one. The passkey, any upstream link, and outstanding
+sign-in or refresh tokens are bound to this User object's Kubernetes UID. Deleting `admin` and
+creating another object with the same name starts a different person. Old credentials still
+exist and require explicit admin cleanup: issue the replacement's setup link with
+`genkanctl setup-link --issuer $ISSUER --username admin --reset`, then enrol a new passkey.
+Do not expect the old passkey or its refresh tokens to work. Signed access and ID tokens already
+issued remain valid until their normal expiry.
+
+### Upgrading existing authentication records
+
+The UID-pinning schema requires `spec.userUid` on `Credential`, `Grant`, and `Invitation`
+objects, and `data.user-uid` on the `genkan-setup` Secret. Stop the old server and mailer,
+then apply the updated CRDs and use the upgraded binaries. Old records without the original
+UID fail closed; there is no legacy backfill. Do not copy the current User UID into old records:
+a reused name cannot establish who originally owned a credential or session.
+
+Before starting the upgraded mailer, administrators **must remove all unverifiable legacy
+invitations, grants, and the setup Secret**, purge legacy credentials, and re-enroll passkeys
+or re-link upstream accounts through freshly issued links. A single legacy Invitation without
+`userUid` makes the typed invitation LIST fail, blocking mail delivery for every invitation.
+Use `genkanctl setup-link --reset` for a User whose stale credentials remain; metadata-only
+counting and deletion let it purge legacy credentials and grants without adopting their owner.
+Delete obsolete invitations and `genkan-setup` explicitly with administrator credentials.
+
+Start the upgraded server for re-enrollment with SMTP disabled: omit both `--smtp-url` /
+`GENKAN_SMTP_URL` and `--mail-from` / `GENKAN_MAIL_FROM`. Keep `--invitations` enabled if needed
+and deliver fresh links directly. Finish re-enrollment and re-linking before enabling the
+upgraded mailer. This is destructive recovery, not transparent migration. Already issued
+signed access and ID tokens remain valid until their normal expiry.
+
 
 ## 8. kubectl on the Mac
 

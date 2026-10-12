@@ -275,11 +275,18 @@
                         "maxLength": 253,
                         "minLength": 1,
                         "type": "string"
+                      },
+                      "userUid": {
+                        "description": "Immutable UID of the original owner. Required; never inferred from the current user.",
+                        "maxLength": 128,
+                        "minLength": 1,
+                        "type": "string"
                       }
                     },
                     "required": [
                       "type",
-                      "user"
+                      "user",
+                      "userUid"
                     ],
                     "type": "object",
                     "x-kubernetes-validations": [
@@ -547,6 +554,12 @@
                         "maxLength": 253,
                         "minLength": 1,
                         "type": "string"
+                      },
+                      "userUid": {
+                        "description": "Immutable UID of the originally authenticated user. Required, with no legacy backfill.",
+                        "maxLength": 128,
+                        "minLength": 1,
+                        "type": "string"
                       }
                     },
                     "required": [
@@ -556,7 +569,8 @@
                       "expiresAt",
                       "initialHash",
                       "initialIdleExpiresAt",
-                      "user"
+                      "user",
+                      "userUid"
                     ],
                     "type": "object",
                     "x-kubernetes-validations": [
@@ -701,11 +715,18 @@
                         "maxLength": 253,
                         "minLength": 1,
                         "type": "string"
+                      },
+                      "userUid": {
+                        "description": "Immutable UID of the original invitee. Required; a reused name is not the invitee.",
+                        "maxLength": 128,
+                        "minLength": 1,
+                        "type": "string"
                       }
                     },
                     "required": [
                       "expiresAt",
-                      "user"
+                      "user",
+                      "userUid"
                     ],
                     "type": "object",
                     "x-kubernetes-validations": [

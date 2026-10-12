@@ -60,7 +60,7 @@ fn to_object(grant: &NewGrant, idle_expires_at: UnixTime) -> GrantObject {
         metadata: ObjectMeta {
             name: Some(grant.name.clone()),
             labels: Some(BTreeMap::from([
-                (USER_LABEL.to_owned(), grant.user.clone()),
+                (USER_LABEL.to_owned(), grant.user.name.clone()),
                 (CLIENT_LABEL.to_owned(), grant.client.clone()),
                 (EXPIRY_BUCKET_LABEL.to_owned(), (expires / 3600).to_string()),
                 (
@@ -76,7 +76,8 @@ fn to_object(grant: &NewGrant, idle_expires_at: UnixTime) -> GrantObject {
             ..ObjectMeta::default()
         },
         spec: GrantSpec {
-            user: grant.user.clone(),
+            user: grant.user.name.clone(),
+            user_uid: grant.user.uid.clone(),
             client: grant.client.clone(),
             audience: grant.audience.clone(),
             auth_time: secs(grant.auth_time),
@@ -94,7 +95,10 @@ fn from_object(object: &GrantObject) -> Grant {
     let spec = &object.spec;
     let new = NewGrant {
         name: object.name_any(),
-        user: spec.user.clone(),
+        user: genkan_store::UserReference {
+            name: spec.user.clone(),
+            uid: spec.user_uid.clone(),
+        },
         client: spec.client.clone(),
         audience: spec.audience.clone(),
         scopes: spec.scopes.clone(),

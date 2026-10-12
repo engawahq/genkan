@@ -30,6 +30,9 @@ pub enum InviteError {
     /// Randomness failed.
     #[error("generating the token failed")]
     Crypto,
+    /// The API response did not identify the original user incarnation.
+    #[error("the User has no Kubernetes UID")]
+    MissingUserUid,
 }
 
 /// Who to invite.
@@ -93,7 +96,9 @@ pub async fn invite(
 ) -> Result<Invited, InviteError> {
     let pp = PostParams::default();
     let users: Api<User> = Api::namespaced(client.clone(), namespace);
-    let created_user = if users.get_opt(&invitee.username).await?.is_none() {
+    let (user, created_user) = if let Some(user) = users.get_opt(&invitee.username).await? {
+        (user, false)
+    } else {
         let user = User::new(
             &invitee.username,
             UserSpec {
@@ -104,11 +109,12 @@ pub async fn invite(
                 ..UserSpec::default()
             },
         );
-        users.create(&pp, &user).await?;
-        true
-    } else {
-        false
+        (users.create(&pp, &user).await?, true)
     };
+    let user_uid = user
+        .uid()
+        .filter(|uid| !uid.is_empty())
+        .ok_or(InviteError::MissingUserUid)?;
 
     let name = format!(
         "inv-{}",
@@ -139,6 +145,7 @@ pub async fn invite(
         },
         spec: InvitationSpec {
             user: invitee.username.clone(),
+            user_uid,
             email: invitee.email.clone(),
             token_hash: token.as_deref().map(|t| hash_secret(t.as_bytes())),
             language: invitee.language.clone(),

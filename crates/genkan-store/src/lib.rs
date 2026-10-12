@@ -83,6 +83,38 @@ pub struct User {
     pub elevated_groups: Vec<String>,
 }
 
+/// The original incarnation of a `User`, never just its reusable object name.
+///
+/// Every authentication lineage retains both the lookup name and Kubernetes UID (`User.subject`).
+/// A missing UID is not migrated from the current directory: that would silently assign an old
+/// credential or grant to a new person. Kubernetes explicitly permits name reuse but gives every
+/// historical object a distinct [UID]. WebAuthn [§7.2] separately requires the identified account
+/// to contain the credential record; the unsigned `userHandle` cannot establish ownership.
+///
+/// [UID]: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#uids
+/// [§7.2]: https://www.w3.org/TR/webauthn-3/#sctn-verifying-assertion
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UserReference {
+    /// Original `User` object name, in the directory's namespace.
+    #[schemars(length(min = 1, max = 253))]
+    pub name: String,
+    /// Original immutable Kubernetes UID, also the token subject.
+    #[schemars(length(min = 1, max = 128))]
+    pub uid: String,
+}
+
+impl User {
+    /// Captures this incarnation for credentials, enrolment tokens, codes and grants.
+    #[must_use]
+    pub fn reference(&self) -> UserReference {
+        UserReference {
+            name: self.name.clone(),
+            uid: self.subject.clone(),
+        }
+    }
+}
+
 /// Read access to clients and users.
 pub trait Directory: Send + Sync + 'static {
     /// Looks up a client by `client_id`.
@@ -94,6 +126,22 @@ pub trait Directory: Send + Sync + 'static {
         &self,
         subject: &str,
     ) -> impl Future<Output = Result<Option<User>, StoreError>> + Send;
+    /// Resolves only the original incarnation. Empty or mismatching UIDs fail closed.
+    fn user_by_reference(
+        &self,
+        reference: &UserReference,
+    ) -> impl Future<Output = Result<Option<User>, StoreError>> + Send {
+        async move {
+            if reference.name.is_empty() || reference.uid.is_empty() {
+                return Ok(None);
+            }
+            Ok(self
+                .user(&reference.name)
+                .await?
+                .filter(|user| user.name == reference.name)
+                .filter(|user| user.subject == reference.uid))
+        }
+    }
 }
 
 /// The single user matching `predicate` among `users`; an error if several match (a subject is
@@ -127,8 +175,8 @@ pub fn unique_user<'a>(
 pub struct NewGrant {
     /// Object name, derived from the authorization code so a code can create at most one grant.
     pub name: String,
-    /// User object name.
-    pub user: String,
+    /// Original user incarnation.
+    pub user: UserReference,
     /// `client_id`.
     pub client: String,
     /// Access-token audience.
@@ -412,8 +460,8 @@ impl GrantStore for MemoryGrantStore {
 pub struct NewPasskey {
     /// Object name (see [`passkey_credential_name`]).
     pub name: String,
-    /// `User` object name.
-    pub user: String,
+    /// Original credential owner.
+    pub user: UserReference,
     /// Credential ID, base64url.
     pub credential_id: String,
     /// The serialized relying-party credential record (public key and flags).
@@ -427,8 +475,8 @@ pub struct NewPasskey {
 pub struct NewExternal {
     /// Object name (see [`external_credential_name`]).
     pub name: String,
-    /// `User` object name.
-    pub user: String,
+    /// Original linked account owner.
+    pub user: UserReference,
     /// The provider.
     pub kind: CredentialType,
     /// Upstream issuer.
@@ -469,8 +517,8 @@ pub fn external_credential_name(issuer: &str, subject: &str) -> String {
 /// A stored passkey.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredPasskey {
-    /// `User` object name.
-    pub user: String,
+    /// Original credential owner.
+    pub user: UserReference,
     /// The serialized credential record.
     pub record: String,
 }
@@ -501,19 +549,19 @@ pub trait CredentialStore: Send + Sync + 'static {
         &self,
         external: &NewExternal,
     ) -> impl Future<Output = Result<CreateCredential, StoreError>> + Send;
-    /// The `User` object name an upstream account (by credential name) signs in as.
+    /// The original user incarnation an upstream account signs in as.
     fn linked_user(
         &self,
         name: &str,
-    ) -> impl Future<Output = Result<Option<String>, StoreError>> + Send;
+    ) -> impl Future<Output = Result<Option<UserReference>, StoreError>> + Send;
 }
 
 /// The pending setup token: who it is for, its hash and expiry, and the stored version that a
 /// redemption must consume.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetupToken {
-    /// `User` object name the token enrols a passkey for.
-    pub user: String,
+    /// Original user incarnation the token enrols a credential for.
+    pub user: UserReference,
     /// `sha256:<hex>` of the token.
     pub token_hash: String,
     /// Expiry.
@@ -554,7 +602,7 @@ pub trait SetupStore: Send + Sync + 'static {
 #[derive(Debug, Default)]
 pub struct MemoryCredentialStore {
     passkeys: Mutex<HashMap<String, StoredPasskey>>,
-    externals: Mutex<HashMap<String, String>>,
+    externals: Mutex<HashMap<String, UserReference>>,
 }
 
 impl CredentialStore for MemoryCredentialStore {
@@ -608,7 +656,7 @@ impl CredentialStore for MemoryCredentialStore {
     fn linked_user(
         &self,
         name: &str,
-    ) -> impl Future<Output = Result<Option<String>, StoreError>> + Send {
+    ) -> impl Future<Output = Result<Option<UserReference>, StoreError>> + Send {
         let externals = self
             .externals
             .lock()
@@ -638,9 +686,15 @@ pub struct MemorySetupStore {
 
 impl MemorySetupStore {
     /// Adds an invitation, as `genkanctl invite` would.
-    pub fn put_invitation(&self, name: &str, user: &str, token_hash: &str, expires_at: UnixTime) {
+    pub fn put_invitation(
+        &self,
+        name: &str,
+        user: &UserReference,
+        token_hash: &str,
+        expires_at: UnixTime,
+    ) {
         let token = SetupToken {
-            user: user.to_owned(),
+            user: user.clone(),
             token_hash: token_hash.to_owned(),
             expires_at,
             version: format!("invitation/{name}"),
@@ -652,13 +706,13 @@ impl MemorySetupStore {
     }
 
     /// Replaces the token, as the admin CLI would.
-    pub fn put(&self, user: &str, token_hash: &str, expires_at: UnixTime) {
+    pub fn put(&self, user: &UserReference, token_hash: &str, expires_at: UnixTime) {
         let mut slot = self.token.lock().unwrap_or_else(PoisonError::into_inner);
         let version = slot
             .as_ref()
             .map_or(1, |t| t.version.parse::<u64>().unwrap_or(0) + 1);
         *slot = Some(SetupToken {
-            user: user.to_owned(),
+            user: user.clone(),
             token_hash: token_hash.to_owned(),
             expires_at,
             version: version.to_string(),

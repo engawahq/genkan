@@ -451,7 +451,7 @@ async fn exchange_code<D: Directory, G: GrantStore, C: Clock>(
     let absolute = now.saturating_add(server.lifetimes.refresh_absolute);
     let grant = NewGrant {
         name: grant_name,
-        user: user.name.clone(),
+        user: claims.user.clone(),
         client: client.id.clone(),
         audience: claims.request.audience.clone(),
         scopes: claims.request.scopes.clone(),
@@ -519,7 +519,7 @@ fn elevated_tokens<D: Directory, G: GrantStore, C: Clock>(
     );
     let grant = NewGrant {
         name: String::new(),
-        user: user.name.clone(),
+        user: claims.user.clone(),
         client: client.id.clone(),
         audience: claims.request.audience.clone(),
         scopes: claims.request.scopes.clone(),
@@ -549,9 +549,13 @@ fn elevated_tokens<D: Directory, G: GrantStore, C: Clock>(
 
 async fn active_user<D: Directory, G: GrantStore, C: Clock>(
     server: &AuthorizationServer<D, G, C>,
-    name: &str,
+    reference: &genkan_store::UserReference,
 ) -> Result<Option<User>, OAuthError> {
-    let user = server.directory.user(name).await.map_err(store_error)?;
+    let user = server
+        .directory
+        .user_by_reference(reference)
+        .await
+        .map_err(store_error)?;
     Ok(user.filter(|user| !user.disabled))
 }
 

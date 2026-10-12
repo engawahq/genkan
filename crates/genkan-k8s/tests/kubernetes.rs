@@ -195,6 +195,7 @@ mod tests {
             name,
             GrantSpec {
                 user: "alice".into(),
+                user_uid: "uid-alice".into(),
                 client: "kubectl".into(),
                 audience: "kubernetes".into(),
                 auth_time: 1_700_000_000,
@@ -362,6 +363,7 @@ mod tests {
         let grants: Api<Grant> = env.admin_api();
         let mut stored = grants.create(&pp, &grant("g", None)).await.unwrap();
         stored.spec.user = "mallory".into();
+        stored.spec.user_uid = "uid-mallory".into();
         let error = grants.replace("g", &pp, &stored).await.unwrap_err();
         assert_eq!(
             status_code(&error),
@@ -698,7 +700,10 @@ mod tests {
     fn new_grant(name: &str, now: u64) -> genkan_store::NewGrant {
         genkan_store::NewGrant {
             name: name.to_owned(),
-            user: "alice".into(),
+            user: genkan_store::UserReference {
+                name: "alice".into(),
+                uid: "uid-alice".into(),
+            },
             client: "kubectl".into(),
             audience: "kubernetes".into(),
             scopes: vec!["openid".into()],
@@ -912,7 +917,11 @@ mod tests {
             .next()
             .unwrap();
         let auth = Authentication {
-            user: "alice".into(),
+            user: genkan_store::Directory::user(&server.directory, "alice")
+                .await
+                .unwrap()
+                .unwrap()
+                .reference(),
             auth_time: genkan_core::clock::Clock::now(&SystemClock),
             amr: vec!["hwk".into()],
         };
@@ -1087,7 +1096,10 @@ mod tests {
             &store_creds,
             &genkan_store::NewPasskey {
                 name: genkan_store::passkey_credential_name(b"cred"),
-                user: "root".into(),
+                user: genkan_store::UserReference {
+                    name: "root".into(),
+                    uid: user.uid().unwrap(),
+                },
                 credential_id: "Y3JlZA".into(),
                 record: "{}".into(),
                 label: None,
@@ -1179,7 +1191,7 @@ mod tests {
 
         let store = KubeSetupStore::new(env.genkan_api()).with_invitations(env.genkan_api());
         let loaded = store.load(&token).await.unwrap().unwrap();
-        assert_eq!(loaded.user, "eve");
+        assert_eq!(loaded.user.name, "eve");
         assert_eq!(
             loaded.token_hash,
             genkan_core::crypto::hash_secret(token.as_bytes())
@@ -1241,6 +1253,13 @@ mod tests {
             "inv-forged",
             InvitationSpec {
                 user: "eve".into(),
+                user_uid: env
+                    .admin_api::<User>()
+                    .get("eve")
+                    .await
+                    .unwrap()
+                    .uid()
+                    .unwrap(),
                 email: None,
                 token_hash: Some(format!("sha256:{}", "a".repeat(64))),
                 language: None,

@@ -34,7 +34,10 @@ tests; `genkan-test-support` provides the software authenticator for the tests.
 - **Passkeys.** Discoverable credentials with user verification required at registration and at
   every assertion ([WebAuthn Level 3 §5.4.6, §7.1, §7.2][webauthn]), attestation `none`, and
   relying party ID equal to the issuer's host, so a passkey cannot be used on another origin.
-  The assertion's user handle must be the credential owner's. A passkey sign-in asserts
+  The assertion's user handle must be the credential owner's, but it is unsigned and is not
+  itself proof of ownership: the stored credential must also name the original User object's
+  Kubernetes UID, so replacing that object under the same name does not inherit the passkey. A
+  passkey sign-in asserts
   `amr = ["swk", "mfa"]` ([RFC 8176 §2][rfc8176]); synced passkeys reach AAL2 in
   [NIST SP 800-63B-4][nist] terms. Every sign-in failure returns the same `passkey-failed`
   problem, so responses do not reveal which users or credentials exist.

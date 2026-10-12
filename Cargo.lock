@@ -1331,6 +1331,7 @@ name = "genkan-e2e"
 version = "0.0.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "form_urlencoded",
  "genkan-core",
  "genkan-k8s",
@@ -1346,6 +1347,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "url",
+ "webauthn-rs",
 ]
 
 [[package]]
