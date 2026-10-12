@@ -22,7 +22,8 @@ It does **not**:
 - **Create `Invitation`s.** An invitation link enrols a passkey on an existing user, so whoever
   can create invitations can take over any account. Keep that power with admins
   (`genkanctl invite --username <name>`), or give it to a separate, admin-equivalent job.
-- **Assign elevated groups.** Admin rights stay a decision made by hand.
+- **Assign elevated groups.** Admin rights stay a decision made by hand: an admin may add
+  elevated groups to a managed user, and the tool's later updates keep them as they are.
 - **Delete users.** Removing a user safely means deleting its credentials and sessions first
   (see [managing-users.md](managing-users.md#suspend-or-remove-someone)); disabling is enough
   to stop sign-ins, and is reversible.
@@ -99,6 +100,12 @@ spec:
       request.operation == 'CREATE' || (has(oldObject.metadata.labels) &&
       'genkan.engawahq.dev/source' in oldObject.metadata.labels &&
       oldObject.metadata.labels['genkan.engawahq.dev/source'] == 'directory')
+  - name: elevated
+    expression: "has(object.spec.elevatedGroups) ? object.spec.elevatedGroups : []"
+  - name: wasElevated
+    expression: >-
+      request.operation == 'UPDATE' && has(oldObject.spec.elevatedGroups) ?
+      oldObject.spec.elevatedGroups : []
   validations:
   - expression: variables.wasManaged
     message: user-sync may only change users it created
@@ -108,8 +115,8 @@ spec:
     message: the object name must equal the username, so a username cannot be taken twice
   - expression: "!has(object.spec.groups) || object.spec.groups.all(g, g in ['dev', 'ops'])"
     message: user-sync may only assign allowlisted groups
-  - expression: "!has(object.spec.elevatedGroups) || size(object.spec.elevatedGroups) == 0"
-    message: user-sync never assigns elevated groups
+  - expression: variables.elevated == variables.wasElevated
+    message: user-sync never assigns or changes elevated groups
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
@@ -119,6 +126,10 @@ spec:
   policyName: genkan-user-sync
   validationActions: [Deny]
 ```
+
+Elevated groups must stay exactly as they were: empty when the tool creates a user, and
+unchanged by its updates. Admission sees the whole resulting object, and server-side apply keeps
+fields the tool's manifest leaves out, so elevated groups an admin added survive every sync.
 
 Why the username rule: Kubernetes sees every `User` as `genkan:<username>`, so two objects with
 the same username would be the same person to RBAC. Object names are unique, and `genkanctl`
@@ -154,8 +165,9 @@ your directory as JSON lines `{"id", "username", "name", "groups", "active"}`.
 #!/usr/bin/env bash
 set -euo pipefail
 ns=genkan-system
+failed=0
 
-directory-export | while read -r person; do
+while read -r person; do
   username=$(jq -r .username <<<"$person")
   jq -n --arg ns "$ns" --argjson p "$person" '{
     apiVersion: "genkan.engawahq.dev/v1alpha1",
@@ -172,10 +184,21 @@ directory-export | while read -r person; do
       groups: $p.groups,
       disabled: ($p.active | not)
     }
-  }' | kubectl apply --server-side --field-manager=user-sync -f -
+  }' | kubectl apply --server-side --field-manager=user-sync -f - ||
+    { echo "failed: $username" >&2; failed=1; continue; }
   echo "synced $username"
-done
+done < <(directory-export)
+exit "$failed"
 ```
+
+One refused user must not stop the others: a suspension further down the export still has to
+be written. The loop reports each failure and exits non-zero at the end, so the job shows as
+failed.
+
+The tool owns `displayName`, `groups` and `disabled` of the users it manages (its field
+manager). Change those in the directory, not with `kubectl`: a hand edit makes the next apply
+fail with a field conflict for that user. Elevated groups are the exception, since the tool
+never writes them.
 
 Before applying, a real tool should also:
 

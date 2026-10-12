@@ -58,6 +58,9 @@ their groups until they expire (at most ten minutes for `kubectl`).
 kg patch gkuser alice --type=merge -p '{"spec":{"groups":["dev","oncall"]}}'
 ```
 
+For users a directory sync manages (label `genkan.engawahq.dev/source=directory`), change the
+name and groups in the directory instead; see [provisioning-users.md](provisioning-users.md).
+
 `username` is immutable, because RBAC bindings and audit logs refer to it. To rename someone,
 create a new user and remove the old one.
 
@@ -70,6 +73,8 @@ asks for it.
 ```sh
 kg patch gkuser alice --type=merge -p '{"spec":{"elevatedGroups":["admins"]}}'
 ```
+
+This works the same for directory-managed users: the sync tool never touches elevated groups.
 
 The install binds `genkan:elevated:admins` to `cluster-admin`. Bind other elevated groups to
 narrower roles in the same way.

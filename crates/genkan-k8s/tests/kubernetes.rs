@@ -1502,7 +1502,7 @@ mod tests {
         }
         let refused = refused.expect("the policy never took effect");
         assert!(
-            refused.contains("never assigns elevated groups"),
+            refused.contains("never assigns or changes elevated groups"),
             "{refused}"
         );
 
@@ -1571,9 +1571,43 @@ mod tests {
             "",
         );
         assert!(
-            !ok && stderr.contains("never assigns elevated groups"),
+            !ok && stderr.contains("never assigns or changes elevated groups"),
             "{stderr}"
         );
+
+        // Elevated groups an admin adds to a managed user survive the tool's updates, which may
+        // neither drop nor change them.
+        let (ok, stderr) = kubectl(
+            &[
+                "-n",
+                &ns,
+                "patch",
+                "gkuser",
+                "ana",
+                "--type=merge",
+                "-p",
+                r#"{"spec":{"elevatedGroups":["admins"]}}"#,
+            ],
+            "",
+        );
+        assert!(ok, "{stderr}");
+        let (ok, stderr) = apply(&user("ana", "ana", true, ", groups: [dev]"));
+        assert!(ok, "{stderr}");
+        for manifest in [
+            user("ana", "ana", true, ", groups: [dev], elevatedGroups: []"),
+            user(
+                "ana",
+                "ana",
+                true,
+                ", groups: [dev], elevatedGroups: [admins, ops]",
+            ),
+        ] {
+            let (ok, stderr) = apply(&manifest);
+            assert!(
+                !ok && stderr.contains("never assigns or changes elevated groups"),
+                "{manifest}\n{stderr}"
+            );
+        }
 
         // RBAC: no delete, nothing but users.
         for args in [
@@ -1589,8 +1623,8 @@ mod tests {
         let root = env.admin_api::<User>().get("root").await.unwrap();
         assert!(!root.spec.disabled);
         let ana = env.admin_api::<User>().get("ana").await.unwrap();
-        assert_eq!(ana.spec.groups, ["dev", "ops"]);
-        assert_eq!(ana.spec.elevated_groups, Vec::<String>::new());
+        assert_eq!(ana.spec.groups, ["dev"]);
+        assert_eq!(ana.spec.elevated_groups, ["admins"]);
 
         for kind in [
             "validatingadmissionpolicybinding",
