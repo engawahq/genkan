@@ -136,6 +136,12 @@ the same username would be the same person to RBAC. Object names are unique, and
 always names a user after its username, so requiring the two to be equal keeps the tool from
 creating a second `admin`.
 
+This limits synchronized usernames to valid object names: lowercase letters, digits, `-` and
+`.`, so no `@`, `+` or `_`. Map an email address to a directory short name or the address's
+local part; `genkanctl invite` has the same limit
+([#26](https://github.com/engawahq/genkan/issues/26)). If two people could map to the same
+name, the directory-ID check below is what stops one from taking over the other's `User`.
+
 Check the policy before trusting it:
 
 ```sh
@@ -158,14 +164,22 @@ EOF
 
 Any language with a Kubernetes client works; this is the shape of it in shell, run as the
 `user-sync` service account (a `CronJob`, or outside the cluster with a token from
-`kubectl -n genkan-system create token user-sync`). `directory-export` stands for whatever lists people from
-your directory as JSON lines `{"id", "username", "name", "groups", "active"}`.
+`kubectl -n genkan-system create token user-sync`). `directory-export` stands for whatever
+lists people from your directory as JSON lines `{"id", "username", "name", "groups", "active"}`,
+and exits non-zero when it cannot list everyone.
 
 ```sh
 #!/usr/bin/env bash
 set -euo pipefail
 ns=genkan-system
 failed=0
+
+# Read the whole export before writing anything: a failing exporter stops the job here.
+people=$(directory-export)
+if [[ -z "$people" ]]; then
+  echo "the export is empty; refusing to sync" >&2
+  exit 1
+fi
 
 while read -r person; do
   username=$(jq -r .username <<<"$person")
@@ -187,9 +201,15 @@ while read -r person; do
   }' | kubectl apply --server-side --field-manager=user-sync -f - ||
     { echo "failed: $username" >&2; failed=1; continue; }
   echo "synced $username"
-done < <(directory-export)
+done <<<"$people"
 exit "$failed"
 ```
+
+The export is read in full first, so an exporter that fails part-way fails the job before any
+write, instead of leaving later users (and their suspensions) out while the job looks
+successful. An empty export is refused too: once the tool disables users missing from the
+export, an empty one would disable everyone. Use whatever completeness check your directory
+offers (a total count, a pagination end marker) inside `directory-export`.
 
 One refused user must not stop the others: a suspension further down the export still has to
 be written. The loop reports each failure and exits non-zero at the end, so the job shows as
@@ -206,8 +226,9 @@ Before applying, a real tool should also:
   account in the directory cannot inherit someone else's `User`.
 - Disable managed users that are no longer in the export
   (`kubectl get gkuser -l genkan.engawahq.dev/source=directory`).
-- Lowercase usernames and check them against the `User` schema
-  (`^[a-z0-9]([-a-z0-9._@+]{0,126}[a-z0-9])?$`) before writing.
+- Lowercase usernames and check that they are valid object names and fit the `User` schema
+  (at most 128 characters,
+  `^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`) before writing.
 
 New people still need a link to enrol: an admin runs `genkanctl invite --username <name>` for
 each new user and sends it to them.
