@@ -31,8 +31,17 @@ This creates the `User` `alice` in group `dev` (Kubernetes sees `genkan:alice` i
 channel you trust; whoever opens it first enrols a passkey, or links a GitHub or Google account
 if those are enabled ([github-sign-in.md](github-sign-in.md)).
 
-With an SMTP server configured, `--email alice@example.com` has Genkan mail the link instead;
-the link is then generated inside Genkan and never shown to you.
+Genkan does not send mail. The link goes to stdout and the notes to stderr, so a script can
+deliver it however your team works, for example:
+
+```sh
+link=$(genkanctl invite --username alice --group dev)
+printf 'Open this link on the device that will keep your passkey:\n\n%s\n' "$link" |
+  mail -s "Set up your passkey" alice@example.com
+```
+
+Anyone holding the link can enrol a passkey as Alice until it is used or expires, so send it
+only to her.
 
 Bind roles to the group, not to the person:
 

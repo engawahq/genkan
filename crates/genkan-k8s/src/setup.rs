@@ -135,18 +135,9 @@ async fn load_invitation(
     let (Some(uid), Some(rv)) = (invitation.uid(), invitation.resource_version()) else {
         return Ok(None);
     };
-    // A mailed invitation has no hash until Genkan has generated and sent its token.
-    let Some(token_hash) = invitation.spec.token_hash.clone().or_else(|| {
-        invitation
-            .status
-            .as_ref()
-            .and_then(|s| s.token_hash.clone())
-    }) else {
-        return Ok(None);
-    };
     Ok(Some(SetupToken {
         user: invitation.spec.user.clone(),
-        token_hash,
+        token_hash: invitation.spec.token_hash.clone(),
         expires_at: UnixTime::from_secs(u64::try_from(invitation.spec.expires_at).unwrap_or(0)),
         version: format!("{INVITATION_VERSION}{name}/{uid}/{rv}"),
     }))

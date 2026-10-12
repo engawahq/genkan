@@ -4,8 +4,8 @@ TLS for Genkan's own connections, all on rustls with the aws-lc-rs provider.
 
 ## Contents
 
-- [`trust`](crate::trust): the certificate authorities trusted for outgoing TLS (mail and
-  upstream identity providers): the system bundle plus an optional extra PEM file.
+- [`trust`](crate::trust): the certificate authorities trusted for outgoing TLS (upstream
+  identity providers): the system bundle plus an optional extra PEM file.
 - [`certificate`](crate::certificate): issues a private CA and a serving certificate, and loads
   a PEM chain and key for rustls.
 - [`listener`](crate::listener): a TLS listener for axum whose certificate can be replaced while
@@ -14,8 +14,7 @@ TLS for Genkan's own connections, all on rustls with the aws-lc-rs provider.
 ## Place in the workspace
 
 Depends on `genkan-core`. Used by `genkan-k8s` (stores the internal certificate in a Secret and
-prints the CA for kube-apiserver), by the `genkan-mail` tests (a local TLS mail server), and by
-the `genkan` server, which runs the internal listener and builds its outgoing trust roots here.
+prints the CA for kube-apiserver) and by the `genkan` server, which runs the internal listener and builds its outgoing trust roots here.
 
 ## Why Genkan issues its own certificate
 

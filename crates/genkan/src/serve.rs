@@ -2,7 +2,7 @@
 //!
 //! Startup order: Kubernetes mode binds the internal port first, failing immediately if it is
 //! unavailable. Signing keys are then reconciled once, background tasks start (key rotation,
-//! garbage collection, optional mailer, internal TLS), and the public port is bound.
+//! garbage collection, internal TLS), and the public port is bound.
 //! With the Kubernetes store, if the API server becomes unreachable, Genkan keeps serving the
 //! last published keys; logins and refreshes that need a write fail closed, and the background
 //! tasks retry.
@@ -24,7 +24,6 @@ use genkan_k8s::keys::SecretKeyStore;
 use genkan_k8s::setup::KubeSetupStore;
 use genkan_keys::manager::{KeyManager, ManagerError};
 use genkan_keys::store::{KeyStore, MemoryKeyStore};
-use genkan_mail::Mailer;
 use genkan_oauth::discovery::ProviderMetadata;
 use genkan_oauth::metadata::{AppState, router};
 use genkan_oauth::{AuthorizationServer, OneTimeIds, endpoints};
@@ -46,7 +45,7 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::config::{MailConfig, ServeConfig, Store};
+use crate::config::{ServeConfig, Store};
 use crate::internal::{self, InternalConfig};
 
 /// How often signing keys are reconciled. Rotation timings are hours to days, so a minute of
@@ -139,17 +138,6 @@ pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
                         gc::run::<Invitation, _>(client, &namespace, SystemClock, shutdown).await;
                     }
                 }));
-                if let Some(mail) = &config.mail {
-                    let mailer = mailer(mail)?;
-                    tracing::info!(?mailer, "mailing invitation links");
-                    background.push(tokio::spawn(crate::mailer::run_mailer(
-                        Api::namespaced(client.clone(), &namespace),
-                        mailer,
-                        config.issuer.clone(),
-                        SystemClock,
-                        shutdown_rx.clone(),
-                    )));
-                }
             }
             let internal_secrets = Api::namespaced(client.clone(), &namespace);
             let gc = tokio::spawn({
@@ -195,23 +183,6 @@ fn upstream_providers(config: &ServeConfig) -> Result<Vec<Provider>, ServeError>
             ))
         })
         .collect()
-}
-
-/// Builds the mailer: reads the password file and the trusted CAs.
-fn mailer(config: &MailConfig) -> Result<Mailer, ServeError> {
-    let password = config
-        .password_file
-        .as_ref()
-        .map(|path| {
-            std::fs::read_to_string(path)
-                .map(|p| p.trim_end_matches(['\r', '\n']).to_owned())
-                .map_err(|error| ServeError::Config(format!("{}: {error}", path.display())))
-        })
-        .transpose()?;
-    let roots = genkan_tls::trust::roots(config.ca_file.as_deref())
-        .map_err(|error| ServeError::Config(error.to_string()))?;
-    Mailer::new(&config.url, password, &config.from, roots)
-        .map_err(|error| ServeError::Config(error.to_string()))
 }
 
 /// Request limits applied to every route.

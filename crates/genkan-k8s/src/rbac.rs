@@ -14,8 +14,8 @@
 //! - **Configuration is read-only.** Users, credentials and clients are written by admins or
 //!   GitOps; Genkan reads them, writes `users/status`, and creates or deletes credentials when a
 //!   passkey is enrolled or an account is linked.
-//! - **Runtime state is Genkan's.** Full access to grants; invitations it can read, mail (`status`)
-//!   and redeem (`delete`), but not create.
+//! - **Runtime state is Genkan's.** Full access to grants; invitations it can read and redeem
+//!   (`delete`), but not create.
 //! - **Nothing else.** No cluster-scoped rights, nothing in other namespaces, no RBAC objects, no
 //!   `impersonate`. The admin bindings ([`ADMINS_BINDING`], [`ELEVATED_ADMINS_BINDING`]) are
 //!   applied at install with the cluster admin's rights; Genkan cannot change them.
@@ -106,15 +106,14 @@ pub fn rules() -> Vec<PolicyRule> {
             ],
         ),
         rule(&[GROUP], &["grants/status"], &[], &["update"]),
-        // Invitations: the admin creates them; Genkan redeems (deletes), mails links (status),
-        // and collects expired ones.
+        // Invitations: the admin creates them; Genkan redeems (deletes) and collects expired
+        // ones.
         rule(
             &[GROUP],
             &["invitations"],
             &[],
             &["get", "list", "watch", "delete"],
         ),
-        rule(&[GROUP], &["invitations/status"], &[], &["update"]),
     ]
 }
 

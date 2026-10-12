@@ -1,5 +1,4 @@
-//! Invitations: the admin's side (`genkanctl invite`). Genkan's server mails links for
-//! invitations that name an address.
+//! Invitations: the admin's side (`genkanctl invite`).
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -43,10 +42,6 @@ pub struct Invitee {
     pub groups: Vec<String>,
     /// Elevated groups, for a new user.
     pub elevated_groups: Vec<String>,
-    /// Mail the link here instead of returning it.
-    pub email: Option<String>,
-    /// Language of the mail.
-    pub language: Option<String>,
 }
 
 /// What was created.
@@ -54,8 +49,8 @@ pub struct Invitee {
 pub struct Invited {
     /// The `Invitation` object name.
     pub name: String,
-    /// The link, unless Genkan will mail it.
-    pub url: Option<String>,
+    /// The link.
+    pub url: String,
     /// Whether the `User` was created now.
     pub created_user: bool,
     /// When the link stops working.
@@ -114,10 +109,7 @@ pub async fn invite(
         hex(&random::<8>().map_err(|_crypto| InviteError::Crypto)?)
     );
     let expires_at = now.saturating_add(valid_for);
-    let token = match invitee.email {
-        Some(_) => None,
-        None => Some(new_token(&name)?),
-    };
+    let token = new_token(&name)?;
     let invitation = Invitation {
         metadata: ObjectMeta {
             name: Some(name.clone()),
@@ -139,18 +131,15 @@ pub async fn invite(
         },
         spec: InvitationSpec {
             user: invitee.username.clone(),
-            email: invitee.email.clone(),
-            token_hash: token.as_deref().map(|t| hash_secret(t.as_bytes())),
-            language: invitee.language.clone(),
+            token_hash: hash_secret(token.as_bytes()),
             expires_at: i64::try_from(expires_at.as_secs()).unwrap_or(i64::MAX),
         },
-        status: None,
     };
     let invitations: Api<Invitation> = Api::namespaced(client, namespace);
     let created = invitations.create(&pp, &invitation).await?;
     Ok(Invited {
         name: created.name_any(),
-        url: token.map(|token| link(issuer, &token)),
+        url: link(issuer, &token),
         created_user,
         expires_at,
     })

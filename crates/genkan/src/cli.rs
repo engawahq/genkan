@@ -9,7 +9,7 @@ use genkan_core::config::{BaseUrl, ConfigError, parse_duration};
 use genkan_keys::rotation::RotationPolicy;
 use genkan_signin::upstream::provider::Kind;
 
-use crate::config::{MailConfig, ServeConfig, Store, UpstreamConfig};
+use crate::config::{ServeConfig, Store, UpstreamConfig};
 
 /// Log output format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -90,15 +90,6 @@ pub struct ServeArgs {
     #[arg(long, env = "GENKAN_INVITATIONS")]
     pub invitations: bool,
 
-    /// Mail invitation links through this submission server: `smtps://[user@]host[:465]` (TLS)
-    /// or `smtp://[user@]host[:587]` (STARTTLS, required). Needs --invitations.
-    #[arg(long, env = "GENKAN_SMTP_URL")]
-    pub smtp_url: Option<String>,
-
-    /// File holding the SMTP password (a mounted Secret).
-    #[arg(long, env = "GENKAN_SMTP_PASSWORD_FILE")]
-    pub smtp_password_file: Option<PathBuf>,
-
     /// Enable "Continue with GitHub": the OAuth app's client ID. Register
     /// `<issuer>/upstream/github/callback` as its callback URL.
     #[arg(
@@ -136,14 +127,6 @@ pub struct ServeArgs {
     /// Extra CA (PEM) trusted for upstream providers.
     #[arg(long, env = "GENKAN_UPSTREAM_CA_FILE")]
     pub upstream_ca_file: Option<PathBuf>,
-
-    /// Extra CA (PEM) trusted for the SMTP server, for a private relay.
-    #[arg(long, env = "GENKAN_SMTP_CA_FILE")]
-    pub smtp_ca_file: Option<PathBuf>,
-
-    /// Sender address of invitation mail.
-    #[arg(long, env = "GENKAN_MAIL_FROM")]
-    pub mail_from: Option<String>,
 
     /// Lifetime of elevated tokens (1m to 15m). The `elevate` scope yields such a token, without
     /// refresh, adding `elevated:<group>` for each of the user's elevated groups, after a passkey
@@ -219,20 +202,6 @@ impl ServeArgs {
             })
             .collect(),
             upstream_ca_file: self.upstream_ca_file.clone(),
-            mail: match (&self.smtp_url, &self.mail_from) {
-                (Some(url), Some(from)) => Some(MailConfig {
-                    url: url.clone(),
-                    password_file: self.smtp_password_file.clone(),
-                    ca_file: self.smtp_ca_file.clone(),
-                    from: from.clone(),
-                }),
-                (None, None) => None,
-                _ => {
-                    return Err(ConfigError::Incomplete(
-                        "--smtp-url and --mail-from go together",
-                    ));
-                }
-            },
             internal_listen: self.internal_listen,
             internal_url: self.internal_url.clone(),
             store: match self.store {

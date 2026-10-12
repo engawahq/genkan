@@ -40,7 +40,7 @@ pub(crate) enum Command {
     /// `AuthenticationConfiguration` (stdout) and how to install it (stderr).
     KubeConfig(KubeConfigArgs),
     /// Invite a user, using your own kubeconfig (admin): creates the `User` if needed and a
-    /// one-time enrolment link, printed, or mailed by Genkan with --email.
+    /// one-time enrolment link, printed for you to send.
     Invite(InviteArgs),
 }
 
@@ -63,12 +63,6 @@ pub(crate) struct InviteArgs {
     /// sign-in with the `elevate` scope.
     #[arg(long = "elevated-group")]
     pub elevated_groups: Vec<String>,
-    /// Have Genkan mail the link to this address (needs `genkan --smtp-url`).
-    #[arg(long)]
-    pub email: Option<String>,
-    /// Language of the mail.
-    #[arg(long, value_parser = ["en", "zh-TW", "zh-CN"])]
-    pub language: Option<String>,
     /// How long the link works.
     #[arg(long, default_value = "7d", value_parser = parse_duration)]
     pub valid_for: Duration,
@@ -92,8 +86,7 @@ pub(crate) struct ManifestsArgs {
     /// An argument for `genkan` (repeatable), for example `--serve-arg=--invitations`.
     #[arg(long = "serve-arg", allow_hyphen_values = true)]
     pub serve_args: Vec<String>,
-    /// A Secret mounted read-only at /etc/genkan, for files such as client secrets and the
-    /// SMTP password.
+    /// A Secret mounted read-only at /etc/genkan, for files such as client secrets.
     #[arg(long)]
     pub config_secret: Option<String>,
 }

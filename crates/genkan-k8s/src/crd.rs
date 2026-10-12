@@ -18,8 +18,8 @@
 //! - [`grant::Grant`]: as Secrets, grants would need namespace-wide `create`, `list` and `delete`
 //!   on Secrets (`create` cannot be limited to a name, [RBAC]), which would also reach the signing
 //!   keys. A grant holds only hashes; `kubectl get grants` shows who is signed in.
-//! - [`invitation::Invitation`]: written by an admin, mailed and redeemed by Genkan. As Secrets,
-//!   pending invitations could only be found with `list` on Secrets.
+//! - [`invitation::Invitation`]: written by an admin, redeemed by Genkan. As Secrets, pending
+//!   invitations could only be found with `list` on Secrets.
 //!
 //! Format rules (lengths, patterns, list sizes) are `OpenAPI` `maxLength`, `pattern` and
 //! `maxItems`, which cost nothing against the CEL cost budget; CEL rules

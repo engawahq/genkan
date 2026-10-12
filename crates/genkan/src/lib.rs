@@ -3,6 +3,5 @@
 pub mod cli;
 pub mod config;
 pub mod internal;
-pub mod mailer;
 pub mod output;
 pub mod serve;

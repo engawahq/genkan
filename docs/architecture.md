@@ -66,7 +66,6 @@ that is also its crate-level documentation (`cargo doc --open`).
 | [`genkan-ui`](../crates/genkan-ui) | server-rendered pages, embedded assets, translations, security headers | core |
 | [`genkan-oauth`](../crates/genkan-oauth) | the OAuth 2.0 / OpenID Connect authorization server | core, keys, store, ui |
 | [`genkan-signin`](../crates/genkan-signin) | passkey enrolment and sign-in, upstream providers, page routes | core, keys, store, oauth, ui |
-| [`genkan-mail`](../crates/genkan-mail) | a minimal SMTP submission client for invitation links | core |
 | [`genkan-k8s`](../crates/genkan-k8s) | custom resources, Kubernetes adapters, GC, manifests, kube-apiserver config | core, keys, store, tls |
 | [`genkan`](../crates/genkan) | **binary**: the in-cluster server | all of the above |
 | [`genkanctl`](../crates/genkanctl) | **binary**: the administrator's CLI | core, k8s |

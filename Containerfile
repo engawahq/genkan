@@ -1,5 +1,5 @@
-# Genkan's image: one static binary and Mozilla's CA bundle (for upstream identity providers and
-# mail servers); no shell, no package manager. kube-apiserver is trusted through the service
+# Genkan's image: one static binary and Mozilla's CA bundle (for upstream identity providers); no
+# shell, no package manager. kube-apiserver is trusted through the service
 # account's CA only. Runs as a non-root user.
 # Built by scripts/build-image.sh.
 FROM scratch

@@ -1,4 +1,4 @@
-//! Certificate authorities trusted for outgoing TLS (mail and upstream identity providers): the
+//! Certificate authorities trusted for outgoing TLS (upstream identity providers): the
 //! system bundle, plus an optional extra PEM file for private servers.
 //!
 //! Genkan's image ships a CA bundle; `SSL_CERT_FILE` and `SSL_CERT_DIR` override where it is

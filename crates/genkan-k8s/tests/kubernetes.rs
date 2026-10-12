@@ -1037,8 +1037,6 @@ mod tests {
             display_name: None,
             groups: vec![],
             elevated_groups: vec![],
-            email: None,
-            language: None,
         };
 
         // Setup precedes credentials; only GC, never reset, removes these dependents.
@@ -1299,10 +1297,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     #[ignore = "needs a Kubernetes cluster (KUBECONFIG)"]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one end-to-end scenario reads best top to bottom"
-    )]
     async fn invitations_are_single_use_and_admin_only() {
         use genkan_k8s::crd::invitation::{Invitation, InvitationSpec};
         use genkan_k8s::invitations::{Invitee, invite};
@@ -1318,8 +1312,6 @@ mod tests {
             display_name: Some("Eve".into()),
             groups: vec!["dev".into()],
             elevated_groups: vec![],
-            email: None,
-            language: None,
         };
         let first = invite(
             env.admin.clone(),
@@ -1332,13 +1324,7 @@ mod tests {
         .await
         .unwrap();
         assert!(first.created_user);
-        let token = first
-            .url
-            .unwrap()
-            .split("#token=")
-            .nth(1)
-            .unwrap()
-            .to_owned();
+        let token = first.url.split("#token=").nth(1).unwrap().to_owned();
         assert!(token.starts_with(&format!("{}.", first.name)));
 
         let store = KubeSetupStore::new(env.genkan_api()).with_invitations(env.genkan_api());
@@ -1377,37 +1363,12 @@ mod tests {
         assert_eq!(consumed, 1);
         assert!(store.load(&token).await.unwrap().is_none());
 
-        // A mailed invitation has no usable token until Genkan records one.
-        let mailed = invite(
-            env.admin.clone(),
-            &env.namespace,
-            &issuer,
-            &Invitee {
-                email: Some("eve@example.com".into()),
-                ..invitee.clone()
-            },
-            Duration::from_hours(1),
-            t0,
-        )
-        .await
-        .unwrap();
-        assert!(mailed.url.is_none() && !mailed.created_user);
-        assert!(
-            store
-                .load(&format!("{}.anything", mailed.name))
-                .await
-                .unwrap()
-                .is_none()
-        );
-
         // Genkan's service account cannot mint invitations; admission rejects malformed ones.
         let forged = Invitation::new(
             "inv-forged",
             InvitationSpec {
                 user: "eve".into(),
-                email: None,
-                token_hash: Some(format!("sha256:{}", "a".repeat(64))),
-                language: None,
+                token_hash: format!("sha256:{}", "a".repeat(64)),
                 expires_at: 0,
             },
         );
@@ -1417,16 +1378,16 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(status_code(&error), Some(403), "{error}");
-        let neither = Invitation::new(
+        let malformed = Invitation::new(
             "inv-bad",
             InvitationSpec {
-                token_hash: None,
+                token_hash: "sha256:not-a-hash".into(),
                 ..forged.spec.clone()
             },
         );
         let error = env
             .admin_api::<Invitation>()
-            .create(&PostParams::default(), &neither)
+            .create(&PostParams::default(), &malformed)
             .await
             .unwrap_err();
         assert_eq!(status_code(&error), Some(422), "{error}");

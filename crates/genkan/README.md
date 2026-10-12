@@ -13,7 +13,6 @@ whose kube-apiserver accepts its tokens. This crate is the `genkan` binary plus 
 - [`serve`](crate::serve): starts the background tasks and the public listener.
 - [`internal`](crate::internal): the in-cluster TLS listener that kube-apiserver fetches
   discovery and keys from.
-- [`mailer`](crate::mailer): mails invitation links when an SMTP server is configured.
 - [`output`](crate::output): the only code that writes to stdout or stderr outside the logger.
 
 ## Two binaries
@@ -27,7 +26,7 @@ could not do those things anyway: it cannot create Secrets, users or RBAC bindin
 ## Place in the workspace
 
 Depends on every library crate: `genkan-core`, `genkan-keys`, `genkan-store`, `genkan-tls`,
-`genkan-ui`, `genkan-oauth`, `genkan-signin`, `genkan-mail` and `genkan-k8s`.
+`genkan-ui`, `genkan-oauth`, `genkan-signin` and `genkan-k8s`.
 Nothing depends on it.
 
 ## Key properties

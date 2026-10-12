@@ -36,7 +36,6 @@ its container image.
 | RFC 9457 Problem Details | RFC | Met for the sign-in endpoints |
 | RFC 8176 Authentication Method Reference values | RFC | Met (`swk`, `mfa` for passkeys) |
 | WCAG 2.2 AA | W3C Recommendation | Partial: contrast computed and met for every colour pair used; no automated browser audit or screen-reader pass yet |
-| RFC 6409, RFC 8314, RFC 3207, RFC 4616 mail submission | RFC | Met for what the invitation mailer uses |
 | OpenID Connect RP-Initiated Logout 1.0 | Final | Not implemented (no sessions) |
 | OpenID Connect Back-Channel Logout 1.0 | Final | Not implemented |
 | RFC 9449 DPoP | RFC | Not implemented: kube-apiserver accepts only bearer tokens |
@@ -166,7 +165,6 @@ Tests are in `genkan-signin/tests/signin.rs` unless noted.
 | RFC 9457 §3 | Problem details | — | `problem.rs` | `requests_from_other_sites_are_refused` | Met |
 | Fetch Metadata | Cross-site state-changing requests refused | — | `lib.rs` `check_request` | `requests_from_other_sites_are_refused`, `genkan-signin: tests::same_origin_checks` | Met |
 | RFC 6265bis | `__Host-` cookies: Secure, `Path=/`, no Domain | MUST | `lib.rs`, `upstream.rs` | `code_flow_issues_tokens_kubernetes_can_use` | Met |
-| RFC 6409, 8314, 3207, 4616 | Mail only over TLS; STARTTLS required on 587; injected pre-TLS replies refused; AUTH only inside TLS | MUST | `genkan-mail/src/lib.rs` | `genkan-mail: tests::*`; `genkan/tests/kubernetes.rs: mailed_invitations_are_claimed_once_and_sent` *(cluster)* | Met |
 
 ## Upstream sign-in (GitHub, Google)
 

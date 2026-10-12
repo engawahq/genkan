@@ -39,8 +39,6 @@ fn invite(args: &InviteArgs) -> ExitCode {
         display_name: args.display_name.clone(),
         groups: args.groups.clone(),
         elevated_groups: args.elevated_groups.clone(),
-        email: args.email.clone(),
-        language: args.language.clone(),
     };
     let result = runtime.block_on(async {
         let client = kube::Client::try_default().await?;
@@ -63,21 +61,12 @@ fn invite(args: &InviteArgs) -> ExitCode {
                     args.username
                 ));
             }
-            match (&created.url, &args.email) {
-                (Some(url), _) => {
-                    output::stdout(url);
-                    output::stderr(&format!(
-                        "Send this link to {}. It works once and expires in {} days.",
-                        args.username,
-                        args.valid_for.as_secs() / 86_400
-                    ));
-                }
-                (None, Some(email)) => output::stderr(&format!(
-                    "Genkan will mail the link to {email} (invitation {}).",
-                    created.name
-                )),
-                (None, None) => {}
-            }
+            output::stdout(&created.url);
+            output::stderr(&format!(
+                "Send this link to {}. It works once and expires in {} days.",
+                args.username,
+                args.valid_for.as_secs() / 86_400
+            ));
             ExitCode::SUCCESS
         }
         Err(error) => {

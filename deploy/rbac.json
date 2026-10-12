@@ -157,17 +157,6 @@
             "watch",
             "delete"
           ]
-        },
-        {
-          "apiGroups": [
-            "genkan.engawahq.dev"
-          ],
-          "resources": [
-            "invitations/status"
-          ],
-          "verbs": [
-            "update"
-          ]
         }
       ]
     },

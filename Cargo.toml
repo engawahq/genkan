@@ -21,7 +21,6 @@ genkan-ui = { path = "crates/genkan-ui" }
 genkan-tls = { path = "crates/genkan-tls" }
 genkan-oauth = { path = "crates/genkan-oauth" }
 genkan-signin = { path = "crates/genkan-signin" }
-genkan-mail = { path = "crates/genkan-mail" }
 genkan-k8s = { path = "crates/genkan-k8s" }
 genkan-test-support = { path = "crates/genkan-test-support" }
 

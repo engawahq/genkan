@@ -31,19 +31,6 @@ pub struct UpstreamConfig {
     pub client_secret_file: std::path::PathBuf,
 }
 
-/// How invitation mail is sent.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MailConfig {
-    /// `smtps://` or `smtp://` URL of the submission server.
-    pub url: String,
-    /// File holding the password.
-    pub password_file: Option<std::path::PathBuf>,
-    /// Extra CA for the server.
-    pub ca_file: Option<std::path::PathBuf>,
-    /// Sender address.
-    pub from: String,
-}
-
 /// Configuration for `genkan`.
 #[derive(Debug, Clone)]
 pub struct ServeConfig {
@@ -57,8 +44,6 @@ pub struct ServeConfig {
     pub metadata_max_age: Duration,
     /// Whether invitations are accepted.
     pub invitations: bool,
-    /// How invitation links are mailed, if they are.
-    pub mail: Option<MailConfig>,
     /// Enabled upstream identity providers.
     pub upstream: Vec<UpstreamConfig>,
     /// Extra CA trusted for the providers (tests and private mirrors).
@@ -103,9 +88,6 @@ impl ServeConfig {
             return Err(ConfigError::BadRotationPolicy(
                 "elevated token lifetime must be between 1m and 15m",
             ));
-        }
-        if self.mail.is_some() && !self.invitations {
-            return Err(ConfigError::Incomplete("--smtp-url needs --invitations"));
         }
         if self.lifetimes.refresh_idle > self.lifetimes.refresh_absolute {
             return Err(ConfigError::BadRotationPolicy(

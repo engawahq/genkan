@@ -77,7 +77,7 @@
               # Required by rust-analyzer
               RUST_SRC_PATH = "${pkgs.rustToolchain}/lib/rustlib/src/rust/library";
               # Mozilla's CA bundle (MPL-2.0), copied into the image for outgoing TLS to identity
-              # providers and mail servers; pinned with nixpkgs.
+              # providers; pinned with nixpkgs.
               GENKAN_CA_BUNDLE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
             }
             // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux (
