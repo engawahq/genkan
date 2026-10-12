@@ -177,7 +177,7 @@ Tests are in `genkan-signin/tests/upstream.rs`.
 |---|---|---|---|---|
 | RFC 6749 §10.12; RFC 9700 §2.1 | `state` bound to the browser, compared in constant time, used once | `upstream.rs` | `unlinked_disabled_and_replayed_sign_ins_fail` | Met |
 | RFC 7636 | PKCE towards the provider | `upstream/provider.rs` | `a_linked_github_account_signs_in_and_gets_a_code` (fake provider checks the verifier) | Met |
-| OIDC Core §3.1.3.7 | ID token: signature from the provider's JWK set, `iss`, `aud`/`azp`, `exp`, `iat`, `nonce` | `upstream/provider.rs` | `google_id_tokens_are_validated` | Met |
+| OIDC Core §3.1.3.7 | ID token: signature from the provider's JWK set, `iss`, `aud` exactly the client ID (no other audience trusted), `azp` if present equal to it, `exp`, `iat`, `nonce` | `upstream/provider.rs` | `google_id_tokens_are_validated` | Met |
 | Project requirement | Only linked accounts sign in; linking only through an enrolment link, once | `upstream.rs` | `an_invitation_links_an_account_once`, `unlinked_disabled_and_replayed_sign_ins_fail` | Met |
 
 ## SCIM 2.0 (RFC 7643, RFC 7644)

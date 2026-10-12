@@ -547,6 +547,8 @@ mod tests {
         for (claim, value) in [
             ("aud", json!("someone-else")),
             ("aud", json!(["google-client", "other"])),
+            ("aud", json!([])),
+            ("azp", json!("other")),
             ("iss", json!("https://evil.example")),
             ("exp", json!(now - 3600)),
             ("nonce", json!("replayed")),
@@ -556,9 +558,16 @@ mod tests {
             let reply = sign_in(&h, "google", &format!("code-{claim}")).await;
             assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{claim}={value}");
         }
-        // Several audiences are fine when azp names this client.
+        // Another audience is refused even when azp names this client (OIDC Core §3.1.3.7 step 3).
         *h.fake.id_token_overrides.lock().unwrap() =
             json!({ "aud": ["google-client", "other"], "azp": "google-client" });
+        assert_eq!(
+            sign_in(&h, "google", "code-azp-other").await.status,
+            StatusCode::BAD_REQUEST
+        );
+        // A one-element array naming this client, with a matching azp, is accepted.
+        *h.fake.id_token_overrides.lock().unwrap() =
+            json!({ "aud": ["google-client"], "azp": "google-client" });
         assert_eq!(
             sign_in(&h, "google", "code-azp").await.status,
             StatusCode::SEE_OTHER
