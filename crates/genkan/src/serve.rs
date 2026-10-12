@@ -214,12 +214,16 @@ fn admission_error(
 
     if error.is::<tower::load_shed::error::Overloaded>() {
         let rejected_total = rejected.fetch_add(1, Ordering::Relaxed) + 1;
-        tracing::warn!(
-            event = "request_overload",
-            router,
-            rejected_total,
-            "request rejected for load"
-        );
+        // Every rejection is counted, but a flood must not become a synchronous log-write flood.
+        // Power-of-two milestones bound warning volume logarithmically without another task/timer.
+        if rejected_total.is_power_of_two() {
+            tracing::warn!(
+                event = "request_overload",
+                router,
+                rejected_total,
+                "request rejected for load"
+            );
+        }
         (
             StatusCode::SERVICE_UNAVAILABLE,
             [

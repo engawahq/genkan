@@ -290,7 +290,8 @@ Genkan additionally limits each business route/method service to 64 concurrent r
 Full services immediately return `503` with `Retry-After: 1`, without queuing ahead of the
 ten-second handler timeout. Health/readiness probes and discovery/keys do not share those
 slots. These are per-process concurrency limits, not per-IP rate limits. Structured
-`request_overload` events expose cumulative rejection counts; `kubernetes_directory_lookup`
+`request_overload` events expose cumulative rejection counts at power-of-two milestones, not
+one warning per rejection; `kubernetes_directory_lookup`
 events expose resource, operation, outcome and API latency in milliseconds.
 Aggregate them in your log backend.
 

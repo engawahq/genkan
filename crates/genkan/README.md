@@ -35,13 +35,16 @@ Nothing depends on it.
   Kubernetes directory's metadata watches must also publish their initial snapshots within
   30 s. Startup failure stops background watchers rather than exposing a partially initialized
   server. `/healthz` answers once the process runs, `/readyz` once keys are published.
+  The generated Deployment uses a two-minute startup probe budget before enabling normal
+  liveness/readiness checks, so slow initialization is not mistaken for a deadlock.
 - **Small and bounded.** A Tokio runtime with two worker threads (one would work; two keep a
   slow request from stalling the key rotator) and axum on HTTP/1.1. Every request body is at most
   16 KiB, handled within 10 s. Each business route/method service independently permits 64
   concurrent handlers, including page assets; metadata and probes use no business slots.
   Saturated services fail immediately with `503`, `Retry-After: 1` and `Cache-Control: no-store`;
   they never queue outside the timeout or borrow another route's slots. Structured
-  `request_overload` logs carry cumulative rejection counts for each business subrouter.
+  `request_overload` logs carry cumulative rejection counts for each business subrouter at
+  power-of-two milestones; every rejection is counted without a log write on every rejection.
   Per-source-IP rate limiting belongs at the ingress; see [the deployment guide].
   The end-to-end test requires the pod's working set after a sign-in to stay within 30 MiB.
 - **TLS ends in front of the public listener** (ingress or gateway). The issuer is an `https`

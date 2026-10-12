@@ -157,6 +157,13 @@ fn container(issuer: &BaseUrl, options: &Options) -> Container {
             port("http", HTTP_PORT),
             port("internal", INTERNAL_PORT),
         ]),
+        // Startup probes suspend liveness/readiness until initialization succeeds. Allow two
+        // minutes for the bounded metadata sync plus key preparation before normal probes start.
+        // https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/#define-startup-probes
+        startup_probe: Some(Probe {
+            failure_threshold: Some(12),
+            ..probe("/healthz")
+        }),
         readiness_probe: Some(probe("/readyz")),
         liveness_probe: Some(probe("/healthz")),
         resources: Some(ResourceRequirements {
