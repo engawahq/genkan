@@ -311,8 +311,26 @@ Skip this on a server only you can reach. Before you expose Genkan to the intern
 address can call the sign-in endpoints. Genkan does not rate-limit by IP address itself; that
 is the ingress's job, because only the ingress sees the browser's real address.
 
-With the Traefik Gateway above, enable Traefik's Kubernetes CRD provider and install its
-Middleware CRDs (see the [Gateway middleware prerequisites][traefik-extref]), then apply:
+**First, let Traefik see each visitor's real address.** By default, k3s's built-in load
+balancer hands Traefik every outside request from the cluster's internal gateway address
+(`10.42.0.1`). Every visitor would then share one limit, and one person could use it up for
+everyone. Setting the Traefik Service's `externalTrafficPolicy` to `Local` keeps the address. On
+the server:
+
+```sh
+cd ~/recommendations && nix develop
+helm -n traefik upgrade traefik oci://ghcr.io/traefik/helm/traefik \
+  --version "$(yq '.releases[] | select(.name == "traefik") | .version' capabilities/ingress/traefik.yaml)" \
+  --reuse-values --set service.spec.externalTrafficPolicy=Local --wait
+```
+
+Change it with Helm, not `kubectl patch`: a patch takes over the field, and the next chart
+upgrade then fails with a conflict. On a cluster with several nodes, `Local` also means only
+nodes that run a Traefik pod accept traffic.
+
+**Then add the limit.** The Traefik from step 3 already reads `Middleware` objects, so nothing
+else needs installing (for other setups, see Traefik's
+[Gateway middleware prerequisites][traefik-extref]). Back in the `~/genkan` shell:
 
 ```sh
 kubectl apply -f - <<'EOF'
@@ -349,6 +367,16 @@ EOF
 
 This route takes precedence over the catch-all route for the listed paths. Discovery and keys
 stay unlimited, because kube-apiserver and every client fetch them.
+
+To check it, send 60 requests at once from your computer. About 20 get `200`, the rest
+`429 Too Many Requests`:
+
+```sh
+ca="$(mkcert -CAROOT)/rootCA.pem"
+for i in $(seq 1 60); do
+  curl -s -o /dev/null -w '%{http_code}\n' --cacert "$ca" https://genkan.example.test/login &
+done | sort | uniq -c
+```
 
 Treat the numbers as a starting point:
 
