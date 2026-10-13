@@ -197,10 +197,10 @@ kubectl -n genkan-system delete gkuser alice
 ```
 
 > [!WARNING]
-> Keep this order. Deleting only the `User` leaves the old passkeys around for a while: until
-> Kubernetes garbage collection removes them, or forever for objects created by hand without an
-> owner reference. If you create a new `User` with the same name in the meantime, the old
-> passkeys sign in as that new user.
+> Keep this order. Deleting only the `User` leaves the old credentials (passkeys and linked GitHub
+> or Google accounts) around for a while: until Kubernetes garbage collection removes them, or
+> forever for objects created by hand without an owner reference. If you create a new `User` with
+> the same name in the meantime, the old credentials sign in as that new user.
 
 ## Keep users in Git
 
