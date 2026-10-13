@@ -136,11 +136,11 @@ the same username would be the same person to RBAC. Object names are unique, and
 always names a user after its username, so requiring the two to be equal keeps the tool from
 creating a second `admin`.
 
-This limits synchronized usernames to valid object names: lowercase letters, digits, `-` and
-`.`, so no `@`, `+` or `_`. Map an email address to a directory short name or the address's
-local part; `genkanctl invite` has the same limit
-([#26](https://github.com/engawahq/genkan/issues/26)). If two people could map to the same
-name, the directory-ID check below is what stops one from taking over the other's `User`.
+The `User` schema limits usernames to DNS subdomains of at most 128 characters: lowercase
+letters, digits, `-` and `.`, with each dot-separated label starting and ending in a letter or
+digit. No `@`, `+` or `_`. Map an email address to a DNS-compatible directory short name;
+`genkanctl invite` and `genkanctl setup-link` use the same contract. If two people could map to
+the same name, the directory-ID check below stops one from taking over the other's `User`.
 
 Check the policy before trusting it:
 

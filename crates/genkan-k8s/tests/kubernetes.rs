@@ -240,6 +240,63 @@ mod tests {
         genkan_core::clock::Clock::now(&SystemClock).as_secs()
     }
 
+    #[tokio::test]
+    #[ignore = "needs a Kubernetes cluster (KUBECONFIG)"]
+    async fn usernames_are_dns_subdomains_with_at_most_128_characters() {
+        let env = Env::new().await;
+        let users: Api<User> = env.admin_api();
+        let pp = PostParams::default();
+
+        for username in [
+            "a".to_owned(),
+            "0".to_owned(),
+            "alice".to_owned(),
+            "alice-smith".to_owned(),
+            "alice.example.com".to_owned(),
+            "a-b.c-d".to_owned(),
+            "a".repeat(128),
+        ] {
+            users
+                .create(&pp, &user_object(&username))
+                .await
+                .unwrap_or_else(|error| panic!("valid username {username:?}: {error}"));
+        }
+
+        for username in [
+            "",
+            "Alice",
+            "alice@example.com",
+            "alice+ops",
+            "alice_smith",
+            "-alice",
+            "alice-",
+            ".alice",
+            "alice.",
+            "alice..smith",
+            "alice.-smith",
+            "alice-.smith",
+            "alice\n",
+            &"a".repeat(129),
+        ] {
+            // Keep metadata.name valid so rejection proves the username schema, not
+            // Kubernetes' independent object-name validation.
+            let mut user = user_object("invalid-username");
+            user.spec.username = username.into();
+            let error = users.create(&pp, &user).await.unwrap_err();
+            assert_eq!(status_code(&error), Some(422), "{username:?}: {error}");
+            let kube::Error::Api(status) = error else {
+                panic!("expected an admission error");
+            };
+            assert!(
+                status.message.contains("spec.username"),
+                "{username:?}: {}",
+                status.message
+            );
+        }
+
+        env.cleanup().await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "needs a Kubernetes cluster (KUBECONFIG)"]
     #[expect(
