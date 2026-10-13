@@ -50,7 +50,7 @@ pub(crate) struct InviteArgs {
     /// The issuer identifier (the same as `genkan --issuer`).
     #[arg(long, env = "GENKAN_ISSUER", value_parser = parse_issuer)]
     pub issuer: BaseUrl,
-    /// Login name: a lowercase DNS subdomain, at most 128 characters; Kubernetes sees
+    /// Login name: a lowercase DNS subdomain, at most 63 characters; Kubernetes sees
     /// `genkan:<username>`.
     #[arg(long)]
     pub username: String,
@@ -131,7 +131,7 @@ pub(crate) struct SetupLinkArgs {
     #[arg(long, env = "GENKAN_ISSUER", value_parser = parse_issuer)]
     pub issuer: BaseUrl,
     /// The `User` to enrol a passkey for; created in group `admins` if it does not exist.
-    /// The username must be a lowercase DNS subdomain of at most 128 characters.
+    /// The username must be a lowercase DNS subdomain of at most 63 characters.
     #[arg(long, default_value = "admin")]
     pub username: String,
     /// Namespace Genkan runs in.

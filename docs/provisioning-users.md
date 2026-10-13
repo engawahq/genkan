@@ -136,11 +136,13 @@ the same username would be the same person to RBAC. Object names are unique, and
 always names a user after its username, so requiring the two to be equal keeps the tool from
 creating a second `admin`.
 
-The `User` schema limits usernames to DNS subdomains of at most 128 characters: lowercase
+The `User` schema limits usernames to DNS subdomains of at most 63 characters: lowercase
 letters, digits, `-` and `.`, with each dot-separated label starting and ending in a letter or
 digit. No `@`, `+` or `_`. Map an email address to a DNS-compatible directory short name;
 `genkanctl invite` and `genkanctl setup-link` use the same contract. If two people could map to
 the same name, the directory-ID check below stops one from taking over the other's `User`.
+The 63-character cap also keeps the full username within Kubernetes' label-value limit for
+invitations, credentials and grants.
 
 Check the policy before trusting it:
 
@@ -227,7 +229,7 @@ Before applying, a real tool should also:
 - Disable managed users that are no longer in the export
   (`kubectl get gkuser -l genkan.engawahq.dev/source=directory`).
 - Lowercase usernames and check that they are valid object names and fit the `User` schema
-  (at most 128 characters,
+  (at most 63 characters,
   `^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`) before writing.
 
 New people still need a link to enrol: an admin runs `genkanctl invite --username <name>` for

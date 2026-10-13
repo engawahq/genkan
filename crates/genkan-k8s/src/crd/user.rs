@@ -34,12 +34,13 @@ use serde::{Deserialize, Serialize};
 )]
 #[serde(rename_all = "camelCase")]
 pub struct UserSpec {
-    /// Login name: a lowercase DNS subdomain of at most 128 characters. Kubernetes sees
-    /// `genkan:<username>`. Use the username as the object name so object-name uniqueness
-    /// also prevents duplicate usernames. Immutable because RBAC bindings and audit logs
-    /// refer to it.
+    /// Login name: a lowercase DNS subdomain of at most 63 characters. Kubernetes sees
+    /// `genkan:<username>`. The length limit keeps the username usable as the
+    /// `genkan.engawahq.dev/user` label value on invitations, credentials and grants.
+    /// Use the username as the object name so object-name uniqueness also prevents duplicate
+    /// usernames. Immutable because RBAC bindings and audit logs refer to it.
     #[schemars(
-        length(min = 1, max = 128),
+        length(min = 1, max = 63),
         regex(pattern = r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$")
     )]
     #[x_kube(validation = Rule::new("self == oldSelf").message("username is immutable"))]

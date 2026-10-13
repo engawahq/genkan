@@ -82,8 +82,8 @@
                         "type": "array"
                       },
                       "username": {
-                        "description": "Login name: a lowercase DNS subdomain of at most 128 characters. Kubernetes sees\n`genkan:<username>`. Use the username as the object name so object-name uniqueness\nalso prevents duplicate usernames. Immutable because RBAC bindings and audit logs\nrefer to it.",
-                        "maxLength": 128,
+                        "description": "Login name: a lowercase DNS subdomain of at most 63 characters. Kubernetes sees\n`genkan:<username>`. The length limit keeps the username usable as the\n`genkan.engawahq.dev/user` label value on invitations, credentials and grants.\nUse the username as the object name so object-name uniqueness also prevents duplicate\nusernames. Immutable because RBAC bindings and audit logs refer to it.",
+                        "maxLength": 63,
                         "minLength": 1,
                         "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$",
                         "type": "string",

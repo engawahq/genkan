@@ -242,7 +242,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "needs a Kubernetes cluster (KUBECONFIG)"]
-    async fn usernames_are_dns_subdomains_with_at_most_128_characters() {
+    async fn usernames_are_dns_subdomains_with_at_most_63_characters() {
         let env = Env::new().await;
         let users: Api<User> = env.admin_api();
         let pp = PostParams::default();
@@ -254,7 +254,7 @@ mod tests {
             "alice-smith".to_owned(),
             "alice.example.com".to_owned(),
             "a-b.c-d".to_owned(),
-            "a".repeat(128),
+            "a".repeat(63),
         ] {
             users
                 .create(&pp, &user_object(&username))
@@ -276,7 +276,7 @@ mod tests {
             "alice.-smith",
             "alice-.smith",
             "alice\n",
-            &"a".repeat(129),
+            &"a".repeat(64),
         ] {
             // Keep metadata.name valid so rejection proves the username schema, not
             // Kubernetes' independent object-name validation.
