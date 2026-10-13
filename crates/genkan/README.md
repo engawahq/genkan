@@ -70,7 +70,7 @@ dependency WARN/ERROR. A supplied value replaces the **complete** filter, includ
 value; it is not merged with defaults. `rustls=debug` does not preserve Genkan INFO or unrelated
 WARN diagnostics; use `warn,genkan=info,rustls=debug` to admit both. `genkan::audit=info` selects
 audit independently of module diagnostics. Native target-prefix and target-only semantics apply.
-Invalid directives fall back to `warn,genkan=info` with `reason="invalid_filter"`, without
+Invalid directives or non-UTF-8 overrides fall back to `warn,genkan=info` with `reason="invalid_filter"`, without
 echoing the supplied value or parser error. `GENKAN_LOG=off` is allowed.
 
 Authentication/security events use exactly `target="genkan::audit"` with business fields

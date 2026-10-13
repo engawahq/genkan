@@ -67,7 +67,8 @@ fn init_logging(format: LogFormat) {
             Ok(filter) => (filter, false),
             Err(_error) => (fallback(), true),
         },
-        Err(_unset) => (fallback(), false),
+        Err(std::env::VarError::NotPresent) => (fallback(), false),
+        Err(std::env::VarError::NotUnicode(_value)) => (fallback(), true),
     };
     // The fmt subscriber's own INFO ceiling must not mask explicit DEBUG/TRACE directives.
     let builder = tracing_subscriber::fmt()
