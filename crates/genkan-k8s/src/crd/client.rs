@@ -9,6 +9,26 @@ pub use genkan_store::ClientType;
 use kube::{CustomResource, KubeSchema};
 use serde::{Deserialize, Serialize};
 
+/// Longest display name.
+pub const MAX_DISPLAY_NAME: usize = 128;
+/// Most redirect URIs per client.
+pub const MAX_REDIRECT_URIS: usize = 16;
+/// Longest redirect URI.
+pub const MAX_REDIRECT_URI: usize = 2048;
+/// Most audiences per client.
+pub const MAX_AUDIENCES: usize = 16;
+/// Longest audience.
+pub const MAX_AUDIENCE: usize = 256;
+/// The pattern every redirect URI matches.
+///
+/// `https://`, or loopback `http://` with an optional port and a path; never a fragment or
+/// whitespace. [`crate::clients::redirect_uri_allowed`] is the same
+/// rule in Rust, for tools that check before `kubectl apply`.
+pub const REDIRECT_URI_PATTERN: &str =
+    r"^(https://[^#\s]+|http://(127\.0\.0\.1|\[::1\])(:[0-9]{1,5})?/[^#\s]*)$";
+/// The stored secret: [`genkan_core::crypto::hash_secret`]'s output.
+pub const SECRET_HASH_PATTERN: &str = r"^sha256:[0-9a-f]{64}$";
+
 /// A registered OAuth 2.0 / OpenID Connect client. The object name is the `client_id`.
 ///
 /// Admission rules reject redirect URIs that RFC 9700 §2.1 and OAuth 2.1 forbid, so a
@@ -37,7 +57,7 @@ use serde::{Deserialize, Serialize};
 pub struct OAuthClientSpec {
     /// Name shown on the consent and login pages.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(length(max = 128))]
+    #[schemars(length(max = MAX_DISPLAY_NAME))]
     pub display_name: Option<String>,
 
     /// Public clients (kubectl, native apps) cannot keep a secret; confidential clients can.
@@ -47,26 +67,21 @@ pub struct OAuthClientSpec {
     /// Redirect URIs, compared by exact string match. Each is `https://`, or
     /// `http://127.0.0.1` / `http://[::1]` for native apps (RFC 8252 §7.3); no fragment.
     #[schemars(
-        length(min = 1, max = 16),
-        inner(
-            length(max = 2048),
-            regex(
-                pattern = r"^(https://[^#\s]+|http://(127\.0\.0\.1|\[::1\])(:[0-9]{1,5})?/[^#\s]*)$"
-            )
-        )
+        length(min = 1, max = MAX_REDIRECT_URIS),
+        inner(length(max = MAX_REDIRECT_URI), regex(pattern = REDIRECT_URI_PATTERN))
     )]
     pub redirect_uris: Vec<String>,
 
     /// Audiences this client may request tokens for (RFC 8707 resource indicators), for example
     /// the `audiences` entry of the cluster's AuthenticationConfiguration.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 16), inner(length(min = 1, max = 256)))]
+    #[schemars(length(max = MAX_AUDIENCES), inner(length(min = 1, max = MAX_AUDIENCE)))]
     pub audiences: Vec<String>,
 
     /// SHA-256 of the client secret, as `sha256:<64 hex digits>`. The secret itself is never
     /// stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(regex(pattern = r"^sha256:[0-9a-f]{64}$"))]
+    #[schemars(regex(pattern = SECRET_HASH_PATTERN))]
     pub secret_hash: Option<String>,
 
     /// Algorithm for ID tokens: `ES256` (default) or `RS256` for clients that need it.

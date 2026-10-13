@@ -22,6 +22,10 @@ Secret, issuing the internal certificate) therefore happens here, with a human's
   sessions. It expires after 60 minutes by default.
 - `genkanctl invite --issuer <url> --username <name>`: creates the `User` if needed and a
   one-time enrolment link (7 days by default), printed for you to send.
+- `genkanctl client create <client-id> --type <public|confidential> --redirect-uri <uri>`:
+  prints an `OAuthClient` after checking it against the same rules as the CRD schema. A
+  confidential client gets a generated 256-bit secret, printed once on stderr; the object holds
+  only its hash. See [Registering clients](../../docs/clients.md).
 
 Results (JSON, YAML or a link) go to stdout and messages to stderr, so commands compose with
 `kubectl apply -f -`.
@@ -35,8 +39,9 @@ Depends on `genkan-core` and `genkan-k8s`. Nothing depends on it.
 - **Least privilege by default.** The installed bindings give `genkan:admins` the built-in
   `view` role and `cluster-admin` only to `genkan:elevated:admins`, which appears only in short
   tokens issued right after a passkey sign-in.
-- **Secrets stay hashed.** Setup and invitation tokens are 256-bit random values; only their
-  SHA-256 is written to the cluster, and the link carries the token in the URL fragment.
+- **Secrets stay hashed.** Setup and invitation tokens and client secrets are 256-bit random
+  values; only their SHA-256 is written to the cluster, and a link carries its token in the URL
+  fragment.
 - **Single use.** Redeeming a setup link or invitation deletes its object with `uid` and
   `resourceVersion` preconditions, so only one redemption can succeed; a new setup link
   invalidates the previous one.

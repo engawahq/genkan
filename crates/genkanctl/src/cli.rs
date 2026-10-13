@@ -2,12 +2,12 @@
 
 use std::time::Duration;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use genkan_core::config::{BaseUrl, ConfigError, parse_duration};
 use genkan_k8s::kube_config::{DiscoveryMode, Distro};
 
 /// Administer Genkan with your own kubeconfig: install manifests, configure kube-apiserver,
-/// issue setup links and invitations.
+/// issue setup links and invitations, register clients.
 #[derive(Debug, Parser)]
 #[command(name = "genkanctl", version, about)]
 pub(crate) struct Cli {
@@ -42,6 +42,72 @@ pub(crate) enum Command {
     /// Invite a user, using your own kubeconfig (admin): creates the `User` if needed and a
     /// one-time enrolment link, printed for you to send.
     Invite(InviteArgs),
+    /// Register OAuth clients.
+    Client {
+        /// The client command to run.
+        #[command(subcommand)]
+        command: ClientCommand,
+    },
+}
+
+/// `genkanctl client` subcommands.
+#[derive(Debug, Subcommand)]
+pub(crate) enum ClientCommand {
+    /// Print an `OAuthClient` (JSON), for `genkanctl client create … | kubectl apply -f -`. A
+    /// confidential client gets a generated secret, printed once on stderr; only its hash goes
+    /// into the object.
+    Create(ClientCreateArgs),
+}
+
+/// Arguments of `genkanctl client create`.
+#[derive(Debug, Args)]
+pub(crate) struct ClientCreateArgs {
+    /// The client ID, also the object name: a lowercase DNS subdomain of at most 63 characters.
+    pub client_id: String,
+    /// `public` for clients that cannot keep a secret (kubectl, native and browser apps),
+    /// `confidential` for servers.
+    #[arg(long = "type", value_enum)]
+    pub kind: ClientKind,
+    /// Redirect URI (repeatable): `https://`, or `http://127.0.0.1` / `http://[::1]` with a path
+    /// for native apps; any port matches for those.
+    #[arg(long = "redirect-uri", required = true)]
+    pub redirect_uris: Vec<String>,
+    /// Audience the client may request tokens for (repeatable), for example `kubernetes`.
+    #[arg(long = "audience")]
+    pub audiences: Vec<String>,
+    /// Name shown on the sign-in pages.
+    #[arg(long)]
+    pub display_name: Option<String>,
+    /// Let the client request the `elevate` scope (short tokens with the user's `elevated:`
+    /// groups). Only for clients meant for administration, such as an admin `kubectl` context.
+    #[arg(long)]
+    pub allow_elevation: bool,
+    /// ID token signing algorithm, for a client that cannot verify `ES256`.
+    #[arg(long, value_enum)]
+    pub id_token_signing_alg: Option<SigningAlg>,
+    /// Namespace Genkan runs in.
+    #[arg(long, env = "GENKAN_NAMESPACE", default_value = genkan_k8s::rbac::DEFAULT_NAMESPACE)]
+    pub namespace: String,
+}
+
+/// Client type.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum ClientKind {
+    /// Identifies itself with its client ID only.
+    Public,
+    /// Authenticates at the token endpoint with a generated secret.
+    Confidential,
+}
+
+/// ID token signing algorithm.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum SigningAlg {
+    /// ECDSA P-256 (the default).
+    #[value(name = "ES256")]
+    Es256,
+    /// RSA PKCS #1 v1.5.
+    #[value(name = "RS256")]
+    Rs256,
 }
 
 /// Arguments of `genkanctl invite`.

@@ -331,16 +331,8 @@ kubectl's OIDC plugin ([kubelogin](https://github.com/int128/kubelogin)) is a pu
 that receives the code on a loopback redirect:
 
 ```sh
-kubectl apply -f - <<'EOF'
-apiVersion: genkan.engawahq.dev/v1alpha1
-kind: OAuthClient
-metadata: {name: kubectl, namespace: genkan-system}
-spec:
-  type: Public
-  redirectUris: ["http://127.0.0.1:8000/"]
-  audiences: [kubernetes]
-  allowElevation: true
-EOF
+genkanctl client create kubectl --type public --allow-elevation \
+  --redirect-uri http://127.0.0.1:8000/ --audience kubernetes | kubectl apply -f -
 genkanctl setup-link --issuer $ISSUER --username admin
 ```
 
@@ -429,6 +421,8 @@ Things to notice:
 
 - [Sign in with GitHub](github-sign-in.md) as an alternative to the passkey for ordinary
   access.
+- [Register more clients](clients.md), such as Grafana or Argo CD, so they sign people in
+  through Genkan too.
 
 ## Troubleshooting
 
@@ -439,8 +433,8 @@ Things to notice:
   `sudo journalctl -u k3s | grep -i "authentication config"`.
 - **`journalctl` finds no journal files on a cloned VM:** the machine ID changed; restart
   `systemd-journald`.
-- **Port 8000 in use:** kubelogin listens there for the redirect. Change `--listen-address`,
-  `--oidc-redirect-url` and the client's `redirectUris` together.
+- **Port 8000 in use:** kubelogin listens there for the redirect. Change `--listen-address` and
+  `--oidc-redirect-url` together; any port on `127.0.0.1` matches the registered redirect URI.
 
 ## Clean up
 

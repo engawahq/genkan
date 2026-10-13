@@ -89,6 +89,8 @@ There is no published image yet; the guide shows how to build one.
 Then:
 
 - [Sign in with GitHub](docs/github-sign-in.md) for teammates who prefer it.
+- [Register clients](docs/clients.md) such as Grafana or Argo CD, with
+  `genkanctl client create`.
 - [Manage users](docs/managing-users.md): groups, admin rights, lost passkeys, removing people;
   [provision them from a directory](docs/provisioning-users.md) with a small sync script.
 - `genkanctl invite --username alice` to send someone a one-time link. It needs the server

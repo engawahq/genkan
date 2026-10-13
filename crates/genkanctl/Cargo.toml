@@ -1,6 +1,6 @@
 [package]
 name = "genkanctl"
-description = "Genkan administration: install manifests, kube-apiserver configuration, setup links and invitations"
+description = "Genkan administration: install manifests, kube-apiserver configuration, setup links, invitations and client registration"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 genkan-core.workspace = true
 genkan-k8s.workspace = true
+genkan-keys.workspace = true
 clap.workspace = true
 kube.workspace = true
 serde_json.workspace = true

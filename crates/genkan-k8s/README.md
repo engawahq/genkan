@@ -18,8 +18,8 @@ garbage collection of expired objects, the install manifests, and the kube-apise
   from code; tests check `deploy/crds.json` and `deploy/rbac.json` against them.
 - [`kube_config`](crate::kube_config), [`internal_tls`](crate::internal_tls): the
   kube-apiserver configuration and the in-cluster discovery certificate.
-- [`invitations`](crate::invitations), [`setup`](crate::setup): the admin's side of
-  `genkanctl invite` and `genkanctl setup-link`.
+- [`invitations`](crate::invitations), [`setup`](crate::setup), [`clients`](crate::clients): the
+  admin's side of `genkanctl invite`, `genkanctl setup-link` and `genkanctl client create`.
 
 ## Place in the workspace
 
@@ -60,7 +60,8 @@ server, the `genkanctl` admin CLI and the `genkan-e2e` tests.
   short tokens issued right after a passkey sign-in, and the generated kube-apiserver
   configuration ([KEP-3331]) rejects any other token that carries them.
 - **Hashes only.** Grants, invitations, the setup token and client secrets are stored as
-  SHA-256 hashes of high-entropy values; credentials hold public keys.
+  SHA-256 hashes of high-entropy values; credentials hold public keys. Client secrets are
+  generated, never chosen, because an unsalted hash of a password could be reversed offline.
 
 ## References
 

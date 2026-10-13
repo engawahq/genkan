@@ -1057,6 +1057,43 @@ mod tests {
         ]))
         .await;
         assert_eq!(status, 400);
+
+        // A client from `genkanctl client create` passes admission and authenticates with the
+        // printed secret; a wrong secret is `invalid_client`.
+        let registration = genkan_k8s::clients::register(
+            genkan_k8s::clients::NewClient {
+                client_id: "dashboard".into(),
+                kind: ClientType::Confidential,
+                display_name: Some("Dashboard".into()),
+                redirect_uris: vec!["https://dash.example.com/callback".into()],
+                audiences: vec!["kubernetes".into()],
+                id_token_signing_alg: None,
+                allow_elevation: false,
+            },
+            &env.namespace,
+        )
+        .unwrap();
+        env.admin_api::<OAuthClient>()
+            .create(&pp, &registration.client)
+            .await
+            .unwrap();
+        let secret = registration.secret.unwrap();
+        for (presented, expected) in [
+            (secret.as_str(), "invalid_grant"),
+            (&"0".repeat(64), "invalid_client"),
+        ] {
+            let (_, _, body) = call(form(&[
+                ("grant_type", "authorization_code"),
+                ("code", "not-a-code"),
+                ("redirect_uri", "https://dash.example.com/callback"),
+                ("code_verifier", verifier),
+                ("client_id", "dashboard"),
+                ("client_secret", presented),
+            ]))
+            .await;
+            let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(error["error"], expected);
+        }
         drop(app);
         drop(server);
         env.cleanup().await;

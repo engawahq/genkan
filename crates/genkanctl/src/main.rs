@@ -9,7 +9,10 @@ use std::process::ExitCode;
 use clap::Parser as _;
 use genkan_core::clock::Clock as _;
 
-use crate::cli::{Cli, Command, InviteArgs, KubeConfigArgs, SetupLinkArgs};
+use crate::cli::{
+    Cli, ClientCommand, ClientCreateArgs, ClientKind, Command, InviteArgs, KubeConfigArgs,
+    SetupLinkArgs, SigningAlg,
+};
 
 fn main() -> ExitCode {
     match Cli::parse().command {
@@ -27,7 +30,44 @@ fn main() -> ExitCode {
         )),
         Command::KubeConfig(args) => kube_config(&args),
         Command::Invite(args) => invite(&args),
+        Command::Client {
+            command: ClientCommand::Create(args),
+        } => client_create(args),
     }
+}
+
+fn client_create(args: ClientCreateArgs) -> ExitCode {
+    use genkan_k8s::crd::client::ClientType;
+    let new = genkan_k8s::clients::NewClient {
+        kind: match args.kind {
+            ClientKind::Public => ClientType::Public,
+            ClientKind::Confidential => ClientType::Confidential,
+        },
+        id_token_signing_alg: args.id_token_signing_alg.map(|alg| match alg {
+            SigningAlg::Es256 => genkan_keys::Algorithm::Es256,
+            SigningAlg::Rs256 => genkan_keys::Algorithm::Rs256,
+        }),
+        client_id: args.client_id,
+        display_name: args.display_name,
+        redirect_uris: args.redirect_uris,
+        audiences: args.audiences,
+        allow_elevation: args.allow_elevation,
+    };
+    let registration = match genkan_k8s::clients::register(new, &args.namespace) {
+        Ok(registration) => registration,
+        Err(error) => {
+            output::stderr(&format!("error: {error}"));
+            return ExitCode::FAILURE;
+        }
+    };
+    let code = print_json(serde_json::to_string_pretty(&registration.client));
+    if let Some(secret) = registration.secret {
+        output::stderr(
+            "Client secret (shown only now; it cannot be recovered from the cluster, only replaced):",
+        );
+        output::stderr(&secret);
+    }
+    code
 }
 
 fn invite(args: &InviteArgs) -> ExitCode {
