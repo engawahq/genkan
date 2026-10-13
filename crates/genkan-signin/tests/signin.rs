@@ -9,6 +9,8 @@ mod tests {
     use axum::Router;
     use axum::body::Body;
     use axum::http::{HeaderMap, Method, Request, StatusCode, header};
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use genkan_core::clock::{Clock, UnixTime};
     use genkan_core::config::BaseUrl;
     use genkan_core::crypto::{Sealer, hash_secret};
@@ -466,11 +468,8 @@ mod tests {
             .split('.')
             .nth(1)
             .unwrap();
-        let claims: Value = serde_json::from_slice(
-            &base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload)
-                .unwrap(),
-        )
-        .unwrap();
+        let claims: Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap();
         assert_eq!(claims["sub"], ADMIN_UID);
         assert_eq!(claims["groups"], json!(["admins"]));
         assert_eq!(claims["amr"], json!(["swk", "mfa"]));
@@ -683,6 +682,16 @@ mod tests {
             (FLOW_COOKIE, flow.as_str()),
             (CEREMONY_COOKIE, ceremony.as_str()),
         ];
+        // Knowing an enrolled credential ID and handle is not proof of possession.
+        let mut forged = assertion.clone();
+        forged["response"]["signature"] = json!(URL_SAFE_NO_PAD.encode([0_u8; 64]));
+        let rejected = post(&h.app, "/login", json!({ "credential": forged }), &cookies).await;
+        assert_eq!(rejected.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(rejected.kind(), "urn:genkan:problem:passkey-failed");
+        let fields = &rejected.audit.as_ref().unwrap()["fields"];
+        assert!(fields.get("user").is_none());
+        assert!(fields.get("subject").is_none());
+        // Failed signature verification does not consume the valid ceremony.
         assert_eq!(
             post(
                 &h.app,
@@ -740,11 +749,10 @@ mod tests {
         h.service.oauth.directory.put_user(admin);
         let reply = sign_in(&h, &mut device).await;
         assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
-        assert_eq!(reply.audit.as_ref().unwrap()["fields"]["user"], "admin");
-        assert_eq!(
-            reply.audit.as_ref().unwrap()["fields"]["subject"],
-            ADMIN_UID
-        );
+        // Disabled users are rejected before signature verification, so no identity is asserted.
+        let fields = &reply.audit.as_ref().unwrap()["fields"];
+        assert!(fields.get("user").is_none());
+        assert!(fields.get("subject").is_none());
     }
 
     #[tokio::test]

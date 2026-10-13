@@ -519,8 +519,6 @@ where
             .await
             .map_err(internal)?
             .ok_or(PASSKEY_FAILED)?;
-        identity = Some(user);
-        let user = identity.as_ref().ok_or(PASSKEY_FAILED)?;
         // The user handle in the assertion must be the credential owner's (WebAuthn Level 3 §7.2).
         if user.disabled || user.subject != handle.to_string() {
             return Err(PASSKEY_FAILED);
@@ -530,6 +528,8 @@ where
             .passkeys
             .finish_sign_in(&request.credential, ceremony.state, &passkey)
             .map_err(|_error| PASSKEY_FAILED)?;
+        // A credential lookup alone does not authenticate the submitted assertion.
+        let user = identity.insert(user);
         // The challenge is single-use once it has produced a successful assertion.
         if service
             .used_ceremonies

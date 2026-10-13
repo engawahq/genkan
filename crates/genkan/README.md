@@ -86,6 +86,9 @@ deletion, not successful revocation.
 
 Optional `user` is the verified local User object name; `subject` is its local UID, not an
 upstream subject; `client` is an authenticated OAuth client. Unknown identity is omitted.
+Passkey sign-in identity is recorded only after assertion verification; a known credential ID
+alone does not attribute an attempt to its owner. Pre-verification rejections, including disabled
+users, omit identity.
 Setup-token-validated names may have no subject. Method/provider/reason values are controlled.
 Audit targeting intentionally loses the original Rust module target; no duplicate module field
 is added. Operational and dependency diagnostics retain their native targets and need not have
