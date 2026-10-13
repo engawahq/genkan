@@ -43,6 +43,8 @@ The examples use these names. Replace them with yours as you go:
 The host name must lead your computer to the server. With a domain of your own, add a DNS
 record. Names under `.test` never resolve on the internet, so for those add a line to your
 hosts file instead (`/etc/hosts`, or `C:\Windows\System32\drivers\etc\hosts` on Windows).
+WSL copies the Windows hosts file when it starts, so after editing it run `wsl --shutdown` in
+Windows and open a new WSL terminal.
 
 ## What you need
 
@@ -55,8 +57,9 @@ On **your computer**:
   (`kubectl krew install oidc-login`, after installing krew itself);
 - [mkcert](https://github.com/FiloSottile/mkcert), with its local CA trusted where your browser
   runs: run `mkcert -install` once (it may ask for your password). Firefox also needs NSS's
-  `certutil`; see mkcert's README. With WSL, the browser runs on Windows, so use the Windows
-  build of mkcert, both here and in step 5.
+  `certutil`; see mkcert's README. With WSL, the browser runs on Windows, so install the
+  Windows build (for example `winget install FiloSottile.mkcert`) and call it as `mkcert.exe`
+  from WSL, both here and in step 5.
 - `ssh` access to the server.
 
 On **the server**: Ubuntu 24.04 or later, 4 CPUs, 8 GiB memory, 30 GiB free disk, Docker, and
@@ -244,7 +247,8 @@ your browser accepts. This guide uses mkcert's local CA. With a real domain, use
 `ClusterIssuer` (ACME) and a `Certificate` instead.
 
 On your computer, issue a certificate for the issuer's host name and copy it to the server. Only the
-certificate and its key leave your computer; the CA's key stays.
+certificate and its key leave your computer; the CA's key stays. With WSL, write `mkcert.exe`
+instead of `mkcert`.
 
 ```sh
 mkcert -cert-file genkan.crt -key-file genkan.key genkan.example.test
@@ -494,6 +498,10 @@ wslpath "$(mkcert.exe -CAROOT | tr -d '\r')"   # e.g. /mnt/c/Users/you/AppData/L
 ```yaml
         --certificate-authority=/mnt/c/Users/you/AppData/Local/mkcert/rootCA.pem,
 ```
+
+kubelogin cannot open the Windows browser from WSL either. Instead it prints
+`Please visit the following URL in your browser manually: http://127.0.0.1:8000/`. Open that
+address in your browser, and the sign-in continues as usual.
 
 Keep `--oidc-use-access-token`: kube-apiserver accepts only Genkan's access tokens, not ID
 tokens.
