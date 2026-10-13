@@ -60,10 +60,13 @@ Nothing depends on it.
 ## Logging
 
 The server defaults to native tracing JSON: one object per line with `timestamp`, `level`,
-`target` and nested `fields`. Current span and span-list fields are omitted. This is not OTLP
+`target` and nested `fields`. JSON omits current span and span-list fields. This is not OTLP
 JSON, syslog, ECS or OCSF. `--log-format text` (or `GENKAN_LOG_FORMAT=text`) explicitly selects
-operator-facing text; ANSI is disabled in both formats. Clap help, version and syntax diagnostics
-and `genkanctl` machine-readable stdout are unchanged.
+operator-facing text; ANSI is disabled in both formats. Native text can render enclosing span
+context and does not provide the JSON span-omission contract. Use JSON for structured audit
+ingestion. Owned spans must not carry credential material; inherited dependency span context
+is outside the audit event-field guarantee. Clap help, version and syntax diagnostics and
+`genkanctl` machine-readable stdout are unchanged.
 
 Without `GENKAN_LOG`, the native `Targets` filter is `warn,genkan=info`: Genkan INFO and
 dependency WARN/ERROR. A supplied value replaces the **complete** filter, including an empty
@@ -92,7 +95,7 @@ users, omit identity.
 Setup-token-validated names may have no subject. Method/provider/reason values are controlled.
 Audit targeting intentionally loses the original Rust module target; no duplicate module field
 is added. Operational and dependency diagnostics retain their native targets and need not have
-business fields. Audit records omit raw errors and credential/token material. Owned operational
+business fields. Audit event fields omit raw errors and credential/token material. Owned operational
 diagnostics retain categorical reasons plus complete error details for troubleshooting.
 **Operational and dependency diagnostics have no no-secrets guarantee**: error text can include
 backend response details or sensitive data, even at WARN/ERROR. DEBUG/TRACE may expose more.
