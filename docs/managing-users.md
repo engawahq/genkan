@@ -48,8 +48,8 @@ Things to know:
 - **Anyone with the link can become Alice** until it is used or expires. Send it only to her.
 - **The link lasts 7 days.** Use `--valid-for 24h`, for example, for a shorter window.
 - **Options apply only to new users.** `--group`, `--elevated-group` and `--display-name` set
-  up a new user. For an existing username, the invitation only adds a passkey; it does not
-  change groups or the name.
+  up a new user. For an existing username, the invitation only adds a passkey or a linked
+  GitHub or Google account; it does not change groups or the name.
 - **Repeat `--group`** to add several groups.
 - **Genkan sends no mail.** The link goes to stdout and everything else to stderr, so a script
   can deliver it however your team works:
@@ -135,8 +135,9 @@ for admin rights, the sign-in page says so and shows for how long.
 ## Add another passkey or device
 
 Most passkeys sync through the platform account (iCloud Keychain, Google Password Manager), so
-a new phone usually needs nothing. For a separate security key, invite the same username again.
-The new link adds one passkey and leaves everything else as it is:
+a new phone usually needs nothing. For a separate security key, or to link a GitHub or Google
+account, invite the same username again. The new link adds one passkey or linked account and
+leaves everything else as it is:
 
 ```sh
 genkanctl invite --username alice

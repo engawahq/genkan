@@ -91,17 +91,21 @@ turns logging off. If the value cannot be parsed, Genkan falls back to the defau
 
 ### Audit events
 
-Every audit event has `target="genkan::audit"` and these fields:
+Every audit event has `target="genkan::audit"`. Its fields:
 
-| Field | Meaning |
-|---|---|
-| `event` | what happened, for example `auth.sign_in` |
-| `outcome` | `success` or `failure`; independent of the log level |
-| `reason` | optional, one of a fixed set of values |
-| `user` | optional: the verified local `User` name |
-| `subject` | optional: that user's local UID (not a GitHub or Google ID) |
-| `client` | optional: an authenticated OAuth client |
-| `method`, `provider` | how the person signed in; fixed sets of values |
+| Field | Present | Meaning |
+|---|---|---|
+| `event` | always | what happened, for example `auth.sign_in` |
+| `outcome` | always | `success` or `failure`; independent of the log level |
+| `reason` | sometimes | one of a fixed set of values |
+| `user` | sometimes | the verified local `User` name |
+| `subject` | sometimes | that user's local UID (not a GitHub or Google ID) |
+| `client` | sometimes | an authenticated OAuth client |
+| `method`, `provider` | events about signing in, enrolment and linking | how the person signed in; fixed sets of values |
+| `phase` | `auth.passkey_enrollment` | `start` or `finish` |
+
+Only `event` and `outcome` are always there; treat every other field as optional. OAuth code
+exchange, refresh and revocation events, for example, carry no `method` or `provider`.
 
 How to read them:
 

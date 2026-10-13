@@ -78,7 +78,7 @@ an issuer reads `GENKAN_ISSUER`, so these examples do not repeat `--issuer`.
 ```sh
 export GENKAN_ISSUER=https://login.example.com
 genkanctl crds | kubectl apply --server-side -f -
-genkanctl manifests --image <image> --serve-arg=--invitations | kubectl apply -f -
+genkanctl manifests --image <image> --serve-arg=--invitations | kubectl apply --server-side -f -
 # Prints kube-apiserver's configuration and how to install it for your distribution:
 genkanctl kube-config --distro k3s > authn.yaml
 # A one-time link: open it and create your passkey.

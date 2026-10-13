@@ -267,7 +267,9 @@ Before applying, a real tool should also:
 ## 4. Send new people their links
 
 The sync program creates users, but they still need a one-time link to set up a passkey. An
-admin sends it, as in [Add someone](managing-users.md#add-someone):
+admin sends it, as in [Add someone](managing-users.md#add-someone). The link works only if the
+Genkan server runs with `--invitations`; see
+[If the link does not work](managing-users.md#if-the-link-does-not-work).
 
 ```sh
 export GENKAN_ISSUER=https://genkan.example.test     # your issuer

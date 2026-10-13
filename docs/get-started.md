@@ -50,9 +50,9 @@ On **your computer**:
 
 - `kubectl`;
 - [kubelogin](https://github.com/int128/kubelogin), the `kubectl` plugin that opens the browser
-  to sign in. Install it with [krew](https://krew.sigs.k8s.io/) (`kubectl krew install
-  oidc-login`), Homebrew (`brew install int128/kubelogin/kubelogin`) or Nix
-  (`nixpkgs#kubelogin-oidc`);
+  to sign in. Install it with Homebrew (`brew install int128/kubelogin/kubelogin`), Nix
+  (`nixpkgs#kubelogin-oidc`), or [krew](https://krew.sigs.k8s.io/docs/user-guide/setup/install/)
+  (`kubectl krew install oidc-login`, after installing krew itself);
 - [mkcert](https://github.com/FiloSottile/mkcert), with its local CA trusted where your browser
   runs: run `mkcert -install` once (it may ask for your password). Firefox also needs NSS's
   `certutil`; see mkcert's README. With WSL, the browser runs on Windows, so use the Windows
@@ -63,7 +63,9 @@ On **the server**: Ubuntu 24.04 or later, 4 CPUs, 8 GiB memory, 30 GiB free disk
 Nix with flakes. Your user must be in the `docker` group. Use a machine that runs nothing else
 important: this guide installs k3s and changes its configuration.
 
-Set the SSH login once in each shell on your computer, so the commands below can use it:
+Keep two terminals open: one on your computer, and one logged in to the server. Each step says
+which one to use. In the terminal on your computer, set the SSH login so later commands can use
+it:
 
 ```sh
 SERVER=ubuntu@genkan.example.test
@@ -71,7 +73,13 @@ SERVER=ubuntu@genkan.example.test
 
 ## 1. Get the code
 
-On the server, clone both repositories into your home directory:
+Log in to the server from your computer:
+
+```sh
+ssh "$SERVER"
+```
+
+In that server shell, clone both repositories into your home directory:
 
 ```sh
 git clone https://github.com/engawahq/genkan.git ~/genkan
@@ -284,6 +292,13 @@ curl --cacert "$(mkcert -CAROOT)/rootCA.pem" \
   https://genkan.example.test/.well-known/openid-configuration
 ```
 
+With WSL and the Windows mkcert, `mkcert -CAROOT` prints a Windows path. Convert it first:
+
+```sh
+curl --cacert "$(wslpath "$(mkcert.exe -CAROOT | tr -d '\r')")/rootCA.pem" \
+  https://genkan.example.test/.well-known/openid-configuration
+```
+
 ### Before going public: rate-limit sign-in
 
 Skip this on a server only you can reach. Before you expose Genkan to the internet, limit how often one
@@ -348,34 +363,37 @@ kube-apiserver checks Genkan's tokens itself. To do that, it fetches Genkan's si
 an internal HTTPS connection. `genkanctl kube-config` creates the certificate for that
 connection and prints the configuration kube-apiserver needs.
 
-Write the new configuration to a temporary file and move it into place in one step, so
-kube-apiserver never reads a half-written file. It checks the file about once a minute.
+kube-apiserver checks the file about once a minute. To know when it has picked up your change,
+count its successful reloads before and after. Define two small helpers in the server shell:
 
 ```sh
-genkanctl kube-config --distro k3s > ~/authn.yaml &&
-  sudo install -m 600 ~/authn.yaml /etc/rancher/k3s/genkan/.authn.yaml.tmp &&
-  sudo mv /etc/rancher/k3s/genkan/.authn.yaml.tmp /etc/rancher/k3s/genkan/authn.yaml
-```
-
-Wait until kube-apiserver reports a successful reload. This loop checks its metrics every five
-seconds for up to three minutes, and prints the k3s log if the reload never succeeds:
-
-```sh
-reloaded=false
-for attempt in $(seq 1 36); do
-  if kubectl get --raw /metrics |
-    grep '^apiserver_authentication_config_controller_automatic_reloads_total' |
-    grep -q 'status="success"'; then
-    reloaded=true
-    break
-  fi
-  sleep 5
-done
-if [ "$reloaded" != true ]; then
+# Successful reloads of the authentication configuration so far.
+reloads() {
+  kubectl get --raw /metrics |
+    awk '/^apiserver_authentication_config_controller_automatic_reloads_total/ &&
+      /status="success"/ { n += $NF } END { print n + 0 }'
+}
+# Waits up to three minutes for the count to pass $1; prints the k3s log if it never does.
+wait_for_reload() {
+  for _ in $(seq 1 36); do
+    [ "$(reloads)" -gt "$1" ] && return 0
+    sleep 5
+  done
   echo "Authentication configuration did not reload; inspect k3s logs." >&2
   sudo journalctl -u k3s --since "5 minutes ago" --no-pager
-  false
-fi
+  return 1
+}
+```
+
+Then write the new configuration to a temporary file and move it into place in one step, so
+kube-apiserver never reads a half-written file, and wait for the reload:
+
+```sh
+before=$(reloads)
+genkanctl kube-config --distro k3s > ~/authn.yaml &&
+  sudo install -m 600 ~/authn.yaml /etc/rancher/k3s/genkan/.authn.yaml.tmp &&
+  sudo mv /etc/rancher/k3s/genkan/.authn.yaml.tmp /etc/rancher/k3s/genkan/authn.yaml &&
+  wait_for_reload "$before"
 ```
 
 The internal certificate is valid for a year. [Renew it](#once-a-year-renew-the-internal-certificate)
@@ -508,20 +526,30 @@ fetch Genkan's keys, and every sign-in to the cluster fails. Running `genkanctl 
 again replaces the certificate automatically when it has less than 30 days left;
 `--renew-certificate` replaces it now.
 
-On the server, with `GENKAN_ISSUER` exported as in step 4:
+On the server, with `GENKAN_ISSUER` exported as in step 4 and the `reloads` and
+`wait_for_reload` helpers from step 6 defined:
 
 ```sh
+before=$(reloads)
 authn=$(mktemp) &&
   genkanctl kube-config --distro k3s --renew-certificate > "$authn" &&
   sudo install -m 600 "$authn" /etc/rancher/k3s/genkan/.authn.yaml.tmp &&
   sudo mv /etc/rancher/k3s/genkan/.authn.yaml.tmp /etc/rancher/k3s/genkan/authn.yaml &&
-  rm "$authn"
+  rm "$authn" &&
+  wait_for_reload "$before"
 ```
 
-Renewal creates a new CA as well, so install the configuration this command prints, not the
-one from step 6. If any step fails, the `&&` chain stops and the installed file stays as it
-was. Sign-ins can fail briefly while Genkan and kube-apiserver both pick up the change (each
-within about a minute). Then run the reload check from step 6, and `kubectl auth whoami` on your computer.
+Renewal creates a new CA as well, so kube-apiserver needs the configuration this command
+prints, not the one from step 6. Sign-ins can fail briefly while Genkan and kube-apiserver both
+pick up the change (each within about a minute). Then run `kubectl auth whoami` on your
+computer.
+
+> [!WARNING]
+> `genkanctl` switches Genkan to the new certificate as soon as it runs. If a later command in
+> the chain fails, kube-apiserver still trusts the old CA, and sign-ins fail until you install
+> a matching configuration. To recover, run the same commands again **without**
+> `--renew-certificate`: `genkanctl` reuses the certificate it just created and prints the
+> configuration that matches it.
 
 To change the validity, use `--certificate-validity`; see the
 [genkanctl README](../crates/genkanctl/README.md#configure-token-limits-and-certificates).
@@ -531,9 +559,9 @@ To change the validity, use `--certificate-validity`; see the
 - **The browser shows a certificate error, or offers no passkey:** mkcert's CA is not trusted
   where the browser runs (`mkcert -install`), or the certificate's name does not match the
   issuer's host name.
-- **`kubectl` says `Unauthorized`:** run the reload check in step 6. If kube-apiserver finds an
-  error in the file, it ignores the file until it changes. On k3s, look for the reason with
-  `sudo journalctl -u k3s | grep -i "authentication config"`.
+- **`kubectl` says `Unauthorized`:** kube-apiserver may not have loaded the configuration from
+  step 6. If it finds an error in the file, it ignores the file until it changes. On k3s, look
+  for the reason with `sudo journalctl -u k3s | grep -i "authentication config"`.
 - **Port 8000 is in use:** kubelogin listens there for the browser's redirect. Change
   `--listen-address` and `--oidc-redirect-url` together; any port on `127.0.0.1` matches the
   registered redirect URI.
