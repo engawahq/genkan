@@ -7,6 +7,8 @@
 //!
 //! Run: `cargo nextest run --run-ignored only -E 'binary(kubernetes)'`
 
+mod redirect_uri_candidates;
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -427,6 +429,36 @@ mod tests {
                 &["https://app.example.com/bücher"][..],
                 None,
             ),
+            (
+                "c10",
+                ClientType::Public,
+                &["https://user@app.example.com/cb"][..],
+                None,
+            ),
+            (
+                "c11",
+                ClientType::Public,
+                &["http://127.0.0.1:8000"][..],
+                None,
+            ),
+            (
+                "c12",
+                ClientType::Public,
+                &["javascript:alert(1)"][..],
+                None,
+            ),
+            (
+                "c13",
+                ClientType::Public,
+                &["https://app.example.com/c b"][..],
+                None,
+            ),
+            (
+                "c14",
+                ClientType::Public,
+                &["https://app.example.com/cb", "http://[::2]/cb"][..],
+                None,
+            ),
         ] {
             let error = clients
                 .create(&pp, &client(name, kind, uris, secret))
@@ -444,6 +476,85 @@ mod tests {
             Some(422),
             "grant spec must be immutable: {error}"
         );
+
+        env.cleanup().await;
+    }
+
+    /// Generated redirect URIs, sent to admission as dry runs. Whatever `genkanctl client
+    /// create` emits must be admitted, and whatever admission lets in must be, to a browser,
+    /// either not a URL at all or an `https` / loopback `http` target without a fragment or
+    /// credentials: Go's parser behind `isURL()` must not open a way around the policy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs a Kubernetes cluster (KUBECONFIG)"]
+    async fn admission_and_genkanctl_agree_on_generated_redirect_uris() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+
+        use genkan_k8s::clients::redirect_uri_allowed;
+        use proptest::strategy::{Strategy as _, ValueTree as _};
+        use proptest::test_runner::TestRunner;
+        use url::{Host, Url};
+
+        let env = Env::new().await;
+        let clients: Api<OAuthClient> = env.admin_api();
+        let dry_run = PostParams {
+            dry_run: true,
+            ..PostParams::default()
+        };
+        let candidates = crate::redirect_uri_candidates::candidate();
+        let mut runner = TestRunner::deterministic();
+        let (mut admitted_count, mut allowed_count) = (0, 0);
+        let mut failures = Vec::new();
+        for i in 0..2000 {
+            let uri = candidates.new_tree(&mut runner).unwrap().current();
+            let client = OAuthClient::new(
+                &format!("p{i}"),
+                OAuthClientSpec {
+                    display_name: None,
+                    kind: ClientType::Public,
+                    redirect_uris: vec![uri.clone()],
+                    audiences: vec![],
+                    secret_hash: None,
+                    id_token_signing_alg: None,
+                    allow_elevation: false,
+                },
+            );
+            let admitted = match clients.create(&dry_run, &client).await {
+                Ok(_) => true,
+                Err(error) if status_code(&error) == Some(422) => false,
+                Err(error) => panic!("{uri:?}: {error}"),
+            };
+            let allowed = redirect_uri_allowed(&uri);
+            if allowed && !admitted {
+                failures.push(format!(
+                    "genkanctl accepts {uri:?} but admission rejects it"
+                ));
+            }
+            if admitted && let Ok(url) = Url::parse(&uri) {
+                let origin = match (url.scheme(), url.host()) {
+                    ("https", Some(_)) => true,
+                    ("http", Some(Host::Ipv4(ip))) => ip == Ipv4Addr::LOCALHOST,
+                    ("http", Some(Host::Ipv6(ip))) => ip == Ipv6Addr::LOCALHOST,
+                    _ => false,
+                };
+                if !(origin
+                    && url.fragment().is_none()
+                    && url.username().is_empty()
+                    && url.password().is_none())
+                {
+                    failures.push(format!(
+                        "admission accepts {uri:?}, which a browser reads as {url}"
+                    ));
+                }
+            }
+            admitted_count += usize::from(admitted);
+            allowed_count += usize::from(allowed);
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        assert!(
+            allowed_count > 100,
+            "too few accepted candidates: {allowed_count}"
+        );
+        assert!(admitted_count >= allowed_count);
 
         env.cleanup().await;
     }

@@ -1373,6 +1373,7 @@ dependencies = [
  "tokio-rustls",
  "tower",
  "tracing",
+ "url",
 ]
 
 [[package]]

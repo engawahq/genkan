@@ -43,7 +43,7 @@ pub enum ClientError {
     RedirectUriCount,
     /// A redirect URI that RFC 9700 §2.1 or RFC 8252 §7.3 forbids.
     #[error(
-        "redirect URI {0:?} must be https:// with a host, or http://127.0.0.1 or http://[::1] with a path; only ASCII URI characters, no fragment, at most {MAX_REDIRECT_URI} characters"
+        "redirect URI {0:?} must be https:// with a host, or http://127.0.0.1 or http://[::1] with a path, written as a browser normalizes it (lowercase, no default port, at least a / path, non-ASCII percent-encoded, every % followed by two hex digits), with no fragment or user information, at most {MAX_REDIRECT_URI} characters"
     )]
     InvalidRedirectUri(String),
     /// Too many audiences.
@@ -168,76 +168,51 @@ fn is_client_id(id: &str) -> bool {
         })
 }
 
-/// Whether the `OAuthClient` schema accepts `uri` as a redirect URI.
+/// Whether `uri` is a redirect URI a browser can follow and the `OAuthClient` schema accepts.
 ///
-/// The same rule as [`REDIRECT_URI_PATTERN`](crate::crd::client::REDIRECT_URI_PATTERN), without a
-/// regex engine. Either `https://` with a non-empty authority (RFC 3986 §3.2: a host name or an
-/// IPv6 literal, then an optional port), followed by nothing or by a path or query; or
-/// `http://127.0.0.1` / `http://[::1]` with an optional port and a path (RFC 8252 §7.3). Only
-/// RFC 3986 URI characters are allowed, so there is never a fragment (RFC 6749 §3.1.2),
-/// whitespace or non-ASCII, and the URI always fits in the `Location` header of the redirect back
-/// to the client.
+/// [`REDIRECT_URI_RULE`](crate::crd::client::REDIRECT_URI_RULE) is the floor: `https://` with a
+/// host, or `http://127.0.0.1` / `http://[::1]` with a path (RFC 9700 §2.1, RFC 8252 §7.3), no
+/// fragment (RFC 6749 §3.1.2) and no user information. On top of it, `uri` must parse as a URL
+/// the way a browser parses it (the WHATWG URL Standard, which the `url` crate implements) and be
+/// written exactly as that parse serializes it. So an address the browser rejects (`999.1.1.1`,
+/// `[:::]`, port 99999) fails here rather than at login, and the string registered for exact
+/// matching is the one the browser will use: lowercase scheme and host, no default port, and a
+/// `/` path at least. Every `%` must start a percent-encoded octet (RFC 3986 §2.1): a browser
+/// leaves a stray `%` alone, but Go's parser, and so admission, rejects it.
 #[must_use]
 pub fn redirect_uri_allowed(uri: &str) -> bool {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    use url::{Host, Url};
+
     if uri.len() > MAX_REDIRECT_URI {
         return false;
     }
-    if let Some(rest) = uri.strip_prefix("https://") {
-        let (authority, rest) = rest.split_at(rest.find(['/', '?']).unwrap_or(rest.len()));
-        return https_authority_allowed(authority) && rest.chars().all(is_uri_char);
-    }
-    let Some(rest) = uri
-        .strip_prefix("http://127.0.0.1")
-        .or_else(|| uri.strip_prefix("http://[::1]"))
-    else {
+    let Ok(url) = Url::parse(uri) else {
         return false;
     };
-    let path = match rest.strip_prefix(':') {
-        Some(port_and_path) => {
-            let (port, path) =
-                port_and_path.split_at(port_and_path.find('/').unwrap_or(port_and_path.len()));
-            if !port_allowed(port) {
-                return false;
-            }
-            path
-        }
-        None => rest,
+    let origin_allowed = match (url.scheme(), url.host()) {
+        ("https", Some(_)) => true,
+        ("http", Some(Host::Ipv4(ip))) => ip == Ipv4Addr::LOCALHOST,
+        ("http", Some(Host::Ipv6(ip))) => ip == Ipv6Addr::LOCALHOST,
+        _ => false,
     };
-    path.starts_with('/') && path.chars().all(is_uri_char)
+    origin_allowed
+        && url.as_str() == uri
+        && percent_encoding_well_formed(uri)
+        && url.fragment().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
 }
 
-/// `host [":" port]`, where host is a non-empty DNS-style name or a bracketed IPv6 literal.
-fn https_authority_allowed(authority: &str) -> bool {
-    let (host_allowed, after_host) = if let Some(literal) = authority.strip_prefix('[') {
-        let Some((address, after)) = literal.split_once(']') else {
-            return false;
-        };
-        let ipv6 = |c: char| c.is_ascii_hexdigit() || c == ':' || c == '.';
-        (!address.is_empty() && address.chars().all(ipv6), after)
-    } else {
-        let (host, after) = authority.split_at(authority.find(':').unwrap_or(authority.len()));
-        (!host.is_empty() && host.chars().all(is_host_char), after)
-    };
-    host_allowed
-        && (after_host.is_empty() || after_host.strip_prefix(':').is_some_and(port_allowed))
-}
-
-/// One to five digits.
-fn port_allowed(port: &str) -> bool {
-    (1..=5).contains(&port.len()) && port.chars().all(|c| c.is_ascii_digit())
-}
-
-/// The characters of a host name (letters, digits, `.`, `-`, `_`). RFC 3986 also allows
-/// sub-delimiters and percent-encoding in a registered name, but no DNS name uses them and HTTP
-/// libraries reject some of them.
-fn is_host_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || "._-".contains(c)
-}
-
-/// The characters of a path and query: RFC 3986 `pchar` (`unreserved`, `sub-delims`, `%`, `:`
-/// and `@`), `/` and `?`. No `#`, so no fragment.
-fn is_uri_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || "-._~!$&'()*+,;=%:@/?".contains(c)
+/// Whether every `%` is followed by two hex digits.
+fn percent_encoding_well_formed(uri: &str) -> bool {
+    uri.split('%').skip(1).all(|after| {
+        after
+            .as_bytes()
+            .get(..2)
+            .is_some_and(|digits| digits.iter().all(u8::is_ascii_hexdigit))
+    })
 }
 
 #[cfg(test)]
@@ -297,48 +272,35 @@ mod tests {
         assert!(value["spec"].get("secretHash").is_none());
     }
 
+    /// The policy, by example. `tests/redirect_uris.rs` checks generated candidates against
+    /// every parser on the way to the browser, and the cluster tests against admission.
     #[test]
-    fn redirect_uris_follow_the_schema_pattern() {
+    fn redirect_uris_are_https_or_loopback_in_the_form_a_browser_uses() {
         for allowed in [
             "https://dash.example.com/callback",
-            "https://dash.example.com",
-            "https://dash.example.com:8443/cb?x=1",
-            "https://dash.example.com?x=1",
-            "https://[2001:db8::1]:8443/cb",
-            "https://xn--bcher-kva.example/cb",
-            "http://127.0.0.1/",
+            "https://[2001:db8::1]:8443/cb?x=1",
             "http://127.0.0.1:8000/",
-            "http://[::1]:12345/cb",
-            "http://[::1]/",
+            "http://[::1]/cb",
         ] {
             assert!(redirect_uri_allowed(allowed), "{allowed}");
         }
         for forbidden in [
-            "http://example.com/",
+            // Not https or loopback (RFC 9700 §2.1, RFC 8252 §7.3).
             "http://localhost:8000/",
+            // A fragment or user information.
             "https://dash.example.com/cb#fragment",
-            "https://dash.example.com/c b",
-            "https://",
-            "javascript:alert(1)",
-            "http://127.0.0.1",
-            "http://127.0.0.1:8000",
-            "http://127.0.0.1:/",
-            "http://127.0.0.1:123456/",
-            "http://127.0.0.1.example.com/",
-            "http://[::1]x/",
-            "HTTPS://dash.example.com/",
-            "https:///callback",
-            "https://?x=1",
-            "https://:443/",
-            "https://dash.example.com:/",
-            "https://dash.example.com:443:1/",
             "https://user@dash.example.com/",
-            "https://[]/",
-            "https://[2001:db8::1/",
-            "https://bücher.example/",
-            "https://dash.example.com/bücher",
-            "https://dash.example.com/<script>",
-            "http://127.0.0.1:8000?x=1",
+            // Not a URL to a browser.
+            "https://[:::]/callback",
+            "https://999.999.999.999/callback",
+            "https://dash.example.com:99999/callback",
+            // A URL, but not as the browser writes it, so an exact match would miss.
+            "https://dash.example.com",
+            "https:///callback",
+            "http://127.0.0.1:8000",
+            // A stray `%`, which a browser keeps but Go's parser (admission) rejects.
+            "http://127.0.0.1:8000/c%",
+            "https://dash.example.com/%zz",
         ] {
             assert!(!redirect_uri_allowed(forbidden), "{forbidden}");
         }
@@ -346,22 +308,6 @@ mod tests {
             "https://e.com/{}",
             "a".repeat(MAX_REDIRECT_URI)
         )));
-    }
-
-    proptest::proptest! {
-        /// Whatever passes is usable as the redirect: a valid `Location` header value, and an
-        /// absolute URI with a scheme and a non-empty host.
-        #[test]
-        fn allowed_redirect_uris_are_absolute_and_fit_a_location_header(
-            uri in "(https://|http://127\\.0\\.0\\.1|http://\\[::1\\])[ -~\\u{80}-\\u{ff}]{0,24}"
-        ) {
-            if redirect_uri_allowed(&uri) {
-                proptest::prop_assert!(axum::http::HeaderValue::try_from(uri.as_str()).is_ok());
-                let parsed: axum::http::Uri = uri.parse().unwrap();
-                proptest::prop_assert!(parsed.scheme().is_some());
-                proptest::prop_assert!(parsed.host().is_some_and(|host| !host.is_empty()));
-            }
-        }
     }
 
     #[test]

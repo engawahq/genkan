@@ -23,9 +23,14 @@ genkanctl client create kubectl --type public \
 A redirect URI is `https://` with a host name (`https://app.example.com/callback`), or
 `http://127.0.0.1/…` or `http://[::1]/…` for apps that receive the code on the user's own
 machine. For those loopback addresses any port matches, so `kubectl` still works when it has to
-listen on a different port. Fragments, plain `http` to other hosts, and characters that are not
-allowed in a URI (spaces, non-ASCII: write `xn--` names and percent-encoded paths instead) are
+listen on a different port. Fragments, user information and plain `http` to other hosts are
 rejected.
+
+Genkan compares redirect URIs as exact strings, so `genkanctl` accepts a URI only in the form a
+browser writes it: lowercase scheme and host, no default port, at least a `/` path
+(`https://app.example.com/`, not `https://app.example.com`), `xn--` host names and
+percent-encoded paths instead of non-ASCII, and every `%` followed by two hex digits. It also
+rejects addresses a browser refuses, such as `999.1.1.1` or port `99999`.
 
 `--audience` lists what the client may request tokens for. Add `kubernetes` (the audience
 `genkanctl kube-config` configured) when the app calls the Kubernetes API as the signed-in user.
@@ -100,5 +105,7 @@ genkanctl client create grafana --type confidential --display-name Grafana \
   | kubectl apply --dry-run=client -o yaml -f - > grafana-client.yaml
 ```
 
-The cluster checks the same rules when the object is applied, so a hand-edited object with a bad
-redirect URI or a malformed `secretHash` fails at `kubectl apply`, not at sign-in.
+The cluster checks the same rules when the object is applied, so a hand-edited object with a
+plain `http` or fragment redirect URI or a malformed `secretHash` fails at `kubectl apply`, not at
+sign-in. The cluster parses URLs with Kubernetes' own `isURL()`, which is looser than a browser,
+so run hand-written redirect URIs through `genkanctl client create` to catch the rest.

@@ -360,12 +360,17 @@
                         "description": "Redirect URIs, compared by exact string match. Each is `https://` with a host, or\n`http://127.0.0.1` / `http://[::1]` with a path for native apps (RFC 8252 §7.3); ASCII URI\ncharacters only, no fragment.",
                         "items": {
                           "maxLength": 2048,
-                          "pattern": "^(https://([A-Za-z0-9._-]+|\\[[0-9A-Fa-f:.]+\\])(:[0-9]{1,5})?([/?][A-Za-z0-9._~!$&'()*+,;=%:@/?-]*)?|http://(127\\.0\\.0\\.1|\\[::1\\])(:[0-9]{1,5})?/[A-Za-z0-9._~!$&'()*+,;=%:@/?-]*)$",
                           "type": "string"
                         },
                         "maxItems": 16,
                         "minItems": 1,
-                        "type": "array"
+                        "type": "array",
+                        "x-kubernetes-validations": [
+                          {
+                            "message": "each redirect URI must be https:// with a host, or http://127.0.0.1 or http://[::1] with a path; printable ASCII, no fragment or user information",
+                            "rule": "self.all(u, u.matches('^[!-~]+$') && !u.contains('#') && isURL(u) && !u.matches('^[^/]*//[^/?]*@') && (url(u).getScheme() == 'https' ? url(u).getHostname() != '' : url(u).getScheme() == 'http' && url(u).getHostname() in ['127.0.0.1', '::1'] && url(u).getEscapedPath() != ''))"
+                          }
+                        ]
                       },
                       "secretHash": {
                         "description": "SHA-256 of the client secret, as `sha256:<64 hex digits>`. The secret itself is never\nstored.",

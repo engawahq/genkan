@@ -19,17 +19,20 @@ pub const MAX_REDIRECT_URI: usize = 2048;
 pub const MAX_AUDIENCES: usize = 16;
 /// Longest audience.
 pub const MAX_AUDIENCE: usize = 256;
-/// The pattern every redirect URI matches.
+/// The admission rule for redirect URIs (RFC 9700 §2.1, RFC 8252 §7.3).
 ///
-/// `https://` with a non-empty authority (a host name or an IPv6 literal, then an optional
-/// port) and an optional path or query, or loopback `http://` with an optional port and a path.
-/// Only RFC 3986 URI characters: no fragment, whitespace or non-ASCII.
-/// [`crate::clients::redirect_uri_allowed`] is the same rule in Rust, for tools that check before
-/// `kubectl apply`.
-pub const REDIRECT_URI_PATTERN: &str = concat!(
-    r"^(https://([A-Za-z0-9._-]+|\[[0-9A-Fa-f:.]+\])(:[0-9]{1,5})?",
-    r"([/?][A-Za-z0-9._~!$&'()*+,;=%:@/?-]*)?",
-    r"|http://(127\.0\.0\.1|\[::1\])(:[0-9]{1,5})?/[A-Za-z0-9._~!$&'()*+,;=%:@/?-]*)$",
+/// Each is a URL by Kubernetes' CEL `isURL()` (Go's `net/url`), and either `https` with a host or
+/// loopback `http` (`127.0.0.1` or `[::1]`) with a path. Printable ASCII only, so the redirect's
+/// `Location` header can carry it; no fragment (RFC 6749 §3.1.2) and no user information. This is
+/// the floor that keeps a GitOps mistake from reaching the server, not a full URL grammar: Go
+/// accepts some hosts and ports that browsers reject. [`crate::clients::redirect_uri_allowed`]
+/// adds a browser's (WHATWG) parse on top, for tools that check before `kubectl apply`.
+pub const REDIRECT_URI_RULE: &str = concat!(
+    "self.all(u, u.matches('^[!-~]+$') && !u.contains('#') && isURL(u)",
+    " && !u.matches('^[^/]*//[^/?]*@')",
+    " && (url(u).getScheme() == 'https' ? url(u).getHostname() != ''",
+    " : url(u).getScheme() == 'http' && url(u).getHostname() in ['127.0.0.1', '::1']",
+    " && url(u).getEscapedPath() != ''))",
 );
 /// The stored secret: [`genkan_core::crypto::hash_secret`]'s output.
 pub const SECRET_HASH_PATTERN: &str = r"^sha256:[0-9a-f]{64}$";
@@ -74,8 +77,11 @@ pub struct OAuthClientSpec {
     /// characters only, no fragment.
     #[schemars(
         length(min = 1, max = MAX_REDIRECT_URIS),
-        inner(length(max = MAX_REDIRECT_URI), regex(pattern = REDIRECT_URI_PATTERN))
+        inner(length(max = MAX_REDIRECT_URI))
     )]
+    #[x_kube(validation = Rule::new(REDIRECT_URI_RULE).message(
+        "each redirect URI must be https:// with a host, or http://127.0.0.1 or http://[::1] with a path; printable ASCII, no fragment or user information"
+    ))]
     pub redirect_uris: Vec<String>,
 
     /// Audiences this client may request tokens for (RFC 8707 resource indicators), for example
