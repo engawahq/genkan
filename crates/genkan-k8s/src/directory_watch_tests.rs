@@ -13,19 +13,18 @@ use axum::response::{IntoResponse as _, Response};
 use axum::{Json, Router};
 use futures_util::stream;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, mpsc};
 
 use super::{Api, Directory as _, KubeDirectory};
 
 const CLIENTS: &str = "oauthclients";
 const USERS: &str = "users";
 
-type ListReply = oneshot::Sender<Value>;
-type WatchSender = mpsc::UnboundedSender<Bytes>;
+type StreamSender = mpsc::UnboundedSender<Bytes>;
 
 enum BackendRequest {
-    List(&'static str, ListReply),
-    Watch(&'static str, WatchSender),
+    List(&'static str, StreamSender),
+    Watch(&'static str, StreamSender),
 }
 
 struct Backend {
@@ -76,36 +75,25 @@ async fn kubernetes(
     );
     let is_watch = form_urlencoded::parse(request.uri.query().unwrap_or_default().as_bytes())
         .any(|(key, value)| key == "watch" && value == "true");
-    if is_watch {
-        let (sender, receiver) = mpsc::unbounded_channel();
-        backend
-            .requests
-            .send(BackendRequest::Watch(resource, sender))
-            .unwrap();
-        drop(backend);
-        let chunks = stream::unfold(receiver, |mut receiver| async move {
-            receiver
-                .recv()
-                .await
-                .map(|bytes| (Ok::<_, std::convert::Infallible>(bytes), receiver))
-        });
-        Response::builder()
-            .header("content-type", "application/json")
-            .body(Body::from_stream(chunks))
-            .unwrap()
+    let (sender, receiver) = mpsc::unbounded_channel();
+    let request = if is_watch {
+        BackendRequest::Watch(resource, sender)
     } else {
         *backend.lists.entry(resource).or_default() += 1;
-        let (reply, response) = oneshot::channel();
-        backend
-            .requests
-            .send(BackendRequest::List(resource, reply))
-            .unwrap();
-        drop(backend);
-        response.await.map_or_else(
-            |_| status(StatusCode::SERVICE_UNAVAILABLE, "ServiceUnavailable"),
-            |objects| Json(objects).into_response(),
-        )
-    }
+        BackendRequest::List(resource, sender)
+    };
+    backend.requests.send(request).unwrap();
+    drop(backend);
+    let chunks = stream::unfold(receiver, |mut receiver| async move {
+        receiver
+            .recv()
+            .await
+            .map(|bytes| (Ok::<_, std::convert::Infallible>(bytes), receiver))
+    });
+    Response::builder()
+        .header("content-type", "application/json")
+        .body(Body::from_stream(chunks))
+        .unwrap()
 }
 
 fn status(code: StatusCode, reason: &str) -> Response {
@@ -136,13 +124,16 @@ fn metadata(object: &Value) -> Value {
         "metadata":object["metadata"]})
 }
 
-fn reply_list(reply: ListReply, items: &[Value], continuation: &str) {
+fn reply_list(reply: StreamSender, items: &[Value]) {
     reply
-        .send(
+        .send(Bytes::from(
             json!({"apiVersion":"meta.k8s.io/v1", "kind":"PartialObjectMetadataList",
-            "metadata":{"resourceVersion":"100", "continue":continuation}, "items":items}),
-        )
+                "metadata":{"resourceVersion":"100"}, "items":items})
+            .to_string(),
+        ))
         .unwrap();
+    // Finish this HTTP response; watch streams deliberately keep their sender alive instead.
+    drop(reply);
 }
 
 async fn bounded<F: Future>(future: F) -> F::Output {
@@ -168,18 +159,15 @@ fn assert_pending<F: Future>(future: Pin<&mut F>) {
 }
 
 struct Mock {
-    directory: KubeDirectory,
     backend: Arc<Mutex<Backend>>,
     requests: mpsc::UnboundedReceiver<BackendRequest>,
-    pending_lists: HashMap<&'static str, ListReply>,
-    streams: HashMap<&'static str, WatchSender>,
-    shutdown: watch::Sender<bool>,
-    watcher: tokio::task::JoinHandle<()>,
+    pending_lists: HashMap<&'static str, StreamSender>,
+    streams: HashMap<&'static str, StreamSender>,
     server: tokio::task::JoinHandle<()>,
 }
 
 impl Mock {
-    async fn unready(clients: Vec<Value>, users: Vec<Value>, stopping: bool) -> Self {
+    async fn start(clients: Vec<Value>, users: Vec<Value>) -> (Self, kube::Client) {
         let (requests, receiver) = mpsc::unbounded_channel();
         let collect = |objects: Vec<Value>| {
             objects
@@ -209,34 +197,33 @@ impl Mock {
             format!("http://{address}").parse().unwrap(),
         ))
         .unwrap();
-        let (shutdown, shutdown_rx) = watch::channel(stopping);
-        let (directory, watcher) = KubeDirectory::new(
-            Api::namespaced(client.clone(), "test"),
-            Api::namespaced(client, "test"),
-            shutdown_rx,
-        );
-        Self {
-            directory,
-            backend,
-            requests: receiver,
-            pending_lists: HashMap::new(),
-            streams: HashMap::new(),
-            shutdown,
-            watcher,
-            server,
-        }
+        (
+            Self {
+                backend,
+                requests: receiver,
+                pending_lists: HashMap::new(),
+                streams: HashMap::new(),
+                server,
+            },
+            client,
+        )
     }
 
-    async fn new(clients: Vec<Value>, users: Vec<Value>) -> Self {
-        let mut mock = Self::unready(clients, users, false).await;
+    async fn new(clients: Vec<Value>, users: Vec<Value>) -> (Self, KubeDirectory) {
+        let (mut mock, client) = Self::start(clients, users).await;
+        let mut construction = std::pin::pin!(KubeDirectory::new(
+            Api::namespaced(client.clone(), "test"),
+            Api::namespaced(client, "test"),
+        ));
+        assert_pending(construction.as_mut());
         for resource in [CLIENTS, USERS] {
             let reply = mock.take_list(resource).await;
-            reply_list(reply, &mock.snapshot(resource).await, "");
+            reply_list(reply, &mock.snapshot(resource).await);
         }
-        bounded(mock.directory.wait_until_ready()).await.unwrap();
+        let directory = bounded(construction).await.unwrap();
         mock.connect_watch(CLIENTS).await;
         mock.connect_watch(USERS).await;
-        mock
+        (mock, directory)
     }
 
     async fn receive(&mut self) {
@@ -250,7 +237,7 @@ impl Mock {
         }
     }
 
-    async fn take_list(&mut self, resource: &'static str) -> ListReply {
+    async fn take_list(&mut self, resource: &'static str) -> StreamSender {
         loop {
             if let Some(reply) = self.pending_lists.remove(resource) {
                 return reply;
@@ -301,84 +288,64 @@ impl Mock {
             .copied()
             .unwrap_or_default()
     }
-
-    fn has_client(&self, name: &str) -> bool {
-        self.directory
-            .client_index
-            .find(|object| object.metadata.name.as_deref() == Some(name))
-            .is_some()
-    }
-
-    async fn stop(&mut self) {
-        self.shutdown.send(true).unwrap();
-        bounded(&mut self.watcher).await.unwrap();
-    }
 }
 
 impl Drop for Mock {
     fn drop(&mut self) {
-        self.shutdown.send_replace(true);
-        self.watcher.abort();
         self.server.abort();
     }
 }
 
+fn has_client(directory: &KubeDirectory, name: &str) -> bool {
+    directory
+        .client_index
+        .find(|object| object.metadata.name.as_deref() == Some(name))
+        .is_some()
+}
+
 #[tokio::test]
-async fn initial_snapshots_gate_resource_reads_until_all_pages_complete() {
-    let known = client("known");
-    let alice = user("alice", "uid-alice");
-    let mut mock = Mock::unready(vec![known.clone()], vec![alice.clone()], false).await;
-    let clients = mock.take_list(CLIENTS).await;
-    let users = mock.take_list(USERS).await;
-    let directory = mock.directory.clone();
-    let mut ready = std::pin::pin!(directory.wait_until_ready());
-    let mut client_lookup = std::pin::pin!(directory.client("known"));
-    let mut user_lookup = std::pin::pin!(directory.user("alice"));
-    let mut subject_lookup = std::pin::pin!(directory.user_by_subject("uid-alice"));
-    assert_pending(ready.as_mut());
-    assert_pending(client_lookup.as_mut());
-    assert_pending(user_lookup.as_mut());
-    assert_pending(subject_lookup.as_mut());
-    reply_list(clients, &[metadata(&known)], "next-page");
-    reply_list(users, &[metadata(&alice)], "");
-    let second_page = mock.take_list(CLIENTS).await;
-    bounded(directory.user_index.wait_until_ready())
-        .await
-        .unwrap();
-    assert!(!mock.has_client("known"));
-    assert_pending(ready.as_mut());
-    assert_pending(client_lookup.as_mut());
-    assert_pending(user_lookup.as_mut());
-    assert_pending(subject_lookup.as_mut());
-    assert!(mock.backend.lock().await.gets.is_empty());
-    reply_list(second_page, &[], "");
-    bounded(ready).await.unwrap();
-    assert!(bounded(client_lookup).await.unwrap().is_some());
-    assert!(bounded(user_lookup).await.unwrap().is_some());
-    assert!(bounded(subject_lookup).await.unwrap().is_some());
-    mock.stop().await;
+async fn constructor_waits_for_both_initial_snapshots() {
+    for first in [CLIENTS, USERS] {
+        let known = client("known");
+        let alice = user("alice", "uid-alice");
+        let (mut mock, client) = Mock::start(vec![known], vec![alice]).await;
+        let mut construction = std::pin::pin!(KubeDirectory::new(
+            Api::namespaced(client.clone(), "test"),
+            Api::namespaced(client, "test"),
+        ));
+        assert_pending(construction.as_mut());
+        let clients = mock.take_list(CLIENTS).await;
+        let users = mock.take_list(USERS).await;
+        let (first_reply, second_reply, second) = if first == CLIENTS {
+            (clients, users, USERS)
+        } else {
+            (users, clients, CLIENTS)
+        };
+        reply_list(first_reply, &mock.snapshot(first).await);
+        mock.connect_watch(first).await;
+        assert_pending(construction.as_mut());
+        assert!(mock.backend.lock().await.gets.is_empty());
+        reply_list(second_reply, &mock.snapshot(second).await);
+        let directory = bounded(construction).await.unwrap();
+        assert!(directory.client("known").await.unwrap().is_some());
+        assert!(directory.user("alice").await.unwrap().is_some());
+        assert!(
+            directory
+                .user_by_subject("uid-alice")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
 }
 
 #[tokio::test]
 async fn unique_unknown_identifiers_never_read_resources() {
-    let mock = Mock::new(vec![], vec![]).await;
+    let (mock, directory) = Mock::new(vec![], vec![]).await;
     for number in 0..4096 {
         let unknown = format!("unknown-{number}");
-        assert!(
-            mock.directory
-                .clone()
-                .client(&unknown)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            mock.directory
-                .user_by_subject(&unknown)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(directory.client(&unknown).await.unwrap().is_none());
+        assert!(directory.user_by_subject(&unknown).await.unwrap().is_none());
     }
     let backend = mock.backend.lock().await;
     assert!(backend.gets.is_empty());
@@ -388,15 +355,15 @@ async fn unique_unknown_identifiers_never_read_resources() {
 
 #[tokio::test]
 async fn client_create_delete_events_update_existence_index() {
-    let mock = Mock::new(vec![], vec![]).await;
+    let (mock, directory) = Mock::new(vec![], vec![]).await;
     let created = client("created");
     mock.put(CLIENTS, created.clone()).await;
-    assert!(mock.directory.client("created").await.unwrap().is_none());
+    assert!(directory.client("created").await.unwrap().is_none());
     assert_eq!(mock.gets("oauthclients/created").await, 0);
     mock.event(CLIENTS, "ADDED", &metadata(&created));
-    wait_for(|| mock.has_client("created")).await;
-    assert!(mock.directory.client("created").await.unwrap().is_some());
-    let cached = mock.directory.client_index.find(|_| true).unwrap();
+    wait_for(|| has_client(&directory, "created")).await;
+    assert!(directory.client("created").await.unwrap().is_some());
+    let cached = directory.client_index.find(|_| true).unwrap();
     assert!(
         serde_json::to_value(cached.as_ref())
             .unwrap()
@@ -411,18 +378,18 @@ async fn client_create_delete_events_update_existence_index() {
         .unwrap()
         .remove("created");
     // Stale existence metadata never authorizes an object deleted before its watch event.
-    assert!(mock.directory.client("created").await.unwrap().is_none());
+    assert!(directory.client("created").await.unwrap().is_none());
     mock.event(CLIENTS, "DELETED", &metadata(&created));
-    wait_for(|| !mock.has_client("created")).await;
-    assert!(mock.directory.client("created").await.unwrap().is_none());
+    wait_for(|| !has_client(&directory, "created")).await;
+    assert!(directory.client("created").await.unwrap().is_none());
     assert_eq!(mock.gets("oauthclients/created").await, 2);
 }
 
 #[tokio::test]
 async fn known_clients_read_latest_authorization_during_watch_interruption() {
-    let mut mock = Mock::new(vec![client("known")], vec![]).await;
+    let (mut mock, directory) = Mock::new(vec![client("known")], vec![]).await;
     assert_eq!(
-        mock.directory
+        directory
             .client("known")
             .await
             .unwrap()
@@ -439,7 +406,7 @@ async fn known_clients_read_latest_authorization_during_watch_interruption() {
     updated["spec"]["redirectUris"] = json!(["https://changed.example/callback"]);
     updated["spec"]["audiences"] = json!(["changed-audience"]);
     mock.put(CLIENTS, updated).await;
-    let current = mock.directory.client("known").await.unwrap().unwrap();
+    let current = directory.client("known").await.unwrap().unwrap();
     assert_eq!(current.display_name.as_deref(), Some("Updated"));
     assert_eq!(current.kind, genkan_store::ClientType::Confidential);
     assert_eq!(
@@ -449,22 +416,18 @@ async fn known_clients_read_latest_authorization_during_watch_interruption() {
     assert_eq!(current.redirect_uris, ["https://changed.example/callback"]);
     assert_eq!(current.audiences, ["changed-audience"]);
     mock.backend.lock().await.fail_gets = true;
-    assert!(mock.directory.client("known").await.is_err());
+    assert!(directory.client("known").await.is_err());
     mock.backend.lock().await.fail_gets = false;
-    assert!(mock.directory.client("known").await.unwrap().is_some());
+    assert!(directory.client("known").await.unwrap().is_some());
     assert_eq!(mock.gets("oauthclients/known").await, 4);
-    mock.connect_watch(CLIENTS).await;
-    assert_eq!(mock.backend.lock().await.lists[CLIENTS], 1);
-    mock.stop().await;
 }
 
 #[tokio::test]
 async fn subject_lookup_reads_current_authorization_without_per_request_lists() {
     let original = user("alice", "uid-alice");
-    let mock = Mock::new(vec![], vec![original.clone()]).await;
+    let (mock, directory) = Mock::new(vec![], vec![original.clone()]).await;
     assert!(
-        !mock
-            .directory
+        !directory
             .user_by_subject("uid-alice")
             .await
             .unwrap()
@@ -475,28 +438,20 @@ async fn subject_lookup_reads_current_authorization_without_per_request_lists() 
     disabled["spec"]["disabled"] = json!(true);
     disabled["spec"]["groups"] = json!([]);
     mock.put(USERS, disabled).await;
-    let current = mock
-        .directory
+    let current = directory
         .user_by_subject("uid-alice")
         .await
         .unwrap()
         .unwrap();
     assert!(current.disabled);
     assert_eq!(current.groups, Vec::<String>::new());
-    assert!(
-        mock.directory
-            .user("alice")
-            .await
-            .unwrap()
-            .unwrap()
-            .disabled
-    );
-    assert!(mock.directory.user("absent").await.unwrap().is_none());
-    assert!(mock.directory.user("absent").await.unwrap().is_none());
+    assert!(directory.user("alice").await.unwrap().unwrap().disabled);
+    assert!(directory.user("absent").await.unwrap().is_none());
+    assert!(directory.user("absent").await.unwrap().is_none());
     assert_eq!(mock.gets("users/alice").await, 3);
     assert_eq!(mock.gets("users/absent").await, 2);
     assert_eq!(mock.backend.lock().await.lists[USERS], 1);
-    let cached = mock.directory.user_index.find(|_| true).unwrap();
+    let cached = directory.user_index.find(|_| true).unwrap();
     assert!(
         serde_json::to_value(cached.as_ref())
             .unwrap()
@@ -508,9 +463,9 @@ async fn subject_lookup_reads_current_authorization_without_per_request_lists() 
 #[tokio::test]
 async fn deleted_recreated_user_never_substitutes_subject() {
     let original = user("alice", "old-uid");
-    let mock = Mock::new(vec![], vec![original.clone()]).await;
+    let (mock, directory) = Mock::new(vec![], vec![original.clone()]).await;
     assert!(
-        mock.directory
+        directory
             .user_by_subject("old-uid")
             .await
             .unwrap()
@@ -524,7 +479,7 @@ async fn deleted_recreated_user_never_substitutes_subject() {
         .unwrap()
         .remove("alice");
     assert!(
-        mock.directory
+        directory
             .user_by_subject("old-uid")
             .await
             .unwrap()
@@ -533,14 +488,14 @@ async fn deleted_recreated_user_never_substitutes_subject() {
     let recreated = user("alice", "new-uid");
     mock.put(USERS, recreated.clone()).await;
     assert!(
-        mock.directory
+        directory
             .user_by_subject("old-uid")
             .await
             .unwrap()
             .is_none()
     );
     assert!(
-        mock.directory
+        directory
             .user_by_subject("new-uid")
             .await
             .unwrap()
@@ -550,21 +505,21 @@ async fn deleted_recreated_user_never_substitutes_subject() {
     mock.event(USERS, "DELETED", &metadata(&original));
     mock.event(USERS, "ADDED", &metadata(&recreated));
     wait_for(|| {
-        mock.directory
+        directory
             .user_index
             .find(|object| object.metadata.uid.as_deref() == Some("new-uid"))
             .is_some()
     })
     .await;
     assert!(
-        mock.directory
+        directory
             .user_by_subject("old-uid")
             .await
             .unwrap()
             .is_none()
     );
     assert_eq!(
-        mock.directory
+        directory
             .user_by_subject("new-uid")
             .await
             .unwrap()
@@ -577,96 +532,58 @@ async fn deleted_recreated_user_never_substitutes_subject() {
 
 #[tokio::test]
 async fn ambiguous_subjects_fail_closed_without_resource_reads() {
-    let mock = Mock::new(
+    let (mock, directory) = Mock::new(
         vec![],
         vec![user("alice", "duplicate"), user("bob", "duplicate")],
     )
     .await;
     assert!(
-        mock.directory
+        directory
             .user_by_subject("duplicate")
             .await
             .unwrap()
             .is_none()
     );
-    assert!(
-        mock.directory
-            .user_by_subject("absent")
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(directory.user_by_subject("absent").await.unwrap().is_none());
     assert!(mock.backend.lock().await.gets.is_empty());
 }
 
 #[tokio::test]
-async fn watch_reconnect_and_atomic_relist_recover_metadata_index() {
-    let old = client("old");
-    let retained = client("retained");
-    let mut mock = Mock::new(vec![old, retained.clone()], vec![]).await;
-    drop(mock.streams.remove(CLIENTS).unwrap());
-    mock.connect_watch(CLIENTS).await;
-    assert!(mock.has_client("old"));
-    mock.event(
-        CLIENTS,
-        "ERROR",
-        &json!({"apiVersion":"v1", "kind":"Status", "status":"Failure",
-        "code":410, "reason":"Gone", "message":"resource version expired"}),
-    );
-    drop(mock.streams.remove(CLIENTS).unwrap());
-    let first_page = mock.take_list(CLIENTS).await;
-    mock.backend
-        .lock()
-        .await
-        .objects
-        .get_mut(CLIENTS)
-        .unwrap()
-        .remove("old");
+async fn cancelling_constructor_closes_both_initial_list_streams() {
+    let (mut mock, client) = Mock::start(vec![], vec![]).await;
+    let (clients, users) = {
+        let mut construction = std::pin::pin!(KubeDirectory::new(
+            Api::namespaced(client.clone(), "test"),
+            Api::namespaced(client, "test"),
+        ));
+        assert_pending(construction.as_mut());
+        let clients = mock.take_list(CLIENTS).await;
+        let users = mock.take_list(USERS).await;
+        assert!(!clients.is_closed());
+        assert!(!users.is_closed());
+        assert_pending(construction.as_mut());
+        (clients, users)
+    };
+    bounded(async {
+        tokio::join!(clients.closed(), users.closed());
+    })
+    .await;
+    assert!(mock.backend.lock().await.gets.is_empty());
+}
+
+#[tokio::test]
+async fn clones_keep_watchers_alive_until_last_directory_drops() {
+    let (mock, directory) = Mock::new(vec![], vec![]).await;
+    let KubeDirectory { _watcher: task, .. } = &directory;
+    let watcher = task.0.abort_handle();
+    let clone = directory.clone();
+    drop(directory);
     let created = client("created");
     mock.put(CLIENTS, created.clone()).await;
-    reply_list(first_page, &[metadata(&created)], "next-page");
-    let second_page = mock.take_list(CLIENTS).await;
-    // The reflector keeps the previous complete index until all relist pages are published.
-    assert!(mock.has_client("old"));
-    assert!(!mock.has_client("created"));
-    assert!(mock.directory.client("old").await.unwrap().is_none());
-    assert!(mock.directory.client("created").await.unwrap().is_none());
-    assert!(mock.directory.client("retained").await.unwrap().is_some());
-    assert_eq!(mock.gets("oauthclients/created").await, 0);
-    reply_list(second_page, &[metadata(&retained)], "");
-    wait_for(|| mock.has_client("created") && !mock.has_client("old")).await;
-    assert!(mock.directory.client("created").await.unwrap().is_some());
-    assert_eq!(mock.directory.client_index.len(), 2);
-    mock.connect_watch(CLIENTS).await;
-    mock.stop().await;
-}
-
-#[tokio::test]
-async fn shutdown_before_initial_sync_fails_readiness() {
-    let mut mock = Mock::unready(vec![], vec![], false).await;
-    let _clients = mock.take_list(CLIENTS).await;
-    let _users = mock.take_list(USERS).await;
-    mock.stop().await;
-    assert!(bounded(mock.directory.wait_until_ready()).await.is_err());
-    assert!(bounded(mock.directory.client("absent")).await.is_err());
-    assert!(mock.backend.lock().await.gets.is_empty());
-
-    let mut already_stopping = Mock::unready(vec![], vec![], true).await;
-    bounded(&mut already_stopping.watcher).await.unwrap();
-    assert!(
-        bounded(already_stopping.directory.wait_until_ready())
-            .await
-            .is_err()
-    );
-    assert!(already_stopping.backend.lock().await.lists.is_empty());
-}
-
-#[tokio::test]
-async fn aborted_watch_task_before_initial_sync_fails_readiness() {
-    let mut mock = Mock::unready(vec![], vec![], false).await;
-    let _clients = mock.take_list(CLIENTS).await;
-    let _users = mock.take_list(USERS).await;
-    mock.watcher.abort();
-    assert!(bounded(&mut mock.watcher).await.unwrap_err().is_cancelled());
-    assert!(bounded(mock.directory.wait_until_ready()).await.is_err());
+    mock.event(CLIENTS, "ADDED", &metadata(&created));
+    wait_for(|| has_client(&clone, "created")).await;
+    assert!(clone.client("created").await.unwrap().is_some());
+    assert!(!watcher.is_finished());
+    drop(clone);
+    wait_for(|| watcher.is_finished()).await;
 }

@@ -3,15 +3,13 @@
 //! Kubernetes mode binds the internal port first, failing immediately if it is unavailable.
 //! Startup refuses to bind the public port until directory metadata watches publish their initial
 //! snapshots and signing keys are reconciled. Background tasks watch metadata, rotate keys,
-//! collect expired grants and invitations, and serve internal TLS. Startup failure signals
-//! shutdown to any tasks already running.
+//! collect expired grants and invitations, and serve internal TLS.
 //! With the Kubernetes store, if the API server becomes unreachable, Genkan keeps serving the
 //! last published keys; logins and refreshes that need a write fail closed, and the background
 //! tasks retry.
 
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::serve::Listener as _;
@@ -20,7 +18,7 @@ use genkan_core::crypto::Sealer;
 use genkan_k8s::crd::grant::Grant;
 use genkan_k8s::crd::invitation::Invitation;
 use genkan_k8s::credentials::KubeCredentialStore;
-use genkan_k8s::directory::{INITIAL_SYNC_TIMEOUT, KubeDirectory};
+use genkan_k8s::directory::KubeDirectory;
 use genkan_k8s::gc;
 use genkan_k8s::grants::KubeGrantStore;
 use genkan_k8s::keys::SecretKeyStore;
@@ -94,7 +92,6 @@ pub enum ServeError {
 /// fails.
 pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let outcome = async {
     match &config.store {
         Store::Memory => {
             tracing::warn!(
@@ -108,7 +105,7 @@ pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
                 MemoryCredentialStore::default(),
                 MemorySetupStore::default(),
             );
-            run(&config, stores, Vec::new(), None, shutdown_tx.clone()).await
+            run(&config, stores, Vec::new(), None, shutdown_tx).await
         }
         Store::Kubernetes {
             namespace,
@@ -129,17 +126,11 @@ pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
                 key_secret.clone(),
             );
             let mut background = Vec::new();
-            let (directory, watcher) = KubeDirectory::new(
+            let directory = KubeDirectory::new(
                 Api::namespaced(client.clone(), &namespace),
                 Api::namespaced(client.clone(), &namespace),
-                shutdown_rx.clone(),
-            );
-            background.push(watcher);
-            tokio::time::timeout(INITIAL_SYNC_TIMEOUT, directory.wait_until_ready())
-                .await
-                .map_err(|_elapsed| {
-                    ServeError::Config("directory metadata initial synchronization timed out".into())
-                })??;
+            )
+            .await?;
             let grants = KubeGrantStore::new(Api::namespaced(client.clone(), &namespace));
             let credentials = KubeCredentialStore::new(Api::namespaced(client.clone(), &namespace));
             let mut setup = KubeSetupStore::new(Api::namespaced(client.clone(), &namespace));
@@ -163,15 +154,11 @@ pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
                 (keys, directory, grants, credentials, setup),
                 background.into_iter().chain([gc]).collect(),
                 Some((internal_listener, resolver, internal_secrets)),
-                shutdown_tx.clone(),
+                shutdown_tx,
             )
             .await
         }
     }
-    }.await;
-    // Startup failures must also terminate any watchers already spawned.
-    shutdown_tx.send_replace(true);
-    outcome
 }
 
 /// The configured upstream providers, with their client secrets read from files.
@@ -204,26 +191,12 @@ fn upstream_providers(config: &ServeConfig) -> Result<Vec<Provider>, ServeError>
 }
 
 /// Maps load shedding to an immediate retryable response without logging request secrets.
-fn admission_error(
-    error: &axum::BoxError,
-    rejected: &AtomicU64,
-    router: &'static str,
-) -> axum::response::Response {
+fn admission_error(error: &axum::BoxError) -> axum::response::Response {
     use axum::http::{StatusCode, header};
     use axum::response::IntoResponse as _;
 
     if error.is::<tower::load_shed::error::Overloaded>() {
-        let rejected_total = rejected.fetch_add(1, Ordering::Relaxed) + 1;
-        // Every rejection is counted, but a flood must not become a synchronous log-write flood.
-        // Power-of-two milestones bound warning volume logarithmically without another task/timer.
-        if rejected_total.is_power_of_two() {
-            tracing::warn!(
-                event = "request_overload",
-                router,
-                rejected_total,
-                "request rejected for load"
-            );
-        }
+        tracing::debug!("request rejected for load");
         (
             StatusCode::SERVICE_UNAVAILABLE,
             [
@@ -245,17 +218,13 @@ fn admission_error(
 /// Overload uses `503` with a one-second retry suggestion ([RFC 9110 §15.6.4]).
 ///
 /// [RFC 9110 §15.6.4]: https://www.rfc-editor.org/rfc/rfc9110.html#section-15.6.4
-fn business_limits(router: axum::Router, name: &'static str) -> axum::Router {
-    let rejected = Arc::new(AtomicU64::new(0));
+fn business_limits(router: axum::Router) -> axum::Router {
     // Materialize deferred handlers once: otherwise axum can rebuild a per-service semaphore
     // when supplying state at request/connection time instead of sharing it across route clones.
     router.with_state(()).layer(
         tower::ServiceBuilder::new()
             .layer(axum::error_handling::HandleErrorLayer::new(
-                move |error: axum::BoxError| {
-                    let rejected = Arc::clone(&rejected);
-                    async move { admission_error(&error, &rejected, name) }
-                },
+                |error: axum::BoxError| async move { admission_error(&error) },
             ))
             .load_shed()
             .concurrency_limit(ROUTE_CONCURRENT),
@@ -337,33 +306,21 @@ async fn run<S: KeyStore, D: Directory, G: GrantStore, K: CredentialStore, T: Se
         manager.subscribe(),
         config.metadata_max_age,
     ))
-    .merge(business_limits(
-        endpoints::router(Arc::clone(&server)),
-        "oauth",
-    ))
-    .merge(business_limits(
-        genkan_signin::router(Arc::clone(&sign_in)),
-        "signin",
-    ))
-    .merge(business_limits(
-        pages::router(Arc::clone(&server), &kinds),
-        "pages",
-    ));
+    .merge(business_limits(endpoints::router(Arc::clone(&server))))
+    .merge(business_limits(genkan_signin::router(Arc::clone(&sign_in))))
+    .merge(business_limits(pages::router(Arc::clone(&server), &kinds)));
     if !providers.is_empty() {
         let roots = genkan_tls::trust::roots(config.upstream_ca_file.as_deref())
             .map_err(|error| ServeError::Config(error.to_string()))?;
         let http =
             HyperClient::new(roots).map_err(|error| ServeError::Config(error.to_string()))?;
         tracing::info!(providers = ?kinds, "upstream sign-in enabled");
-        app = app.merge(business_limits(
-            upstream::router(Arc::new(Upstream {
-                sign_in,
-                providers,
-                http,
-                used_states: OneTimeIds::default(),
-            })),
-            "upstream",
-        ));
+        app = app.merge(business_limits(upstream::router(Arc::new(Upstream {
+            sign_in,
+            providers,
+            http,
+            used_states: OneTimeIds::default(),
+        }))));
     }
     let app = limits(app);
     let listener = TcpListener::bind(config.listen).await?;
@@ -452,7 +409,7 @@ mod tests {
             axum::Router::new()
                 .route("/readyz", get(|| async { StatusCode::OK }))
                 .route("/healthz", get(|| async { StatusCode::OK }))
-                .merge(business_limits(business, "test")),
+                .merge(business_limits(business)),
         );
         let mut tasks = Vec::new();
         for _ in 0..ROUTE_CONCURRENT {
@@ -533,24 +490,9 @@ mod tests {
     }
 
     #[test]
-    fn admission_errors_count_only_overload() {
-        let rejected = Arc::new(AtomicU64::new(0));
-        for expected in 1..=2 {
-            let response = admission_error(
-                &tower::load_shed::error::Overloaded::new().into(),
-                &rejected,
-                "test",
-            );
-            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-            assert_eq!(rejected.load(Ordering::Relaxed), expected);
-        }
-        let response = admission_error(
-            &io::Error::other("unexpected middleware failure").into(),
-            &rejected,
-            "test",
-        );
+    fn unexpected_admission_errors_return_internal_server_error() {
+        let response = admission_error(&io::Error::other("unexpected middleware failure").into());
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(rejected.load(Ordering::Relaxed), 2);
         assert!(!response.headers().contains_key(header::RETRY_AFTER));
     }
 }

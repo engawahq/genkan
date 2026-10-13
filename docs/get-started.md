@@ -290,12 +290,10 @@ and [Gateway middleware prerequisites](https://doc.traefik.io/traefik/reference/
 Genkan additionally limits each business route/method service to 64 concurrent requests.
 Full services immediately return `503` with `Retry-After: 1`, without queuing ahead of the
 ten-second handler timeout. Health/readiness probes and discovery/keys do not share those
-slots. These are per-process concurrency limits, not per-IP rate limits. Structured
-`request_overload` events expose cumulative rejection counts at power-of-two milestones, not
-one warning per rejection. `kubernetes_directory_lookup` events sample the first and every
-64th directory GET attempt, exposing resource, operation, outcome, process-wide `lookup_total`
-and API latency in milliseconds instead of writing an INFO event for each GET.
-Aggregate them in your log backend.
+slots. These are per-process concurrency limits, not per-IP rate limits. Overload events are
+logged at DEBUG, not WARN, and directory GETs do not emit per-request INFO logs. Enabling
+DEBUG during a flood can generate substantial log traffic; keep the normal INFO level for
+production incident handling.
 
 Kubernetes directory metadata is watched before the public listener starts. Unknown client
 names are rejected locally, including a flood of distinct random IDs; known clients still

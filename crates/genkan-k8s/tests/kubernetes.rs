@@ -827,7 +827,7 @@ mod tests {
     async fn oauth_flow_on_kubernetes_storage() {
         use genkan_core::config::BaseUrl;
         use genkan_core::crypto::Sealer;
-        use genkan_k8s::directory::{INITIAL_SYNC_TIMEOUT, KubeDirectory};
+        use genkan_k8s::directory::KubeDirectory;
         use genkan_k8s::grants::KubeGrantStore;
         use genkan_oauth::authorize::Authentication;
         use genkan_oauth::endpoints::{FLOW_COOKIE, complete_authorization, router};
@@ -875,12 +875,8 @@ mod tests {
             RotationPolicy::DEFAULT,
         );
         manager.reconcile().await.unwrap();
-        let (directory_shutdown, directory_shutdown_rx) = watch::channel(false);
-        let (directory, directory_task) =
-            KubeDirectory::new(env.genkan_api(), env.genkan_api(), directory_shutdown_rx);
-        tokio::time::timeout(INITIAL_SYNC_TIMEOUT, directory.wait_until_ready())
+        let directory = KubeDirectory::new(env.genkan_api(), env.genkan_api())
             .await
-            .unwrap()
             .unwrap();
         let server = Arc::new(AuthorizationServer {
             issuer: BaseUrl::parse("issuer", "https://login.example.com").unwrap(),
@@ -1002,8 +998,8 @@ mod tests {
         ]))
         .await;
         assert_eq!(status, 400);
-        directory_shutdown.send(true).unwrap();
-        directory_task.await.unwrap();
+        drop(app);
+        drop(server);
         env.cleanup().await;
     }
 

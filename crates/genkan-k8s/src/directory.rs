@@ -16,8 +16,8 @@
 //! [UID]: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#uids
 
 use std::fmt::Debug;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::StreamExt as _;
 use genkan_keys::Algorithm;
@@ -25,12 +25,11 @@ use genkan_store::{Client, Directory, StoreError, User};
 use kube::api::Api;
 use kube::core::{NamespaceResourceScope, PartialObjectMeta};
 use kube::runtime::WatchStreamExt as _;
-use kube::runtime::reflector::Store;
 use kube::runtime::reflector::store::Writer;
+use kube::runtime::reflector::{self, ObjectRef, Store};
 use kube::runtime::watcher::{self, watcher};
 use kube::{Resource, ResourceExt as _};
 use serde::de::DeserializeOwned;
-use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::crd::client::OAuthClient;
@@ -48,6 +47,7 @@ pub struct KubeDirectory {
     users: Api<UserObject>,
     client_index: Store<PartialObjectMeta<OAuthClient>>,
     user_index: Store<PartialObjectMeta<UserObject>>,
+    _watcher: Arc<WatchTask>,
 }
 
 impl Debug for KubeDirectory {
@@ -56,60 +56,69 @@ impl Debug for KubeDirectory {
     }
 }
 
-impl KubeDirectory {
-    /// Starts metadata-only watches in the same namespaces as the supplied APIs.
-    ///
-    /// Keep the returned task alive until shutdown and call [`Self::wait_until_ready`] before
-    /// serving requests. Aborting the task before its initial snapshots makes readiness fail.
-    #[must_use]
-    pub fn new(
-        clients: Api<OAuthClient>,
-        users: Api<UserObject>,
-        shutdown: watch::Receiver<bool>,
-    ) -> (Self, JoinHandle<()>) {
-        let client_writer = Writer::default();
-        let user_writer = Writer::default();
-        let directory = Self {
-            client_index: client_writer.as_reader(),
-            user_index: user_writer.as_reader(),
-            clients,
-            users,
-        };
-        let client_metadata = metadata_api(&directory.clients);
-        let user_metadata = metadata_api(&directory.users);
-        let task = tokio::spawn(async move {
-            tokio::join!(
-                run_index(client_metadata, client_writer, shutdown.clone(), "client"),
-                run_index(user_metadata, user_writer, shutdown, "user"),
-            );
-        });
-        (directory, task)
-    }
+/// The last directory clone owns cancellation; construction failure also drops this guard.
+struct WatchTask(JoinHandle<()>);
 
-    /// Waits for both metadata indexes to contain their complete initial snapshots.
+impl Drop for WatchTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl KubeDirectory {
+    /// Returns a directory only after both metadata snapshots initialize.
+    ///
+    /// Watches use the supplied API namespaces and stop when the last directory clone drops.
     ///
     /// # Errors
     ///
-    /// Returns an error if either watch task stops before its initial snapshot completes.
-    /// The caller must bound startup waiting when the API server remains unavailable.
-    pub async fn wait_until_ready(&self) -> Result<(), StoreError> {
-        tokio::try_join!(
-            self.client_index.wait_until_ready(),
-            self.user_index.wait_until_ready(),
-        )
-        .map(|_| ())
+    /// Returns an error if initial synchronization fails or exceeds [`INITIAL_SYNC_TIMEOUT`].
+    /// Cancelling construction also stops its watchers.
+    pub async fn new(
+        clients: Api<OAuthClient>,
+        users: Api<UserObject>,
+    ) -> Result<Self, StoreError> {
+        let (client_index, client_writer) = reflector::store();
+        let (user_index, user_writer) = reflector::store();
+        let client_metadata = metadata_api(&clients);
+        let user_metadata = metadata_api(&users);
+        let watcher = Arc::new(WatchTask(tokio::spawn(async move {
+            tokio::join!(
+                run_index(client_metadata, client_writer, "client"),
+                run_index(user_metadata, user_writer, "user"),
+            );
+        })));
+        tokio::time::timeout(INITIAL_SYNC_TIMEOUT, async {
+            tokio::try_join!(
+                client_index.wait_until_ready(),
+                user_index.wait_until_ready(),
+            )
+        })
+        .await
+        .map_err(|_elapsed| {
+            StoreError("directory metadata initial synchronization timed out".into())
+        })?
         .map_err(|error| {
             StoreError(format!(
                 "directory metadata index did not initialize: {error}"
             ))
+        })?;
+        Ok(Self {
+            clients,
+            users,
+            client_index,
+            user_index,
+            _watcher: watcher,
         })
     }
 
     async fn read_user(&self, name: &str) -> Result<Option<User>, StoreError> {
-        let sample = sample_lookup();
-        let result = self.users.get_opt(name).await;
-        record_lookup("user", sample, &result);
-        Ok(result.map_err(|e| backend(&e))?.and_then(convert))
+        Ok(self
+            .users
+            .get_opt(name)
+            .await
+            .map_err(|e| backend(&e))?
+            .and_then(convert))
     }
 }
 
@@ -124,11 +133,9 @@ where
     }
 }
 
-/// Each writer publishes relists only on `InitDone`, preserving the last complete snapshot.
 async fn run_index<K>(
     api: Api<PartialObjectMeta<K>>,
-    mut writer: Writer<PartialObjectMeta<K>>,
-    mut shutdown: watch::Receiver<bool>,
+    writer: Writer<PartialObjectMeta<K>>,
     resource: &'static str,
 ) where
     K: Resource<Scope = NamespaceResourceScope, DynamicType = ()>
@@ -139,72 +146,19 @@ async fn run_index<K>(
         + Sync
         + 'static,
 {
-    let mut events = watcher(api, watcher::Config::default())
+    reflector::reflector(writer, watcher(api, watcher::Config::default()))
         .default_backoff()
-        .boxed();
-    while !*shutdown.borrow() {
-        tokio::select! {
-            biased;
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    break;
-                }
+        .for_each(|event| async move {
+            if let Err(error) = event {
+                tracing::warn!(
+                    event = "kubernetes_directory_watch",
+                    resource,
+                    %error,
+                    "directory metadata watch error; retrying with backoff"
+                );
             }
-            event = events.next() => match event {
-                Some(Ok(event)) => writer.apply_watcher_event(&event),
-                Some(Err(error)) => {
-                    tracing::warn!(
-                        event = "kubernetes_directory_watch",
-                        resource,
-                        outcome = "error",
-                        %error,
-                        "directory metadata watch error; retrying with backoff"
-                    );
-                }
-                None => {
-                    tracing::warn!(
-                        event = "kubernetes_directory_watch",
-                        resource,
-                        outcome = "stopped",
-                        "directory metadata watch stopped"
-                    );
-                    break;
-                }
-            },
-        }
-    }
-}
-
-/// Count every attempted GET; only the first and every 64th need a clock read and log event.
-fn sample_lookup() -> Option<(u64, Instant)> {
-    static LOOKUPS: AtomicU64 = AtomicU64::new(0);
-    let total = LOOKUPS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-    (total == 1 || total.is_multiple_of(64)).then(|| (total, Instant::now()))
-}
-
-/// Only bounded resource and outcome labels are logged; object names and errors may carry PII.
-fn record_lookup<T>(
-    resource: &'static str,
-    sample: Option<(u64, Instant)>,
-    result: &Result<Option<T>, kube::Error>,
-) {
-    let Some((lookup_total, started)) = sample else {
-        return;
-    };
-    let outcome = match result {
-        Ok(Some(_)) => "found",
-        Ok(None) => "not_found",
-        Err(_) => "error",
-    };
-    tracing::info!(
-        event = "kubernetes_directory_lookup",
-        resource,
-        operation = "get",
-        outcome,
-        lookup_total,
-        latency_ms = started.elapsed().as_secs_f64() * 1000.0,
-        "Kubernetes directory API lookup"
-    );
+        })
+        .await;
 }
 
 fn backend(error: &kube::Error) -> StoreError {
@@ -213,17 +167,18 @@ fn backend(error: &kube::Error) -> StoreError {
 
 impl Directory for KubeDirectory {
     async fn client(&self, id: &str) -> Result<Option<Client>, StoreError> {
-        self.wait_until_ready().await?;
-        if self
-            .client_index
-            .find(|object| object.metadata.name.as_deref() == Some(id))
-            .is_none()
-        {
+        let indexed = self.clients.namespace().map_or_else(
+            // Preserve the all-namespaces API contract; names alone are not store keys there.
+            || {
+                self.client_index
+                    .find(|object| object.metadata.name.as_deref() == Some(id))
+            },
+            |namespace| self.client_index.get(&ObjectRef::new(id).within(namespace)),
+        );
+        if indexed.is_none() {
             return Ok(None);
         }
-        let sample = sample_lookup();
         let result = self.clients.get_opt(id).await;
-        record_lookup("client", sample, &result);
         Ok(result.map_err(|e| backend(&e))?.map(|object| {
             let id = object.name_any();
             let spec = object.spec;
@@ -240,12 +195,10 @@ impl Directory for KubeDirectory {
     }
 
     async fn user(&self, name: &str) -> Result<Option<User>, StoreError> {
-        self.wait_until_ready().await?;
         self.read_user(name).await
     }
 
     async fn user_by_subject(&self, subject: &str) -> Result<Option<User>, StoreError> {
-        self.wait_until_ready().await?;
         // Filter under one store read lock so an ambiguous snapshot never picks an arbitrary user.
         // Only matching metadata is cloned, not a full snapshot of every user.
         let matches = self
