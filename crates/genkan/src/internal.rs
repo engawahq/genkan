@@ -68,9 +68,10 @@ pub async fn run<C: Clock>(
         let material = match secrets.get_opt(internal_tls::SECRET).await {
             Ok(Some(secret)) => match internal_tls::parse(&secret) {
                 Ok(material) => material,
-                Err(_error) => {
+                Err(error) => {
                     tracing::error!(
                         reason = "invalid_certificate",
+                        %error,
                         "internal listener: unusable certificate"
                     );
                     continue;
@@ -86,9 +87,10 @@ pub async fn run<C: Clock>(
                 }
                 continue;
             }
-            Err(_error) => {
+            Err(error) => {
                 tracing::warn!(
                     reason = "certificate_read_failed",
+                    %error,
                     "internal listener: reading the certificate failed"
                 );
                 continue;
@@ -113,8 +115,8 @@ pub async fn run<C: Clock>(
         });
         resolver.set(Arc::clone(&material.key));
     }
-    if let Err(_error) = server.await {
-        tracing::error!(reason = "internal_task_failed", "internal listener failed");
+    if let Err(error) = server.await {
+        tracing::error!(%error, reason = "internal_task_failed", "internal listener failed");
     }
 }
 
@@ -142,11 +144,11 @@ fn start(
         let stopped = async move {
             drop(shutdown.wait_for(|stop| *stop).await);
         };
-        if let Err(_error) = axum::serve(listener, app)
+        if let Err(error) = axum::serve(listener, app)
             .with_graceful_shutdown(stopped)
             .await
         {
-            tracing::error!(reason = "http_failed", "internal listener stopped");
+            tracing::error!(%error, reason = "http_failed", "internal listener stopped");
         }
     })
 }

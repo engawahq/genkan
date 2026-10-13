@@ -182,8 +182,8 @@ pub(crate) fn json<T: Serialize>(status: StatusCode, body: &T) -> Response {
     response
 }
 
-pub(crate) fn internal(_error: impl std::fmt::Display) -> Problem {
-    tracing::error!(reason = "internal_error", "sign-in failed");
+pub(crate) fn internal(error: impl std::fmt::Display) -> Problem {
+    tracing::error!(reason = "internal_error", %error, "sign-in failed");
     Problem::internal()
 }
 
@@ -367,7 +367,10 @@ where
         let passkey: Passkey = service
             .passkeys
             .finish_registration(&request.credential, &ceremony.state)
-            .map_err(|_error| PASSKEY_FAILED)?;
+            .map_err(|error| {
+                tracing::warn!(reason = PASSKEY_FAILED.kind, %error, "passkey registration verification failed");
+                PASSKEY_FAILED
+            })?;
         if service
             .used_ceremonies
             .first_use(&ceremony.id, ceremony.expires_at, "", now)
@@ -505,7 +508,10 @@ where
         let (handle, credential_id) = service
             .passkeys
             .identify(&request.credential)
-            .map_err(|_unknown| PASSKEY_FAILED)?;
+            .map_err(|error| {
+                tracing::warn!(reason = PASSKEY_FAILED.kind, %error, "passkey identification failed");
+                PASSKEY_FAILED
+            })?;
         let stored = service
             .credentials
             .get(&credential_name(&credential_id))
@@ -527,7 +533,10 @@ where
         service
             .passkeys
             .finish_sign_in(&request.credential, ceremony.state, &passkey)
-            .map_err(|_error| PASSKEY_FAILED)?;
+            .map_err(|error| {
+                tracing::warn!(reason = PASSKEY_FAILED.kind, %error, "passkey sign-in verification failed");
+                PASSKEY_FAILED
+            })?;
         // A credential lookup alone does not authenticate the submitted assertion.
         let user = identity.insert(user);
         // The challenge is single-use once it has produced a successful assertion.
@@ -545,7 +554,10 @@ where
             amr: PASSKEY_AMR.iter().map(|m| (*m).to_owned()).collect(),
         };
         let location = complete_authorization(&service.oauth, &flow, authentication)
-            .map_err(|_error| NO_REQUEST)?;
+            .map_err(|error| {
+                tracing::warn!(reason = NO_REQUEST.kind, ?error, "passkey authorization failed");
+                NO_REQUEST
+            })?;
         let mut response = json(
             StatusCode::OK,
             &SignInResponse {
@@ -625,23 +637,5 @@ mod tests {
         assert_eq!(cookie(&h, FLOW_COOKIE), Some("xyz"));
         assert_eq!(cookie(&h, "b"), Some("2"));
         assert_eq!(cookie(&h, "c"), None);
-    }
-
-    #[test]
-    fn internal_diagnostics_do_not_format_secret_bearing_errors() {
-        let capture = genkan_test_support::logging::Capture::new();
-        let problem = tracing::dispatcher::with_default(&capture.dispatch(), || {
-            internal("secret-bearing-signin-error-sentinel")
-        });
-        assert_eq!(problem, Problem::internal());
-        let records = capture.records();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0]["target"], "genkan_signin");
-        assert_eq!(records[0]["fields"]["reason"], "internal_error");
-        assert!(
-            !serde_json::to_string(&records)
-                .unwrap()
-                .contains("secret-bearing-signin-error-sentinel")
-        );
     }
 }

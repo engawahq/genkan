@@ -180,8 +180,8 @@ async fn authorize<D: Directory, G: GrantStore, C: Clock>(
         None => None,
         Some(id) => match server.directory.client(id).await {
             Ok(client) => client,
-            Err(_error) => {
-                tracing::error!(reason = "storage_failed", "client lookup failed");
+            Err(error) => {
+                tracing::error!(%error, reason = "storage_failed", "client lookup failed");
                 return local_error(lang, &OAuthError::server());
             }
         },
@@ -420,8 +420,8 @@ const INVALID_GRANT: OAuthError = OAuthError::new(
     "the grant is invalid, expired, revoked or was issued to another client",
 );
 
-fn store_error(_error: impl std::fmt::Display) -> OAuthError {
-    tracing::error!(reason = "storage_failed", "storage failed");
+fn store_error(error: impl std::fmt::Display) -> OAuthError {
+    tracing::error!(%error, reason = "storage_failed", "storage failed");
     OAuthError::server()
 }
 

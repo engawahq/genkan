@@ -116,8 +116,8 @@ pub async fn userinfo<D: Directory, G: GrantStore, C: Clock>(
     let user = match server.directory.user_by_subject(&claims.sub).await {
         Ok(Some(user)) if user.subject == claims.sub && !user.disabled => user,
         Ok(_) => return invalid(),
-        Err(_error) => {
-            tracing::error!(reason = "storage_failed", "user lookup failed");
+        Err(error) => {
+            tracing::error!(%error, reason = "storage_failed", "user lookup failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };

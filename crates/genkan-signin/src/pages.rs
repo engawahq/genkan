@@ -44,8 +44,8 @@ async fn login<D: Directory, G: GrantStore, C: Clock>(
         Some(flow) => match server.directory.client(&flow.request.client_id).await {
             Ok(Some(client)) => Some(client.display_name.unwrap_or(client.id)),
             Ok(None) => None,
-            Err(_error) => {
-                tracing::error!(reason = "client_lookup_failed", "client lookup failed");
+            Err(error) => {
+                tracing::error!(reason = "client_lookup_failed", %error, "client lookup failed");
                 None
             }
         },

@@ -19,10 +19,11 @@ fn serve(args: &ServeArgs) -> ExitCode {
     init_logging(args.log_format);
     let config = match args.config() {
         Ok(config) => config,
-        Err(_error) => {
+        Err(error) => {
             tracing::error!(
                 event = "server.configuration",
                 reason = "invalid_configuration",
+                %error,
                 "configuration failed"
             );
             return ExitCode::from(2);
@@ -34,9 +35,10 @@ fn serve(args: &ServeArgs) -> ExitCode {
         .build()
     {
         Ok(runtime) => runtime,
-        Err(_error) => {
+        Err(error) => {
             tracing::error!(
                 reason = "runtime_creation_failed",
+                %error,
                 "starting the async runtime failed"
             );
             return ExitCode::FAILURE;
@@ -45,7 +47,7 @@ fn serve(args: &ServeArgs) -> ExitCode {
     match runtime.block_on(genkan::serve::serve(config)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            let reason = match error {
+            let reason = match &error {
                 ServeError::Kubernetes(_) => "kubernetes_unavailable",
                 ServeError::Keys(_) => "signing_keys_failed",
                 ServeError::Directory(_) => "directory_unavailable",
@@ -53,7 +55,7 @@ fn serve(args: &ServeArgs) -> ExitCode {
                 ServeError::Config(_) => "invalid_configuration",
                 ServeError::Io(_) => "http_failed",
             };
-            tracing::error!(reason, "exiting");
+            tracing::error!(reason, %error, "exiting");
             ExitCode::FAILURE
         }
     }

@@ -303,16 +303,20 @@ where
         let subject = provider
             .identify(&service.http, exchange, now)
             .await
-            .map_err(|_error| ("provider_verification_failed", m.upstream_failed))?;
+            .map_err(|error| {
+                tracing::warn!(reason = "provider_verification_failed", %error, "upstream provider verification failed");
+                ("provider_verification_failed", m.upstream_failed)
+            })?;
         let issuer = provider.kind().issuer();
         let name = external_credential_name(issuer, &subject);
         let linked = sign_in
             .credentials
             .linked_user(&name)
             .await
-            .map_err(|_error| {
+            .map_err(|error| {
                 tracing::error!(
                     reason = "credential_lookup_failed",
+                    %error,
                     "credential lookup failed"
                 );
                 ("credential_lookup_failed", m.generic_error)
@@ -323,7 +327,10 @@ where
                 .directory
                 .user(&user)
                 .await
-                .map_err(|_error| ("user_lookup_failed", m.upstream_failed))?;
+                .map_err(|error| {
+                    tracing::warn!(reason = "user_lookup_failed", %error, "upstream user lookup failed");
+                    ("user_lookup_failed", m.upstream_failed)
+                })?;
             let user = identity
                 .as_ref()
                 .ok_or(("user_unavailable", m.upstream_failed))?;
@@ -337,7 +344,10 @@ where
                 amr: Vec::new(),
             };
             let location = complete_authorization(oauth, flow, authentication)
-                .map_err(|_error| ("authorization_failed", m.upstream_failed))?;
+                .map_err(|error| {
+                    tracing::warn!(reason = "authorization_failed", ?error, "upstream authorization failed");
+                    ("authorization_failed", m.upstream_failed)
+                })?;
             let mut response = StatusCode::SEE_OTHER.into_response();
             if let Ok(value) = HeaderValue::try_from(location) {
                 response.headers_mut().insert(header::LOCATION, value);
@@ -360,9 +370,10 @@ where
         match sign_in.setup.consume(&stored).await {
             Ok(Consume::Consumed) => {}
             Ok(Consume::AlreadyUsed) => return Err(("setup_already_used", m.setup_invalid)),
-            Err(_error) => {
+            Err(error) => {
                 tracing::error!(
                     reason = "setup_consume_failed",
+                    %error,
                     "consuming the enrolment token failed"
                 );
                 return Err(("setup_consume_failed", m.generic_error));
@@ -385,9 +396,10 @@ where
             Ok(CreateCredential::AlreadyExists) => {
                 Err(("account_already_linked", m.upstream_already_linked))
             }
-            Err(_error) => {
+            Err(error) => {
                 tracing::error!(
                     reason = "credential_link_failed",
+                    %error,
                     "linking the account failed"
                 );
                 Err(("credential_link_failed", m.generic_error))

@@ -164,11 +164,12 @@ async fn run_index<K>(
     reflector::reflector(writer, watcher(api, watcher::Config::default()))
         .default_backoff()
         .for_each(|event| async move {
-            if let Err(_error) = event {
+            if let Err(error) = event {
                 tracing::warn!(
                     event = "kubernetes_directory_watch",
                     resource,
                     reason = "watch_failed",
+                    %error,
                     "directory metadata watch error; retrying with backoff"
                 );
             }

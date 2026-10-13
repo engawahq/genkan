@@ -133,8 +133,12 @@ pub fn access_token(
         groups: &subject.user.groups,
     };
     let key = signer(keys, Algorithm::Es256, now)?;
-    sign_compact(&key, "at+jwt", &claims).map_err(|_error| {
-        tracing::error!(reason = "signing_failed", "signing an access token failed");
+    sign_compact(&key, "at+jwt", &claims).map_err(|error| {
+        tracing::error!(
+            %error,
+            reason = "signing_failed",
+            "signing an access token failed"
+        );
         OAuthError::server()
     })
 }
@@ -174,8 +178,8 @@ pub fn id_token(
             .then_some(subject.user.groups.as_slice()),
     };
     let key = signer(keys, subject.client.id_token_alg, now)?;
-    sign_compact(&key, "JWT", &claims).map_err(|_error| {
-        tracing::error!(reason = "signing_failed", "signing an ID token failed");
+    sign_compact(&key, "JWT", &claims).map_err(|error| {
+        tracing::error!(%error, reason = "signing_failed", "signing an ID token failed");
         OAuthError::server()
     })
 }

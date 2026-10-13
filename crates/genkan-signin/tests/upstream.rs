@@ -391,15 +391,7 @@ mod tests {
             }
             assert!(fields.get("client").is_none());
         }
-        let owned: Vec<_> = records
-            .iter()
-            .filter(|r| {
-                r["target"]
-                    .as_str()
-                    .is_some_and(|target| target.starts_with("genkan"))
-            })
-            .collect();
-        let serialized = serde_json::to_string(&owned).unwrap();
+        let serialized = serde_json::to_string(&audits).unwrap();
         for secret in query_secrets.iter().map(String::as_str).chain(
             cookies
                 .split(';')
@@ -474,7 +466,7 @@ mod tests {
             headers: parts.headers,
             body: response_body,
             audit: audits.first().map(|r| (*r).clone()),
-            logs: serialized,
+            logs: serde_json::to_string(&records).unwrap(),
         }
     }
 
@@ -970,6 +962,22 @@ mod tests {
             None,
         );
         assert!(!failed.body.contains(SECRET_ERROR));
+        let records: Vec<Value> = serde_json::from_str(&failed.logs).unwrap();
+        let diagnostic = records
+            .iter()
+            .find(|record| record["target"] == "genkan_signin::upstream")
+            .unwrap();
+        assert_eq!(
+            diagnostic["fields"]["reason"],
+            "provider_verification_failed"
+        );
+        assert_eq!(
+            diagnostic["fields"]["error"],
+            format!("upstream request failed: {SECRET_ERROR}")
+        );
+        let audit = failed.audit.as_ref().unwrap();
+        assert!(audit["fields"].get("error").is_none());
+        assert!(!serde_json::to_string(audit).unwrap().contains(SECRET_ERROR));
     }
 
     #[tokio::test]

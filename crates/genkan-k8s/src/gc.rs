@@ -235,7 +235,7 @@ pub async fn run<K, C>(
                         schedule.remove(name);
                     }
                 }
-                Some(Err(_error)) => tracing::warn!(%kind, reason = "watch_failed", "watch error; retrying with backoff"),
+                Some(Err(error)) => tracing::warn!(%kind, %error, reason = "watch_failed", "watch error; retrying with backoff"),
                 None => break,
             },
             () = tokio::time::sleep(sleep_for) => {
@@ -262,8 +262,8 @@ where
             Ok(DeleteOutcome::Changed) => {
                 schedule.postpone(&due.name, now.saturating_add(RETRY_AFTER));
             }
-            Err(_error) => {
-                tracing::warn!(%kind, reason = "deletion_failed", "deleting expired object failed; will retry");
+            Err(error) => {
+                tracing::warn!(%kind, %error, reason = "deletion_failed", "deleting expired object failed; will retry");
                 schedule.postpone(&due.name, now.saturating_add(RETRY_AFTER));
             }
         }

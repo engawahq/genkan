@@ -54,10 +54,10 @@ user name and subject.
 `oauth.replay` and `oauth.client_binding` describe detection before attempted deletion, not
 proof that deletion succeeded. `oauth.revocation_request` with `outcome=success` and
 `reason=accepted` means the request was accepted, including RFC 7009's invalid-token no-op.
-Storage and signing diagnostics retain their module targets and fixed categorical reasons.
-Owned records omit tokens, codes, credentials, groups and raw errors; dependency diagnostics
-do not share this guarantee. See the server README for stdout formatting, filtering and
-best-effort collection limits.
+Storage and signing diagnostics retain their module targets and fixed categorical reasons,
+and include full error details. Audit records omit tokens, codes, credentials, groups and raw
+errors; operational and dependency diagnostics do not share this guarantee. See the server
+README for stdout formatting, filtering and best-effort collection limits.
 
 ## References
 

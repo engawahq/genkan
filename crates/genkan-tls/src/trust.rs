@@ -32,9 +32,10 @@ pub enum TrustError {
 pub fn roots(extra: Option<&Path>) -> Result<RootCertStore, TrustError> {
     let mut store = RootCertStore::empty();
     let system = rustls_native_certs::load_native_certs();
-    for _error in &system.errors {
+    for error in &system.errors {
         tracing::debug!(
             reason = "system_ca_unavailable",
+            %error,
             "skipping part of the system CA bundle"
         );
     }

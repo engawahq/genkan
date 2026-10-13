@@ -190,7 +190,7 @@ fn upstream_providers(config: &ServeConfig) -> Result<Vec<Provider>, ServeError>
         .collect()
 }
 
-/// Maps load shedding to an immediate retryable response without logging request secrets.
+/// Maps load shedding to an immediate retryable response; unexpected errors retain diagnostics.
 fn admission_error(error: &axum::BoxError) -> axum::response::Response {
     use axum::http::{StatusCode, header};
     use axum::response::IntoResponse as _;
@@ -206,7 +206,7 @@ fn admission_error(error: &axum::BoxError) -> axum::response::Response {
         )
             .into_response()
     } else {
-        tracing::error!("unexpected request admission error");
+        tracing::error!(%error, "unexpected request admission error");
         StatusCode::INTERNAL_SERVER_ERROR.into_response()
     }
 }
@@ -331,8 +331,8 @@ async fn run<S: KeyStore, D: Directory, G: GrantStore, K: CredentialStore, T: Se
         .await;
     shutdown_tx.send_replace(true);
     for task in background.into_iter().chain([rotator]) {
-        if let Err(_error) = task.await {
-            tracing::error!(reason = "background_task_failed", "background task failed");
+        if let Err(error) = task.await {
+            tracing::error!(%error, reason = "background_task_failed", "background task failed");
         }
     }
     outcome?;
@@ -342,9 +342,10 @@ async fn run<S: KeyStore, D: Directory, G: GrantStore, K: CredentialStore, T: Se
 
 async fn shutdown_signal() {
     let interrupt = async {
-        if let Err(_error) = tokio::signal::ctrl_c().await {
+        if let Err(error) = tokio::signal::ctrl_c().await {
             tracing::error!(
                 reason = "sigint_listener_failed",
+                %error,
                 "cannot listen for SIGINT"
             );
             std::future::pending::<()>().await;
@@ -356,9 +357,10 @@ async fn shutdown_signal() {
             Ok(mut signal) => {
                 signal.recv().await;
             }
-            Err(_error) => {
+            Err(error) => {
                 tracing::error!(
                     reason = "sigterm_listener_failed",
+                    %error,
                     "cannot listen for SIGTERM"
                 );
                 std::future::pending::<()>().await;

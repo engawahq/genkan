@@ -373,26 +373,21 @@ mod tests {
     }
 
     fn assert_no_secrets(h: &Harness, secrets: &[&str]) {
-        let owned: Vec<_> = h
+        let audit: Vec<_> = h
             .capture
             .records()
             .into_iter()
-            .filter(|record| {
-                record["target"] == "genkan::audit"
-                    || record["target"]
-                        .as_str()
-                        .is_some_and(|target| target.starts_with("genkan_oauth"))
-            })
+            .filter(|record| record["target"] == "genkan::audit")
             .collect();
         assert!(
-            !owned.is_empty(),
-            "secret exclusion requires captured owned records"
+            !audit.is_empty(),
+            "secret exclusion requires captured audit records"
         );
-        for record in &owned {
+        for record in &audit {
             assert!(record.get("span").is_none());
             assert!(record.get("spans").is_none());
         }
-        let serialized = serde_json::to_string(&owned).unwrap();
+        let serialized = serde_json::to_string(&audit).unwrap();
         for secret in secrets.iter().copied().chain([
             VERIFIER,
             CHALLENGE,
@@ -404,7 +399,7 @@ mod tests {
         ]) {
             assert!(
                 !serialized.contains(secret),
-                "owned records contain secret: {secret}"
+                "audit records contain secret: {secret}"
             );
         }
         assert!(!serialized.contains(&STANDARD.encode(format!("web:{WEB_SECRET}"))));
@@ -1685,6 +1680,7 @@ mod tests {
             assert!(h.capture.records().iter().any(|record| {
                 record["target"] == "genkan_oauth::endpoints"
                     && record["fields"]["reason"] == "storage_failed"
+                    && record["fields"]["error"] == "storage failed: oauth-storage-secret-sentinel"
             }));
             if detection != "revoke" {
                 let (event, reason) = match detection {

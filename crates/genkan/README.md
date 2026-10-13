@@ -92,8 +92,11 @@ users, omit identity.
 Setup-token-validated names may have no subject. Method/provider/reason values are controlled.
 Audit targeting intentionally loses the original Rust module target; no duplicate module field
 is added. Operational and dependency diagnostics retain their native targets and need not have
-business fields. Owned records omit raw errors and credential/token material; **dependency
-diagnostics have no no-secrets guarantee**, especially at DEBUG/TRACE.
+business fields. Audit records omit raw errors and credential/token material. Owned operational
+diagnostics retain categorical reasons plus complete error details for troubleshooting.
+**Operational and dependency diagnostics have no no-secrets guarantee**: error text can include
+backend response details or sensitive data, even at WARN/ERROR. DEBUG/TRACE may expose more.
+Filtering or routing to the audit target does not remove earlier exposure in the mixed stream.
 
 Select successful fresh sign-ins from a JSON stream:
 

@@ -179,6 +179,7 @@ mod tests {
         headers: HeaderMap,
         body: Value,
         audit: Option<Value>,
+        diagnostics: Vec<Value>,
     }
 
     impl Reply {
@@ -272,15 +273,7 @@ mod tests {
             }
             assert!(fields.get("client").is_none());
         }
-        let owned: Vec<_> = records
-            .iter()
-            .filter(|r| {
-                r["target"]
-                    .as_str()
-                    .is_some_and(|target| target.starts_with("genkan"))
-            })
-            .collect();
-        let serialized = serde_json::to_string(&owned).unwrap();
+        let serialized = serde_json::to_string(&audit).unwrap();
         for (_, secret) in cookies {
             assert!(!serialized.contains(secret), "cookie leaked");
         }
@@ -300,6 +293,10 @@ mod tests {
             headers: parts.headers,
             body: response_body,
             audit: audit.first().map(|r| (*r).clone()),
+            diagnostics: records
+                .into_iter()
+                .filter(|record| record["target"] == "genkan_signin")
+                .collect(),
         }
     }
 
@@ -691,6 +688,9 @@ mod tests {
         let fields = &rejected.audit.as_ref().unwrap()["fields"];
         assert!(fields.get("user").is_none());
         assert!(fields.get("subject").is_none());
+        assert!(fields.get("error").is_none());
+        let diagnostic = rejected.diagnostics.first().unwrap();
+        assert_eq!(diagnostic["fields"]["reason"], "passkey-failed");
         // Failed signature verification does not consume the valid ceremony.
         assert_eq!(
             post(
@@ -866,6 +866,17 @@ mod tests {
             assert_eq!(fields["outcome"], "failure");
             assert_eq!(fields["user"], "admin");
             assert_eq!(fields["subject"], ADMIN_UID);
+            assert!(fields.get("error").is_none());
+            let diagnostic = reply.diagnostics.first().unwrap();
+            assert_eq!(diagnostic["fields"]["reason"], "no-request");
+            let error = diagnostic["fields"]["error"].as_str().unwrap();
+            assert!(error.contains("InvalidRequest"));
+            assert!(error.contains(if expired {
+                "the sign-in request expired; start again"
+            } else {
+                "the sign-in request is missing or invalid"
+            }));
+            assert!(!serde_json::to_string(fields).unwrap().contains(error));
             // A rejected authorization still consumed the verified passkey ceremony.
             let second_attempt = post(
                 &h.app,
