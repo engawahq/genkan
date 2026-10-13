@@ -171,9 +171,9 @@ expires, within ten minutes.
 genkanctl setup-link --username alice --reset
 ```
 
-This deletes all of Alice's passkeys, sessions and pending invitations, and prints a new
-one-time link that lasts an hour. Whoever opens the link becomes Alice, so confirm you are
-talking to her before you send it.
+This deletes all of Alice's credentials (passkeys and any linked GitHub or Google account),
+sessions and pending invitations, and prints a new one-time link that lasts an hour. Whoever
+opens the link becomes Alice, so confirm you are talking to her before you send it.
 
 ## Suspend or remove someone
 
@@ -184,8 +184,8 @@ deleted, so you can undo it:
 kubectl -n genkan-system patch gkuser alice --type=merge -p '{"spec":{"disabled":true}}'
 ```
 
-**To remove someone for good**, delete their passkeys, sessions and invitations first, then the
-`User`:
+**To remove someone for good**, delete their credentials, sessions and invitations first, then
+the `User`:
 
 ```sh
 for kind in gkcred gkgrant gkinvite; do

@@ -481,6 +481,17 @@ EOF
 If you installed kubelogin with Homebrew or Nix rather than krew, set `command: kubelogin`
 (Nix: `kubectl-oidc_login`) and drop `oidc-login` from `args`.
 
+With WSL, kubelogin runs inside Linux and does not see the CA that the Windows mkcert trusted.
+Add the CA to both `args` lists, using the path from the WSL check in step 5:
+
+```sh
+wslpath "$(mkcert.exe -CAROOT | tr -d '\r')"   # e.g. /mnt/c/Users/you/AppData/Local/mkcert
+```
+
+```yaml
+        --certificate-authority=/mnt/c/Users/you/AppData/Local/mkcert/rootCA.pem,
+```
+
 Keep `--oidc-use-access-token`: kube-apiserver accepts only Genkan's access tokens, not ID
 tokens.
 
