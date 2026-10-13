@@ -221,8 +221,10 @@ docker save genkan:dev | sudo k3s ctr images import -
 cargo build --release -p genkanctl && alias genkanctl=$PWD/target/release/genkanctl
 ```
 
-Now install it. `genkanctl` reads the issuer from `GENKAN_ISSUER`, so set it once per shell and
-the commands do not need `--issuer`:
+Now install it. `genkanctl` reads the issuer from `GENKAN_ISSUER`, so the commands do not need
+`--issuer`. Keep using this server shell for the rest of the guide: the `genkanctl` alias,
+`GENKAN_ISSUER` and the `nix develop` environment last only as long as the shell. In a new shell,
+run `cd ~/genkan && nix develop` and the `alias` and `export` lines again.
 
 ```sh
 export GENKAN_ISSUER=https://genkan.example.test
@@ -361,7 +363,8 @@ See Traefik's [RateLimit options][traefik-ratelimit] for the details.
 
 kube-apiserver checks Genkan's tokens itself. To do that, it fetches Genkan's signing keys over
 an internal HTTPS connection. `genkanctl kube-config` creates the certificate for that
-connection and prints the configuration kube-apiserver needs.
+connection and prints the configuration kube-apiserver needs. It also prints k3s setup
+instructions, including a one-time restart; step 2 already did that, so you can skip them.
 
 kube-apiserver checks the file about once a minute. To know when it has picked up your change,
 count its successful reloads before and after. Define two small helpers in the server shell:
@@ -478,8 +481,8 @@ current-context: genkan-k3s
 EOF
 ```
 
-If you installed kubelogin with Homebrew or Nix rather than krew, set `command: kubelogin`
-(Nix: `kubectl-oidc_login`) and drop `oidc-login` from `args`.
+Krew and Nix install kubelogin as a `kubectl` plugin, so the file works as written. If you
+installed it with Homebrew, set `command: kubelogin` and drop `oidc-login` from `args`.
 
 With WSL, kubelogin runs inside Linux and does not see the CA that the Windows mkcert trusted.
 Add the CA to both `args` lists, using the path from the WSL check in step 5:
@@ -515,7 +518,7 @@ What just happened:
 - **Admin tokens** last at most 5 minutes and never renew. When one expires, the admin context
   asks for your passkey again.
 - **Each token is traceable.** `kubectl auth whoami` shows `genkan.engawahq.dev/jti` and
-  `client_id`. They also appear in Kubernetes audit events, so each request maps to one sign-in.
+  `genkan.engawahq.dev/client-id`. They also appear in Kubernetes audit events, so each request maps to one sign-in.
 - **People, passkeys and sessions are Kubernetes objects** in `genkan-system`: a passkey is a
   `Credential`, and a signed-in session is a `Grant`. On the server, list them with
   `kubectl -n genkan-system get users,credentials,grants`.
@@ -537,8 +540,8 @@ fetch Genkan's keys, and every sign-in to the cluster fails. Running `genkanctl 
 again replaces the certificate automatically when it has less than 30 days left;
 `--renew-certificate` replaces it now.
 
-On the server, with `GENKAN_ISSUER` exported as in step 4 and the `reloads` and
-`wait_for_reload` helpers from step 6 defined:
+On the server, in a shell set up as in step 4 (`nix develop`, the `genkanctl` alias and
+`GENKAN_ISSUER`) and with the `reloads` and `wait_for_reload` helpers from step 6 defined:
 
 ```sh
 before=$(reloads)
