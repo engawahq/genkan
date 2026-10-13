@@ -4,10 +4,18 @@ Everything Genkan knows about people is a custom resource in its namespace, so m
 is `genkanctl` for links and `kubectl` (or GitOps) for the rest. The commands assume the
 cluster from [get-started.md](get-started.md): namespace `genkan-system`, issuer
 `https://genkan-k3s.shared`, run with the cluster admin's kubeconfig.
+Use your installed issuer instead if it has another hostname.
 
 ```sh
 export GENKAN_ISSUER=https://genkan-k3s.shared
 ```
+
+`genkanctl` reads `GENKAN_ISSUER` for commands that need the issuer, so the examples below
+leave it out of the command line.
+
+Lifetime examples assume the server defaults: ordinary tokens last 10 minutes and elevated
+tokens last 5 minutes. See [token limits](../crates/genkanctl/README.md#configure-token-limits-and-certificates)
+if your installation changes them.
 
 | Object | Short name | Who writes it |
 |---|---|---|
@@ -21,14 +29,34 @@ Credentials, invitations and grants carry the label `genkan.engawahq.dev/user=<U
 
 ## Add someone
 
+Invitation links work only when the server runs with `--invitations`. If it is not enabled,
+regenerate and apply the deployment:
+
+```sh
+genkanctl manifests --image docker.io/library/genkan:dev \
+  --serve-arg=--invitations | kubectl apply --server-side -f -
+kubectl -n genkan-system rollout status deploy/genkan
+```
+
+Keep your deployed image, namespace, `--config-secret` and every existing `--serve-arg` when
+regenerating; the command above shows only the local walkthrough's basic deployment.
+
+Then invite the person:
+
 ```sh
 genkanctl invite --username alice --display-name "Alice Chen" --group dev
 ```
 
-This creates the `User` `alice` in group `dev` (Kubernetes sees `genkan:alice` in
-`genkan:dev`) and prints a one-time link, valid for 7 days (`--valid-for`). Send it over a
-channel you trust; whoever opens it first enrols a passkey, or links a GitHub or Google account
-if those are enabled ([github-sign-in.md](github-sign-in.md)).
+For a new user, this creates `alice` in group `dev` (Kubernetes sees `genkan:alice` in
+`genkan:dev`). `--group`, `--elevated-group` and `--display-name` apply **only when the user is
+new**; inviting an existing username leaves its groups, display name and credentials unchanged.
+Repeat `--group` or `--elevated-group` to assign more than one. Elevated groups grant access
+only after a passkey sign-in that requests elevation; see [Admin rights](#admin-rights).
+
+The command prints a one-time link, valid for 7 days by default; use `--valid-for 24h`, for
+example, for a shorter window. Send it over a channel you trust. Whoever redeems it first
+enrols a passkey, or links a [GitHub](github-sign-in.md) or [Google](google-sign-in.md) account
+if that provider is enabled.
 
 Genkan does not send mail. The link goes to stdout and the notes to stderr, so a script can
 deliver it however your team works, for example:
@@ -151,9 +179,9 @@ kubectl -n genkan-system delete gkuser alice
 
 Do this in that order. Credentials, sessions and invitations Genkan creates carry an owner
 reference to the `User`, so deleting only the `User` also removes them, but eventually rather
-than at once, and not at all with `--cascade=orphan` or for records without an owner reference
-(written before owner references were added, or created by hand). Until they are gone, a new
-`User` given the same name would be signed in by the old credentials.
+than at once, and not at all with `--cascade=orphan` or for hand-created records without an
+owner reference. Until they are gone, a new `User` given the same name would be signed in by
+the old credentials.
 
 ## Keep users in Git
 

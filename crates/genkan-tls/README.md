@@ -14,7 +14,8 @@ TLS for Genkan's own connections, all on rustls with the aws-lc-rs provider.
 ## Place in the workspace
 
 Depends on `genkan-core`. Used by `genkan-k8s` (stores the internal certificate in a Secret and
-prints the CA for kube-apiserver) and by the `genkan` server, which runs the internal listener and builds its outgoing trust roots here.
+prints the CA for kube-apiserver) and by the `genkan` server, which runs the internal listener
+and builds its outgoing trust roots here.
 
 ## Why Genkan issues its own certificate
 

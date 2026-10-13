@@ -1,8 +1,8 @@
 # genkan-store
 
 Storage interfaces (ports) for Genkan, with in-memory adapters for tests and `--store memory`.
-The Kubernetes adapters, backed by the `User`, `Credential`, `OAuthClient` and `Grant` custom
-resources, live in `genkan-k8s`.
+The Kubernetes adapters, backed by the `User`, `Credential`, `OAuthClient`, `Grant` and
+`Invitation` custom resources, live in `genkan-k8s`. The one-time setup token lives in a Secret.
 
 ## Ports
 

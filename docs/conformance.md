@@ -110,7 +110,18 @@ its container image.
 | Project requirement | Signing keys in a Secret, rotation with overlap | `genkan-k8s/src/keys.rs` | `signing_keys_persist_and_only_one_writer_wins` *(cluster)* | Met |
 | WebAuthn Level 3 §7.1 | A known credential ID fails registration | `genkan-store` `passkey_credential_name`, create-once | `genkan-signin/tests/signin.rs`; `setup_link_is_single_use_and_replaceable` *(cluster)* | Met |
 | RFC 9700 §4.14.2 | Refresh rotation with reuse detection | `genkan-k8s/src/grants.rs`, `genkan-store` `classify` | `grant_rotation_is_linearizable` *(cluster: 1 of 64 rotates)* | Met |
-| Project account-recovery policy; RFC 9700 §4.14.2 (security-event revocation, MAY) | Reset deletes pending invitations, then credentials, then refresh-token families before writing a setup link, including zero-credential retries after partial failure | `genkan-k8s/src/setup.rs` | `genkan-k8s/tests/setup_reset.rs: reset_revokes_invitations_before_anything_else`, `reset_retries_grant_deletion_after_credentials_are_gone`, `reset_revokes_old_grants_without_credentials`; `genkan-k8s/tests/kubernetes.rs: setup_link_is_single_use_and_replaceable` *(cluster: only the reset user's invitation is revoked)* (mock Kubernetes HTTP API, real OAuth router); `genkan-e2e/tests/e2e.rs: passkey_sign_in_then_kubectl_auth_whoami` *(cluster: refresh succeeds before reset and fails afterward)* | Met |
+| Project account-recovery policy; RFC 9700 §4.14.2 (security-event revocation, MAY) | Reset deletes pending invitations, then credentials, then refresh-token families before writing a setup link, including zero-credential retries after partial failure | `genkan-k8s/src/setup.rs` | [Account-recovery tests](#account-recovery-tests) | Met |
+
+### Account-recovery tests
+
+- `genkan-k8s/tests/setup_reset.rs`: `reset_revokes_invitations_before_anything_else`,
+  `reset_retries_grant_deletion_after_credentials_are_gone` and
+  `reset_revokes_old_grants_without_credentials` exercise partial-failure recovery using a mock
+  Kubernetes HTTP API and the real OAuth router.
+- `genkan-k8s/tests/kubernetes.rs`: `setup_link_is_single_use_and_replaceable` checks on a cluster
+  that reset revokes only the target user's invitation.
+- `genkan-e2e/tests/e2e.rs`: `passkey_sign_in_then_kubectl_auth_whoami` checks on a cluster that
+  refresh succeeds before reset and fails afterward.
 
 ## OAuth 2.0 and OpenID Connect
 

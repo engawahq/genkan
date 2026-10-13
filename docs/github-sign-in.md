@@ -5,6 +5,12 @@ adds it to the cluster from [get-started.md](get-started.md); the commands assum
 (issuer `https://genkan-k3s.shared`, namespace `genkan-system`, `genkanctl` and `kubectl` on the
 VM inside `nix develop`).
 
+```sh
+export GENKAN_ISSUER=https://genkan-k3s.shared
+```
+
+`genkanctl` reads `GENKAN_ISSUER`, so the commands below do not pass an issuer argument.
+
 ## What it does and does not do
 
 - **A GitHub account signs in only as a user it was linked to.** Nothing is created on the
@@ -47,20 +53,20 @@ printf %s "$GITHUB_SECRET" | kubectl -n genkan-system create secret generic genk
 unset GITHUB_SECRET
 ```
 
-If `genkan-config` already exists (for example with Google's secret), add the key to it instead:
+If `genkan-config` already exists, add the key instead of replacing the other secrets:
 `kubectl -n genkan-system edit secret genkan-config`, or recreate it with every
-`--from-literal`/`--from-file`.
+`--from-literal`/`--from-file`. For the other provider, see [Google sign-in](google-sign-in.md).
 
 ## 3. Enable the provider
 
 Re-apply the manifests with the Secret, the client ID and `--invitations` (step 4 links accounts
-with invitation links). `genkanctl manifests` is declarative: pass every `--serve-arg` you want
-to keep each time.
+with invitation links). Keep your deployed image, namespace, `--config-secret` and every
+existing `--serve-arg` when regenerating; omitted options are not preserved by
+`genkanctl manifests`.
 
 ```sh
-ISSUER=https://genkan-k3s.shared
 GITHUB_CLIENT_ID=Ov23li...   # from step 1; not a secret
-genkanctl manifests --issuer $ISSUER --image docker.io/library/genkan:dev \
+genkanctl manifests --image docker.io/library/genkan:dev \
   --config-secret genkan-config \
   --serve-arg=--invitations \
   --serve-arg=--github-client-id=$GITHUB_CLIENT_ID \
@@ -74,44 +80,23 @@ page now shows **Continue with GitHub**.
 
 ## 4. Link GitHub accounts to users
 
-Pick one of three ways.
-
-### A new person, with an invitation
-
-```sh
-genkanctl invite --issuer $ISSUER --username alice --display-name "Alice" --group developers
-```
-
-Send Alice the printed link (valid for 7 days, single use). On that page she can create a
-passkey or choose **Continue with GitHub**; either links the credential to `alice`. A
-redeemed link is gone; issue another invitation to link a second credential.
-
-`developers` is just a group name. Kubernetes sees it as `genkan:developers`, so give it rights
-the usual way, for example read access to one namespace:
-
-```sh
-kubectl create namespace demo --dry-run=client -o yaml | kubectl apply -f -
-kubectl -n demo create rolebinding developers-view --clusterrole=view --group=genkan:developers
-```
-
-### An existing user, such as `admin`
-
-Invite the same username. The existing `User` and its passkeys stay as they are; the link only
-adds a credential.
-
-```sh
-genkanctl invite --issuer $ISSUER --username admin
-```
-
-Open the link and choose **Continue with GitHub**.
+For a [new person](managing-users.md#add-someone), send an invitation as described in
+Managing users. For an [existing user](managing-users.md#add-another-passkey-or-device),
+invite the same username to add a credential without changing their existing account.
+On either link, choose **Continue with GitHub** and select the intended GitHub account
+instead of enrolling a passkey. Each link adds one credential; use another link to add a
+passkey or another account.
 
 ### Directly, as the cluster admin
 
-When you know the person's GitHub account, create the `Credential` yourself. Its name must be
-derived from the issuer and the numeric ID exactly as Genkan derives it, because Genkan looks
-the account up by name. Give it an owner reference to the User's current UID, as Genkan does
-for credentials it creates, so that deleting the User also deletes the credential; without
-one, the credential outlives the User and signs in as any later User given the same name:
+When you know the person's GitHub account, you can create the `Credential` yourself. Its name
+must match Genkan's derivation from the issuer and numeric ID, because Genkan looks up the
+account by name. Include the user label so the shared management commands can find it, and an
+owner reference to the `User`'s current UID so Kubernetes removes it when the `User` is deleted.
+
+**Warning:** without the owner reference, the credential outlives the `User` and signs in as
+any later `User` with the same name. Garbage collection is eventual even with the reference;
+follow the [safe removal order](managing-users.md#suspend-or-remove-someone).
 
 ```sh
 LOGIN=octocat
@@ -125,6 +110,7 @@ kind: Credential
 metadata:
   name: $NAME
   namespace: genkan-system
+  labels: {genkan.engawahq.dev/user: "$USER_NAME"}
   ownerReferences:
     - {apiVersion: genkan.engawahq.dev/v1alpha1, kind: User, name: $USER_NAME, uid: $USER_UID}
 spec:
@@ -155,28 +141,15 @@ kubectl --context genkan-k3s-admin auth whoami
 
 ## Removing access
 
-Credentials are immutable; revoking one is deleting it.
+Use Managing users to [see and revoke credentials](managing-users.md#see-and-revoke-credentials),
+[end existing sessions](managing-users.md#sign-someone-out), or
+[suspend or remove a user](managing-users.md#suspend-or-remove-someone). Deleting a GitHub
+credential stops new sign-ins, but does not end the sessions it already started.
 
-```sh
-kubectl -n genkan-system get credentials -o custom-columns=NAME:.metadata.name,TYPE:.spec.type,USER:.spec.user
-kubectl -n genkan-system delete credential <name>
-```
-
-Deleting a credential stops new sign-ins with it. Sessions it already started live on as
-refresh-token grants; end them too by deleting the user's grants:
-
-```sh
-kubectl -n genkan-system get grants -o json \
-  | jq -r '.items[] | select(.spec.user == "alice") | .metadata.name' \
-  | xargs -r kubectl -n genkan-system delete grant
-```
-
-An access token already issued stays valid until it expires (10 minutes by default), because
-kube-apiserver cannot revoke tokens. To lock a person out entirely, set `spec.disabled: true` on
-their `User`.
-
-To turn GitHub sign-in off, re-apply the manifests without the two `--github-*` arguments and
-delete the OAuth app on GitHub.
+To turn GitHub sign-in off, re-apply the manifests without the two `--github-*` arguments,
+keeping all other deployment options, and delete the OAuth app on GitHub. This does not
+remove stored credentials or end existing Genkan sessions; use the shared management flows
+if you want to revoke them too.
 
 ## Troubleshooting
 
@@ -188,11 +161,10 @@ delete the OAuth app on GitHub.
 - **"This sign-in needs a passkey":** the request asked for elevation; use a passkey.
 - **"This provider is not enabled":** the Deployment lacks `--github-client-id`; check
   `kubectl -n genkan-system get deploy genkan -o jsonpath='{.spec.template.spec.containers[0].args}'`.
-- **The pod restarts and logs `Permission denied` for `/etc/genkan/...`:** either the manifests
-  came from a `genkanctl` older than the `fsGroup` fix (rebuild `genkanctl` and apply them
-  again), or the image was built before `build-image.sh` staged `/etc` with mode 0755: older
-  images have a 0444 `/etc` that the non-root user cannot enter, which also hides the CA bundle.
-  Rebuild the image, import it and restart the Deployment.
+- **The pod cannot read `/etc/genkan/...`:** check that `--config-secret genkan-config`
+  mounts the Secret, that it contains `github-client-secret`, and that
+  `--github-client-secret-file` points to `/etc/genkan/github-client-secret`. If you customize
+  the pod's security context or mounts, retain the generated `fsGroup` and read permissions.
 - **Sign-in fails after GitHub returns:** the pod cannot reach `github.com` or
   `api.github.com`; check egress (proxy, firewall, NetworkPolicy) and
   `kubectl -n genkan-system logs deploy/genkan`.

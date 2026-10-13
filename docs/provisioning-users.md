@@ -1,10 +1,20 @@
 # Provisioning users from a directory
 
-Genkan has no built-in SCIM server. Users are `User` objects in Genkan's namespace, so keeping
-them in step with Okta, Entra ID, Google Workspace, LDAP or an HR system is a small program
-that reads the directory and writes those objects with the Kubernetes API. This guide sets up
-the permissions such a program needs, and an admission policy that limits the damage if it is
-wrong or compromised. Day-to-day commands are in [managing-users.md](managing-users.md).
+Keep users in step with Okta, Entra ID, Google Workspace, LDAP or an HR system using a small
+sync program that reads the directory and writes `User` objects with the Kubernetes API.
+Genkan does not speak SCIM; the sync program is the bridge to your directory.
+
+This guide sets up the program's permissions and an admission policy that limits the damage
+if it is wrong or compromised. Day-to-day commands are in
+[managing-users.md](managing-users.md).
+
+For the invitation commands, set your installed issuer (the local walkthrough uses this one):
+
+```sh
+export GENKAN_ISSUER=https://genkan-k3s.shared
+```
+
+`genkanctl` reads it, so the commands do not need an issuer argument.
 
 ## What the sync tool does
 
@@ -136,12 +146,22 @@ the same username would be the same person to RBAC. Object names are unique, and
 always names a user after its username, so requiring the two to be equal keeps the tool from
 creating a second `admin`.
 
-The `User` schema limits usernames to DNS subdomains of at most 63 characters: lowercase
-letters, digits, `-` and `.`, with each dot-separated label starting and ending in a letter or
-digit. No `@`, `+` or `_`. Map an email address to a DNS-compatible directory short name;
-`genkanctl invite` and `genkanctl setup-link` use the same contract. If two people could map to
-the same name, the directory-ID check below stops one from taking over the other's `User`.
-The 63-character cap also keeps the full username within Kubernetes' label-value limit for
+### Username rules
+
+Use the same value for `metadata.name` and `spec.username`. The `User` schema accepts lowercase
+DNS subdomains of at most 63 characters: letters, digits, `-` and `.`, with each dot-separated
+label starting and ending in a letter or digit. No `@`, `+` or `_`. The exact pattern is:
+
+```text
+^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+```
+
+`genkanctl invite` and `genkanctl setup-link` enforce the same rule.
+
+**Mapping note:** map an email address to a DNS-compatible directory short name, but keep the
+immutable directory ID as the identity check. If two people map to the same name, the check
+described in [The sync loop](#3-the-sync-loop) must stop one from taking over the other's
+`User`. The 63-character cap also keeps usernames within the Kubernetes label-value limit on
 invitations, credentials and grants.
 
 Check the policy before trusting it:
@@ -228,9 +248,9 @@ Before applying, a real tool should also:
   account in the directory cannot inherit someone else's `User`.
 - Disable managed users that are no longer in the export
   (`kubectl get gkuser -l genkan.engawahq.dev/source=directory`).
-- Lowercase usernames and check that they are valid object names and fit the `User` schema
-  (at most 63 characters,
-  `^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`) before writing.
+- Lowercase usernames and check them against the [username rules](#username-rules) before
+  writing.
 
-New people still need a link to enrol: an admin runs `genkanctl invite --username <name>` for
-each new user and sends it to them.
+New people still need a link to enrol. Enable the server's `--invitations` option first
+([Add someone](managing-users.md#add-someone) shows the manifest command). An admin then runs
+`genkanctl invite --username <name>` for each new user and sends the printed link to them.

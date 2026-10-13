@@ -1,7 +1,7 @@
 # Get started: k3s in a VM, kubectl with a passkey
 
 This guide builds a single-node k3s cluster in a Linux VM, installs the components the
-[recommendations catalog](https://github.com/engawa/recommendations) marks as recommended for
+[recommendations catalog](https://github.com/engawahq/recommendations) marks as recommended for
 ingress, certificates, metrics and node updates, installs Genkan, and signs `kubectl` on a Mac
 in with a passkey. It takes about half an hour, most of it downloads and one Rust build.
 
@@ -33,15 +33,18 @@ Names used throughout:
   Firefox needs `nss` as well; Safari and Chrome use the system trust store.
 - **VM:** Ubuntu (24.04 or later), 4 CPUs, 8 GiB memory, 30 GiB free disk, Docker, Nix with
   flakes, and SSH access from the Mac. The VM user must be in the `docker` group.
-- Checkouts of `genkan` and `recommendations` side by side on the Mac.
+- Checkouts of [genkan](https://github.com/engawahq/genkan) and
+  [recommendations](https://github.com/engawahq/recommendations) side by side on the Mac.
 
 ## 1. Create the VM
 
-Clone a base image instead of changing it, then give the clone its own identity: a clone
-shares the base's machine ID (and so its DHCP identity and journal directory) and SSH host keys.
+Clone your own Ubuntu base VM, prepared with the prerequisites above, instead of changing it.
+The example names that user-provided base `ubuntu-base`; replace it with your VM's name.
+Give the clone its own identity: it shares the base's machine ID (and so its DHCP identity and
+journal directory) and SSH host keys.
 
 ```sh
-prlctl clone engawa-actions-runner-base --name genkan-k3s
+prlctl clone ubuntu-base --name genkan-k3s
 prlctl start genkan-k3s
 prlctl exec genkan-k3s 'rm -f /etc/machine-id /var/lib/dbus/machine-id && systemd-machine-id-setup \
   && rm -f /etc/ssh/ssh_host_* && ssh-keygen -A && systemctl restart ssh systemd-journald'
@@ -144,6 +147,10 @@ for ((i = 0; i < count; i++)); do
 done
 ```
 
+```sh
+chmod +x ~/install-component.sh
+```
+
 It does not handle a component's `inputs` or `contributes`; the four below have neither. Install
 them in dependency order (cert-manager depends on ingress for the Gateway API CRDs):
 
@@ -172,13 +179,17 @@ cd ~/genkan && nix develop
 docker save genkan:dev | sudo k3s ctr images import -
 cargo build --release -p genkanctl && alias genkanctl=$PWD/target/release/genkanctl
 
-ISSUER=https://genkan-k3s.shared
+export GENKAN_ISSUER=https://genkan-k3s.shared
 genkanctl crds | kubectl apply --server-side -f -
-genkanctl manifests --issuer $ISSUER --image docker.io/library/genkan:dev | kubectl apply --server-side -f -
+genkanctl manifests --image docker.io/library/genkan:dev \
+  --serve-arg=--invitations | kubectl apply --server-side -f -
 kubectl -n genkan-system rollout status deploy/genkan
 ```
 
-Everything Genkan owns lives in the `genkan-system` namespace.
+Everything Genkan owns lives in the `genkan-system` namespace. `genkanctl` reads the exported
+`GENKAN_ISSUER` for commands that need an issuer, so the examples omit `--issuer`. Export it
+again if you open another VM shell. Invitations are enabled so the links you issue when
+[adding users](managing-users.md#add-someone) can be redeemed.
 
 ## 5. Publish the issuer over HTTPS
 
@@ -313,17 +324,54 @@ kube-apiserver reaches through the Service's ClusterIP, and prints the
 about once a minute):
 
 ```sh
-genkanctl kube-config --issuer $ISSUER --distro k3s > ~/authn.yaml
-sudo install -m 600 ~/authn.yaml /etc/rancher/k3s/genkan/.authn.yaml.tmp
-sudo mv /etc/rancher/k3s/genkan/.authn.yaml.tmp /etc/rancher/k3s/genkan/authn.yaml
+genkanctl kube-config --distro k3s > ~/authn.yaml &&
+  sudo install -m 600 ~/authn.yaml /etc/rancher/k3s/genkan/.authn.yaml.tmp &&
+  sudo mv /etc/rancher/k3s/genkan/.authn.yaml.tmp /etc/rancher/k3s/genkan/authn.yaml
 ```
 
-Wait for a successful reload:
+Wait for a successful reload (up to three minutes). Before the first reload, this metric may
+not exist yet:
 
 ```sh
-kubectl get --raw /metrics | grep '^apiserver_authentication_config_controller_automatic_reloads_total'
-# ...{status="success"} 1
+reloaded=false
+for attempt in $(seq 1 36); do
+  if kubectl get --raw /metrics |
+    grep '^apiserver_authentication_config_controller_automatic_reloads_total' |
+    grep -q 'status="success"'; then
+    reloaded=true
+    break
+  fi
+  sleep 5
+done
+if [ "$reloaded" != true ]; then
+  echo "Authentication configuration did not reload; inspect k3s logs." >&2
+  sudo journalctl -u k3s --since "5 minutes ago" --no-pager
+  false
+fi
 ```
+
+### Renew the internal certificate
+
+The internal certificate expires after **365 days** by default (`--certificate-validity`).
+Renew it before expiry; an expired certificate prevents kube-apiserver from fetching Genkan's
+discovery and signing keys. `kube-config` reuses a usable certificate, automatically replacing
+it when fewer than 30 days remain; `--renew-certificate` forces replacement now.
+
+On the VM, using its cluster-admin kubeconfig and the issuer exported in step 4:
+
+```sh
+authn=$(mktemp) &&
+  genkanctl kube-config --distro k3s --renew-certificate > "$authn" &&
+  sudo install -m 600 "$authn" /etc/rancher/k3s/genkan/.authn.yaml.tmp &&
+  sudo mv /etc/rancher/k3s/genkan/.authn.yaml.tmp /etc/rancher/k3s/genkan/authn.yaml &&
+  rm "$authn"
+```
+
+The `&&` chain leaves the installed configuration untouched if generation or staging fails.
+Renewal also creates a new CA, so **install the newly printed configuration**, not the old one.
+Genkan picks up the new certificate within a minute; kube-apiserver also reloads its file.
+There can be a brief authentication interruption while they converge. Check the reload metric
+above and repeat `kubectl auth whoami` on the Mac after renewal.
 
 ## 7. Register kubectl and enrol the first passkey
 
@@ -333,7 +381,7 @@ that receives the code on a loopback redirect:
 ```sh
 genkanctl client create kubectl --type public --allow-elevation \
   --redirect-uri http://127.0.0.1:8000/ --audience kubernetes | kubectl apply -f -
-genkanctl setup-link --issuer $ISSUER --username admin
+genkanctl setup-link --username admin
 ```
 
 Open the printed link on the Mac and create a passkey. The link works once and expires in 60
@@ -410,17 +458,20 @@ kubectl --context genkan-k3s-admin auth whoami
 
 Things to notice:
 
-- Normal tokens last 10 minutes and are refreshed silently for up to 12 hours; the elevated one
-  asks for the passkey again every time it expires.
+- Normal tokens last 10 minutes. Refresh is silent until 12 hours after sign-in, or until the
+  session has been unused for 4 hours (`--refresh-absolute` and `--refresh-idle` defaults).
+  Elevated tokens cannot be refreshed and ask for the passkey again after expiry.
 - `kubectl auth whoami` shows `genkan.engawahq.dev/jti` and `client_id` in its extra fields, so
   audit events tie each request to one token issuance.
-- Users, passkeys and sessions are custom resources:
-  `kubectl -n genkan-system get users,credentials,grants` (as cluster admin on the VM).
+- Users, passkeys and sessions are custom resources: a passkey is a `Credential`, and a session
+  is a `Grant`. Inspect them with `kubectl -n genkan-system get users,credentials,grants`
+  (as cluster admin on the VM); see [Managing users](managing-users.md) for revocation.
 
 ## Next
 
-- [Sign in with GitHub](github-sign-in.md) as an alternative to the passkey for ordinary
-  access.
+- [Manage users](managing-users.md): invite people, add passkeys, revoke sessions or remove access.
+- [Sign in with GitHub](github-sign-in.md) or [Google](google-sign-in.md) as an alternative
+  to the passkey for ordinary access.
 - [Register more clients](clients.md), such as Grafana or Argo CD, so they sign people in
   through Genkan too.
 
