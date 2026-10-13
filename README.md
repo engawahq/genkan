@@ -42,7 +42,7 @@ and restarting a deployment is refused with 403 until you ask for admin rights.*
     </picture></td>
     <td width="33%"><picture>
       <source media="(prefers-color-scheme: dark)" srcset="docs/images/sign-in-elevated-dark.avif">
-      <img alt="Sign-in page for admin access, with the passkey button only" src="docs/images/sign-in-elevated-light.avif">
+      <img alt="Sign-in page for admin access: an elevated access notice for kubectl, valid for 5 minutes, and the passkey button only" src="docs/images/sign-in-elevated-light.avif">
     </picture></td>
     <td width="33%"><picture>
       <source media="(prefers-color-scheme: dark)" srcset="docs/images/setup-dark.avif">
@@ -51,7 +51,7 @@ and restarting a deployment is refused with 403 until you ask for admin rights.*
   </tr>
   <tr>
     <td align="center"><b>Everyday sign-in</b><br>passkey or GitHub</td>
-    <td align="center"><b>Admin access</b><br>passkey only, 5 minutes</td>
+    <td align="center"><b>Admin access</b><br>clearly flagged, passkey only, 5 minutes</td>
     <td align="center"><b>Joining</b><br>a one-time invitation link</td>
   </tr>
 </table>
