@@ -64,9 +64,11 @@ Things to know:
   ```
 
 Kubernetes sees Alice as the user `genkan:alice` in the group `genkan:dev`. Give permissions to
-the group, not to the person:
+the group, not to the person. For example, to let the `dev` group edit everything in a `dev`
+namespace:
 
 ```sh
+kubectl create namespace dev            # if it does not exist yet
 kubectl create rolebinding dev-edit --clusterrole=edit --group=genkan:dev -n dev
 ```
 

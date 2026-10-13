@@ -18,10 +18,16 @@ First decide which kind of client the application is:
 
 ## Public clients
 
+This is the `kubectl` client from [Get started](get-started.md):
+
 ```sh
-genkanctl client create kubectl --type public \
+genkanctl client create kubectl --type public --allow-elevation \
   --redirect-uri http://127.0.0.1:8000/ --audience kubernetes | kubectl apply -f -
 ```
+
+Running `client create` for a name that already exists replaces that client, so always pass all
+of its options. Leaving out `--allow-elevation` here, for example, turns admin sign-in off for
+`kubectl`.
 
 The options:
 
@@ -67,6 +73,7 @@ on the machine can see in the process list:
 
 ```sh
 read -rs CLIENT_SECRET     # paste the secret, then Enter
+# monitoring: the namespace Grafana runs in.
 printf %s "$CLIENT_SECRET" | kubectl -n monitoring create secret generic grafana-oidc \
   --from-file=client-secret=/dev/stdin
 unset CLIENT_SECRET
@@ -115,8 +122,13 @@ The printed object contains no secret, so you can commit it. Convert it to YAML 
 ```sh
 genkanctl client create grafana --type confidential --display-name Grafana \
   --redirect-uri https://grafana.example.com/login/generic_oauth \
-  | kubectl apply --dry-run=client -o yaml -f - > grafana-client.yaml
+  | kubectl create --dry-run=client -o yaml -f - > grafana-client.yaml
 ```
+
+Each run generates a new secret, so give the one it prints to the application before you apply
+the file. Use `kubectl create --dry-run=client`, not `kubectl apply --dry-run=client`: `apply`
+adds a `last-applied-configuration` annotation, and, if the client already exists, its
+`resourceVersion`, which makes the file fail to apply later.
 
 If you edit the object by hand, the cluster checks it when you apply it: a plain `http` or
 fragment redirect URI, or a malformed `secretHash`, fails at `kubectl apply` rather than at
