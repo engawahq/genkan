@@ -40,8 +40,9 @@ match by email address: addresses get reused when people leave.
 
 ## 1. A service account with write access to users only
 
-```sh
-kubectl apply -f - <<'EOF'
+Save this as `user-sync-rbac.yaml` and apply it with `kubectl apply -f user-sync-rbac.yaml`:
+
+```yaml
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -71,7 +72,6 @@ subjects:
 - kind: ServiceAccount
   name: user-sync
   namespace: genkan-system
-EOF
 ```
 
 There is no `delete`, and no access to credentials, invitations, grants or Secrets.
@@ -89,8 +89,9 @@ It enforces that the sync program:
 - only assigns groups from an allowlist. Edit `['dev', 'ops']` below to yours;
 - names each object after its username (see [why](#why-the-name-must-equal-the-username)).
 
-```sh
-kubectl apply -f - <<'EOF'
+Save this as `user-sync-policy.yaml` and apply it with `kubectl apply -f user-sync-policy.yaml`:
+
+```yaml
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -142,7 +143,6 @@ metadata:
 spec:
   policyName: genkan-user-sync
   validationActions: [Deny]
-EOF
 ```
 
 An admin can still add elevated groups to a synced user by hand. The sync program's later
