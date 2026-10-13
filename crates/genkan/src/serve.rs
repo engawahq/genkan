@@ -1,8 +1,9 @@
 //! `genkan`: wires configuration, storage, keys and HTTP together.
 //!
 //! Startup order: Kubernetes mode binds the internal port first, failing immediately if it is
-//! unavailable. Signing keys are then reconciled once, background tasks start (key rotation,
-//! garbage collection, internal TLS), and the public port is bound.
+//! unavailable, then waits until the directory cache has listed every client and user. Signing
+//! keys are then reconciled once, background tasks start (key rotation, garbage collection,
+//! internal TLS), and the public port is bound.
 //! With the Kubernetes store, if the API server becomes unreachable, Genkan keeps serving the
 //! last published keys; logins and refreshes that need a write fail closed, and the background
 //! tasks retry.
@@ -34,7 +35,7 @@ use genkan_signin::upstream::{self, Upstream};
 use genkan_signin::{SignIn, pages};
 use genkan_store::{
     CredentialStore, Directory, GrantStore, MemoryCredentialStore, MemoryDirectory,
-    MemoryGrantStore, MemorySetupStore, SetupStore,
+    MemoryGrantStore, MemorySetupStore, SetupStore, StoreError,
 };
 use genkan_tls::listener::{Resolver, TlsListener, server_config};
 use k8s_openapi::api::core::v1::Secret;
@@ -75,6 +76,9 @@ pub enum ServeError {
     /// The configuration cannot be used (for example as a WebAuthn origin).
     #[error("configuration: {0}")]
     Config(String),
+    /// The directory cache stopped before it was synchronised.
+    #[error("synchronising the directory: {0}")]
+    Directory(#[from] StoreError),
     /// Binding or serving failed.
     #[error("serving HTTP: {0}")]
     Io(#[from] io::Error),
@@ -121,14 +125,14 @@ pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
                 Api::namespaced(client.clone(), &namespace),
                 key_secret.clone(),
             );
-            let directory = KubeDirectory::new(
-                Api::namespaced(client.clone(), &namespace),
-                Api::namespaced(client.clone(), &namespace),
-            );
+            let (directory, directory_task) =
+                KubeDirectory::watch(&client, &namespace, shutdown_rx.clone());
+            tracing::info!("waiting for the directory cache to list clients and users");
+            directory.wait_until_ready().await?;
             let grants = KubeGrantStore::new(Api::namespaced(client.clone(), &namespace));
             let credentials = KubeCredentialStore::new(Api::namespaced(client.clone(), &namespace));
             let mut setup = KubeSetupStore::new(Api::namespaced(client.clone(), &namespace));
-            let mut background = Vec::new();
+            let mut background = vec![directory_task];
             if config.invitations {
                 setup = setup.with_invitations(Api::namespaced(client.clone(), &namespace));
                 background.push(tokio::spawn({
