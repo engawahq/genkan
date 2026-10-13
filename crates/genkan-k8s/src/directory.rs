@@ -7,13 +7,13 @@
 //!
 //! - **Unknown clients cost nothing.** A `client_id` that names no object is a map miss, so
 //!   unauthenticated traffic to `/authorize`, `/par`, `/token` and `/revoke` puts no load on the
-//!   API server, whatever IDs it carries ([#10]). [Pinniped] reads its `OIDCClient`s with one
-//!   GET per request and screens out only IDs that lack its required prefix; a cache needs no
-//!   such screen.
-//! - **Changes apply with the watch event, not after a TTL.** Disabling a user or editing a
-//!   client reaches the cache as soon as the API server delivers the event. The alternative
-//!   considered in [#10], a short negative cache in front of per-request GETs, still costs one
-//!   GET per distinct unknown ID and keeps a newly created client invisible for the TTL.
+//!   API server, whatever IDs it carries ([#10]). [Pinniped] reads its `OIDCClient`s with one GET
+//!   per request and screens out only IDs that lack its required prefix; a cache needs no such
+//!   screen.
+//! - **Changes apply with the watch event, not after a TTL.** Disabling a user or editing a client
+//!   reaches the cache as soon as the API server delivers the event. The alternative considered in
+//!   [#10], a short negative cache in front of per-request GETs, still costs one GET per distinct
+//!   unknown ID and keeps a newly created client invisible for the TTL.
 //! - **Lookups by subject scan memory.** UserInfo used to LIST every user per call.
 //! - **Fails closed until synchronised.** Until both caches have completed their first list, every
 //!   lookup is an error. `genkan serve` waits for that before it binds the public port, so the
@@ -25,8 +25,8 @@
 //!   while the API server is unreachable. UserInfo can still answer from the stale entry, as it
 //!   answers for any unexpired access token.
 //! - **Memory.** Every object of both kinds is held, with `managedFields` dropped. Users carry no
-//!   secrets; clients carry only `secret_hash`. At the expected scale (tens to hundreds of
-//!   objects) this is kilobytes. The Role already grants `list` and `watch` on both kinds.
+//!   secrets; clients carry only `secret_hash`. At the expected scale (tens to hundreds of objects)
+//!   this is kilobytes. The Role already grants `list` and `watch` on both kinds.
 //!
 //! # References
 //!
