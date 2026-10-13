@@ -38,12 +38,12 @@ After registering, note the **Client ID** and generate a **client secret**.
 ## 2. Store the client secret
 
 Genkan reads secrets from files in a Secret mounted at `/etc/genkan`. Create it without
-putting the secret in your shell history:
+putting the secret in your shell history or the process list:
 
 ```sh
 read -rs GITHUB_SECRET     # paste the client secret, then Enter
-kubectl -n genkan-system create secret generic genkan-config \
-  --from-literal=github-client-secret="$GITHUB_SECRET"
+printf %s "$GITHUB_SECRET" | kubectl -n genkan-system create secret generic genkan-config \
+  --from-file=github-client-secret=/dev/stdin
 unset GITHUB_SECRET
 ```
 

@@ -43,12 +43,13 @@ genkanctl client create grafana --type confidential --display-name Grafana \
 The object goes to stdout. The client secret goes to stderr, so it shows in your terminal but
 never lands in the object, in `kubectl`'s input or in a GitOps repository. It is shown once:
 the cluster keeps only its SHA-256 hash. Give it to the application right away, for example as
-a Secret in the application's namespace:
+a Secret in the application's namespace. Pipe it in rather than passing it as an argument, which
+other users can see in the process list:
 
 ```sh
 read -rs CLIENT_SECRET     # paste the secret, then Enter
-kubectl -n monitoring create secret generic grafana-oidc \
-  --from-literal=client-secret="$CLIENT_SECRET"
+printf %s "$CLIENT_SECRET" | kubectl -n monitoring create secret generic grafana-oidc \
+  --from-file=client-secret=/dev/stdin
 unset CLIENT_SECRET
 ```
 
