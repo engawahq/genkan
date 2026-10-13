@@ -1,81 +1,111 @@
-# Get started: k3s in a VM, kubectl with a passkey
+# Get started: k3s on an Ubuntu server, kubectl with a passkey
 
-This guide builds a single-node k3s cluster in a Linux VM, installs the components the
-[recommendations catalog](https://github.com/engawahq/recommendations) marks as recommended for
-ingress, certificates, metrics and node updates, installs Genkan, and signs `kubectl` on a Mac
-in with a passkey. It takes about half an hour, most of it downloads and one Rust build.
+By the end of this guide you will run `kubectl get pods` on your computer, confirm with your
+passkey, and get into a k3s cluster without an admin kubeconfig on your computer. It takes
+about half an hour, most of it spent on downloads and one Rust build.
 
-The cluster admin's kubeconfig never leaves the VM. The Mac only gets the cluster's CA
-certificate and an OIDC configuration; every request it makes carries a short-lived token
-issued after a passkey sign-in.
+You will:
+
+1. install k3s on an Ubuntu server;
+2. add an ingress, cert-manager and a few other basics from the
+   [recommendations catalog](https://github.com/engawahq/recommendations);
+3. build and install Genkan, and publish its sign-in page over HTTPS;
+4. tell kube-apiserver to trust Genkan's tokens;
+5. create your passkey and point `kubectl` on your computer at the cluster.
+
+The guide talks about two machines:
+
+- **Your computer** runs the browser and `kubectl`. It can run macOS, Linux or Windows. The
+  commands are written for a POSIX shell; on Windows, use WSL.
+- **The server** runs k3s and Genkan. Any Ubuntu machine your computer can reach over the
+  network works: a VPS, a homelab box, a spare PC or a local VM.
+
+The cluster's admin kubeconfig stays on the server, where you use it only to install things. Your
+computer gets the cluster's CA certificate and a kubeconfig that signs in through Genkan. Every
+request it sends carries a token that expires within minutes.
 
 ```text
-Mac                                         VM (k3s)
- browser ──https://genkan-k3s.shared──▶ Traefik :443 ──▶ genkan (genkan-system)
- kubectl ──https://genkan-k3s.shared:6443──▶ kube-apiserver
+Your computer                               server (k3s)
+ browser ──https://genkan.example.test──▶ Traefik :443 ──▶ genkan (genkan-system)
+ kubectl ──https://genkan.example.test:6443──▶ kube-apiserver
                                               │ verifies tokens itself; discovery and keys
                                               └─▶ https://<genkan ClusterIP> (internal TLS)
 ```
 
-The example uses a Parallels VM on an Apple silicon Mac; any Linux VM the Mac can reach works.
-Names used throughout:
+The examples use these names. Replace them with yours as you go:
 
-| Name | Value here |
+| Name | In the examples |
 |---|---|
-| VM host name, as the Mac resolves it | `genkan-k3s.shared` (Parallels adds it to `/etc/hosts`) |
-| Issuer | `https://genkan-k3s.shared` |
-| VM user | `parallels`, with `sudo` |
+| The server's host name | `genkan.example.test` |
+| Issuer (Genkan's public URL) | `https://genkan.example.test` |
+| SSH login to the server | `ubuntu@genkan.example.test`, a user with `sudo` |
+
+The host name must lead your computer to the server. With a domain of your own, add a DNS
+record. Names under `.test` never resolve on the internet, so for those add a line to your
+hosts file instead (`/etc/hosts`, or `C:\Windows\System32\drivers\etc\hosts` on Windows).
 
 ## What you need
 
-- **Mac:** Nix, `kubectl`, and the [mkcert](https://github.com/FiloSottile/mkcert) local CA
-  trusted (`nix shell nixpkgs#mkcert -c mkcert -install`; it asks for your password once).
-  Firefox needs `nss` as well; Safari and Chrome use the system trust store.
-- **VM:** Ubuntu (24.04 or later), 4 CPUs, 8 GiB memory, 30 GiB free disk, Docker, Nix with
-  flakes, and SSH access from the Mac. The VM user must be in the `docker` group.
-- Checkouts of [genkan](https://github.com/engawahq/genkan) and
-  [recommendations](https://github.com/engawahq/recommendations) side by side on the Mac.
+On **your computer**:
 
-## 1. Create the VM
+- `kubectl`;
+- [kubelogin](https://github.com/int128/kubelogin), the `kubectl` plugin that opens the browser
+  to sign in. Install it with [krew](https://krew.sigs.k8s.io/) (`kubectl krew install
+  oidc-login`), Homebrew (`brew install int128/kubelogin/kubelogin`) or Nix
+  (`nixpkgs#kubelogin-oidc`);
+- [mkcert](https://github.com/FiloSottile/mkcert), with its local CA trusted where your browser
+  runs: run `mkcert -install` once (it may ask for your password). Firefox also needs NSS's
+  `certutil`; see mkcert's README. With WSL, the browser runs on Windows, so use the Windows
+  build of mkcert, both here and in step 5.
+- `ssh` access to the server.
 
-Clone your own Ubuntu base VM, prepared with the prerequisites above, instead of changing it.
-The example names that user-provided base `ubuntu-base`; replace it with your VM's name.
-Give the clone its own identity: it shares the base's machine ID (and so its DHCP identity and
-journal directory) and SSH host keys.
+On **the server**: Ubuntu 24.04 or later, 4 CPUs, 8 GiB memory, 30 GiB free disk, Docker, and
+Nix with flakes. Your user must be in the `docker` group. Use a machine that runs nothing else
+important: this guide installs k3s and changes its configuration.
+
+Set the SSH login once in each shell on your computer, so the commands below can use it:
 
 ```sh
-prlctl clone ubuntu-base --name genkan-k3s
-prlctl start genkan-k3s
-prlctl exec genkan-k3s 'rm -f /etc/machine-id /var/lib/dbus/machine-id && systemd-machine-id-setup \
-  && rm -f /etc/ssh/ssh_host_* && ssh-keygen -A && systemctl restart ssh systemd-journald'
-ssh parallels@genkan-k3s.shared true    # accept the new host key
+SERVER=ubuntu@genkan.example.test
 ```
 
-Copy both repositories to the VM:
+## 1. Get the code
+
+On the server, clone both repositories into your home directory:
 
 ```sh
-rsync -a --delete --exclude target genkan/ parallels@genkan-k3s.shared:genkan/
-rsync -a --delete --exclude out recommendations/ parallels@genkan-k3s.shared:recommendations/
+git clone https://github.com/engawahq/genkan.git ~/genkan
+git clone https://github.com/engawahq/recommendations.git ~/recommendations
 ```
 
 The first `nix develop` in each checkout downloads its toolchain (about 1–2 GB for Genkan). On
-a slow connection this is the longest step.
+a slow connection, this is the longest step.
 
 ## 2. Install k3s
 
-On the VM, as root. Traefik and metrics-server are disabled so that both come from the
-catalog's charts. kube-apiserver gets its `AuthenticationConfiguration` from a file that starts
-with no issuer; Genkan's comes later and is picked up without a restart.
+Run this on the server. Before installing k3s, it:
+
+- turns off k3s's built-in Traefik and metrics-server, because step 3 installs them from the
+  catalog;
+- adds `genkan.example.test` to the API server's certificate, so your computer can connect by
+  that name;
+- points kube-apiserver at an authentication file that is empty for now. Step 6 fills it in,
+  and kube-apiserver picks up the change without a restart.
 
 ```sh
 sudo mkdir -p /etc/rancher/k3s/genkan /etc/rancher/k3s/config.yaml.d
-printf 'apiVersion: apiserver.config.k8s.io/v1\nkind: AuthenticationConfiguration\nanonymous:\n  enabled: false\njwt: []\n' \
-  | sudo tee /etc/rancher/k3s/genkan/authn.yaml >/dev/null
+sudo tee /etc/rancher/k3s/genkan/authn.yaml >/dev/null <<'EOF'
+apiVersion: apiserver.config.k8s.io/v1
+kind: AuthenticationConfiguration
+anonymous:
+  enabled: false
+jwt: []
+EOF
 sudo tee /etc/rancher/k3s/config.yaml >/dev/null <<'EOF'
 # Traefik and metrics-server come from the recommendations catalog instead.
 disable: [traefik, metrics-server]
-# The name the Mac uses for the API server.
-tls-san: [genkan-k3s.shared]
+# The name your computer uses for the API server.
+tls-san: [genkan.example.test]
 EOF
 sudo tee /etc/rancher/k3s/config.yaml.d/50-genkan.yaml >/dev/null <<'EOF'
 kube-apiserver-arg:
@@ -87,17 +117,18 @@ install -d -m 700 ~/.kube
 sudo install -o "$USER" -m 600 /etc/rancher/k3s/k3s.yaml ~/.kube/config
 ```
 
-`~/.kube/config` is the cluster-admin credential. Keep it on the VM; it is only for installing
+`~/.kube/config` is the cluster-admin credential. Keep it on the server, and use it only to install
 things.
 
-From here on, run `kubectl` inside `nix develop` (either checkout provides it). The `kubectl`
-that k3s installs reads `/etc/rancher`, which only root can, and warns on every call.
+From here on, run `kubectl` on the server inside `nix develop` (either checkout provides it). The
+`kubectl` that comes with k3s tries to read `/etc/rancher`, which only root can read, and warns
+on every call.
 
 ## 3. Install the recommended components
 
-The catalog is data, not an installer, so this short script installs one component's releases
-in order: Helm charts with the shared values plus one profile's, or upstream manifests. Save it
-as `~/install-component.sh` on the VM and make it executable.
+The catalog lists components but does not install them. This short script installs one
+component: it applies the component's Helm charts or manifests in order, using the shared
+values plus those of one profile. Save it as `~/install-component.sh` on the server.
 
 ```bash
 #!/usr/bin/env bash
@@ -151,8 +182,9 @@ done
 chmod +x ~/install-component.sh
 ```
 
-It does not handle a component's `inputs` or `contributes`; the four below have neither. Install
-them in dependency order (cert-manager depends on ingress for the Gateway API CRDs):
+Install these four components in this order; cert-manager needs the Gateway API CRDs that the
+ingress installs. (The script does not handle a component's `inputs` or `contributes`; these
+four have neither.)
 
 ```sh
 cd ~/recommendations && nix develop
@@ -163,51 +195,56 @@ kubectl get gatewayclass traefik          # ACCEPTED True
 kubectl top nodes                         # metrics-server answers after about a minute
 ```
 
-The catalog also recommends VictoriaMetrics and VictoriaLogs for single-node clusters. They are
-left out here to keep the cluster small; install them the same way
-(`observability-operator/victoria-metrics-operator`, then `metrics/victoria-metrics` and
-`logs/victoria-logs`) once you have checked their `inputs`.
+The catalog also recommends VictoriaMetrics and VictoriaLogs for single-node clusters. This
+guide leaves them out to keep the cluster small. To add them later, install
+`observability-operator/victoria-metrics-operator`, then `metrics/victoria-metrics` and
+`logs/victoria-logs` the same way, after checking their `inputs`.
 
 ## 4. Build and install Genkan
 
-Genkan has no published image yet, so build it on the VM (Linux, same architecture as the
-node) and import it into k3s's containerd:
+Genkan has no published image yet, so build one on the server and load it into k3s. Building on
+the server gives you a Linux image for the node's CPU architecture. You also build `genkanctl`,
+the admin tool you use for the rest of the guide.
 
 ```sh
 cd ~/genkan && nix develop
 ./scripts/build-image.sh genkan:dev                       # about 20 MB
 docker save genkan:dev | sudo k3s ctr images import -
 cargo build --release -p genkanctl && alias genkanctl=$PWD/target/release/genkanctl
+```
 
-export GENKAN_ISSUER=https://genkan-k3s.shared
+Now install it. `genkanctl` reads the issuer from `GENKAN_ISSUER`, so set it once per shell and
+the commands do not need `--issuer`:
+
+```sh
+export GENKAN_ISSUER=https://genkan.example.test
 genkanctl crds | kubectl apply --server-side -f -
 genkanctl manifests --image docker.io/library/genkan:dev \
   --serve-arg=--invitations | kubectl apply --server-side -f -
 kubectl -n genkan-system rollout status deploy/genkan
 ```
 
-Everything Genkan owns lives in the `genkan-system` namespace. `genkanctl` reads the exported
-`GENKAN_ISSUER` for commands that need an issuer, so the examples omit `--issuer`. Export it
-again if you open another VM shell. Invitations are enabled so the links you issue when
-[adding users](managing-users.md#add-someone) can be redeemed.
+Everything Genkan owns lives in the `genkan-system` namespace. `--serve-arg=--invitations`
+turns on invitation links, which you use later to [add people](managing-users.md#add-someone).
 
-## 5. Publish the issuer over HTTPS
+## 5. Publish the sign-in page over HTTPS
 
-Passkeys need a secure context, so the browser must trust the sign-in page's certificate. On
-the Mac, issue a certificate for the issuer's host name from the mkcert CA. Only the leaf
-certificate and its key go to the VM; the CA key stays on the Mac.
+Browsers offer passkeys only on pages they trust, so Genkan's sign-in page needs a certificate
+your browser accepts. This guide uses mkcert's local CA. With a real domain, use a cert-manager
+`ClusterIssuer` (ACME) and a `Certificate` instead.
+
+On your computer, issue a certificate for the issuer's host name and copy it to the server. Only the
+certificate and its key leave your computer; the CA's key stays.
 
 ```sh
-# Mac
-mkcert -cert-file genkan.crt -key-file genkan.key genkan-k3s.shared
-ssh parallels@genkan-k3s.shared 'install -d -m 700 ~/genkan-tls'
-scp genkan.crt genkan.key parallels@genkan-k3s.shared:genkan-tls/
+mkcert -cert-file genkan.crt -key-file genkan.key genkan.example.test
+ssh "$SERVER" 'install -d -m 700 ~/genkan-tls'
+scp genkan.crt genkan.key "$SERVER":genkan-tls/
 rm genkan.key
 ```
 
-On the VM, store it as a Secret and route the host name to Genkan through Traefik's Gateway
-API support. Traefik's HTTPS entry point listens on 8443 in the pod; k3s's ServiceLB exposes it
-on the node's port 443.
+On the server, store it as a Secret and route the host name to Genkan through Traefik. (Traefik
+listens on 8443 inside its pod; k3s exposes that as port 443 on the node.)
 
 ```sh
 kubectl -n genkan-system create secret tls genkan-tls \
@@ -222,7 +259,7 @@ spec:
   - name: https
     protocol: HTTPS
     port: 8443
-    hostname: genkan-k3s.shared
+    hostname: genkan.example.test
     tls:
       certificateRefs: [{name: genkan-tls}]
     allowedRoutes: {namespaces: {from: Same}}
@@ -232,36 +269,32 @@ kind: HTTPRoute
 metadata: {name: genkan, namespace: genkan-system}
 spec:
   parentRefs: [{name: genkan}]
-  hostnames: [genkan-k3s.shared]
+  hostnames: [genkan.example.test]
   rules:
   - backendRefs: [{name: genkan, port: 80}]
 EOF
 kubectl -n genkan-system wait gateway/genkan --for=condition=Programmed
 ```
 
-Check from the Mac with the system `curl` (Nix's `curl` does not read the macOS keychain):
+Check it from your computer. You should get a JSON document whose `issuer` is
+`https://genkan.example.test`:
 
 ```sh
-/usr/bin/curl https://genkan-k3s.shared/.well-known/openid-configuration
+curl --cacert "$(mkcert -CAROOT)/rootCA.pem" \
+  https://genkan.example.test/.well-known/openid-configuration
 ```
 
-With a real domain, use a cert-manager `ClusterIssuer` (ACME) and a `Certificate` for the
-Secret instead of mkcert.
+### Before going public: rate-limit sign-in
 
-### Limit unauthenticated traffic at the ingress
+Skip this on a server only you can reach. Before you expose Genkan to the internet, limit how often one
+address can call the sign-in endpoints. Genkan does not rate-limit by IP address itself; that
+is the ingress's job, because only the ingress sees the browser's real address.
 
-Apply per-source-IP rate limits to `/authorize`, `/token`, `/par`, `/revoke`, `/login*`,
-`/setup*` and `/upstream/*` before exposing Genkan publicly. Genkan normally sees the ingress address,
-not the browser's address; it does not trust arbitrary forwarded headers or implement
-in-process per-IP limiting. At the ingress, preserve the source IP and, when another proxy
-is in front, configure forwarded-header trust only for that proxy's addresses. Otherwise
-all users may share a bucket, or forged headers may bypass it.
+With the Traefik Gateway above, enable Traefik's Kubernetes CRD provider and install its
+Middleware CRDs (see the [Gateway middleware prerequisites][traefik-extref]), then apply:
 
-For the Traefik Gateway above, enable its Kubernetes CRD provider and install its Middleware
-CRDs, then apply this additional route. Its specific paths take precedence over the
-catch-all route; discovery and keys remain outside the rate limit.
-
-```yaml
+```sh
+kubectl apply -f - <<'EOF'
 apiVersion: traefik.io/v1alpha1
 kind: Middleware
 metadata: {name: genkan-rate-limit, namespace: genkan-system}
@@ -276,7 +309,7 @@ kind: HTTPRoute
 metadata: {name: genkan-rate-limited, namespace: genkan-system}
 spec:
   parentRefs: [{name: genkan}]
-  hostnames: [genkan-k3s.shared]
+  hostnames: [genkan.example.test]
   rules:
   - matches:
     - path: {type: Exact, value: /authorize}
@@ -290,38 +323,33 @@ spec:
     - type: ExtensionRef
       extensionRef: {group: traefik.io, kind: Middleware, name: genkan-rate-limit}
     backendRefs: [{name: genkan, port: 80}]
+EOF
 ```
 
-These are starting values, not a security guarantee: tune for users sharing NAT and expected
-sign-in bursts. Traefik's default bucket key is the remote address; each Traefik replica has
-its own buckets unless distributed rate limiting is configured. See the
-[RateLimit options](https://doc.traefik.io/traefik/reference/routing-configuration/http/middlewares/ratelimit/)
-and [Gateway middleware prerequisites](https://doc.traefik.io/traefik/reference/routing-configuration/kubernetes/gateway-api/#extensionref-filters).
+This route takes precedence over the catch-all route for the listed paths. Discovery and keys
+stay unlimited, because kube-apiserver and every client fetch them.
 
-Genkan additionally limits each business route/method service to 64 concurrent requests.
-Full services immediately return `503` with `Retry-After: 1`, without queuing ahead of the
-ten-second handler timeout. Health/readiness probes and discovery/keys do not share those
-slots. These are per-process concurrency limits, not per-IP rate limits. Overload events are
-logged at DEBUG, not WARN, and directory GETs do not emit per-request INFO logs. Enabling
-DEBUG during a flood can generate substantial log traffic; keep the normal INFO level for
-production incident handling.
+Treat the numbers as a starting point:
 
-Kubernetes directory metadata is watched before the public listener starts. Unknown client
-names are rejected locally, including a flood of distinct random IDs; known clients still
-use a direct GET so secret, redirect URI and audience changes take effect on the next request.
-UserInfo resolves `sub` from watched user metadata and directly reads the user to verify its
-UID and enabled state. Access-token claims do not change. New client names and UserInfo subjects
-become visible after their watch events arrive; watch lag can delay those lookups, never authorize
-stale client/user data. Unknown entries in these indexes never fall back to per-ID API reads.
-Name-based user lookups used by setup, sign-in and refresh remain uncached direct GETs after
-initial synchronization, including absent names; they do not await individual user watch events.
+- People behind one NAT share one address, and so share one limit. Raise it if your office
+  signs in at the same time each morning.
+- If another proxy sits in front of Traefik, configure Traefik to trust forwarded headers from
+  that proxy only. Otherwise everyone shares one bucket, or a forged header gets around it.
+- Each Traefik replica keeps its own count unless you set up distributed rate limiting.
+
+See Traefik's [RateLimit options][traefik-ratelimit] for the details.
+
+[traefik-ratelimit]: https://doc.traefik.io/traefik/reference/routing-configuration/http/middlewares/ratelimit/
+[traefik-extref]: https://doc.traefik.io/traefik/reference/routing-configuration/kubernetes/gateway-api/#extensionref-filters
 
 ## 6. Let kube-apiserver trust Genkan
 
-`genkanctl kube-config` issues the certificate of Genkan's internal listener, which
-kube-apiserver reaches through the Service's ClusterIP, and prints the
-`AuthenticationConfiguration`. Replace the file atomically (kube-apiserver re-reads it by path
-about once a minute):
+kube-apiserver checks Genkan's tokens itself. To do that, it fetches Genkan's signing keys over
+an internal HTTPS connection. `genkanctl kube-config` creates the certificate for that
+connection and prints the configuration kube-apiserver needs.
+
+Write the new configuration to a temporary file and move it into place in one step, so
+kube-apiserver never reads a half-written file. It checks the file about once a minute.
 
 ```sh
 genkanctl kube-config --distro k3s > ~/authn.yaml &&
@@ -329,8 +357,8 @@ genkanctl kube-config --distro k3s > ~/authn.yaml &&
   sudo mv /etc/rancher/k3s/genkan/.authn.yaml.tmp /etc/rancher/k3s/genkan/authn.yaml
 ```
 
-Wait for a successful reload (up to three minutes). Before the first reload, this metric may
-not exist yet:
+Wait until kube-apiserver reports a successful reload. This loop checks its metrics every five
+seconds for up to three minutes, and prints the k3s log if the reload never succeeds:
 
 ```sh
 reloaded=false
@@ -350,71 +378,63 @@ if [ "$reloaded" != true ]; then
 fi
 ```
 
-### Renew the internal certificate
+The internal certificate is valid for a year. [Renew it](#once-a-year-renew-the-internal-certificate)
+before then.
 
-The internal certificate expires after **365 days** by default (`--certificate-validity`).
-Renew it before expiry; an expired certificate prevents kube-apiserver from fetching Genkan's
-discovery and signing keys. `kube-config` reuses a usable certificate, automatically replacing
-it when fewer than 30 days remain; `--renew-certificate` forces replacement now.
+## 7. Register kubectl and create the first passkey
 
-On the VM, using its cluster-admin kubeconfig and the issuer exported in step 4:
-
-```sh
-authn=$(mktemp) &&
-  genkanctl kube-config --distro k3s --renew-certificate > "$authn" &&
-  sudo install -m 600 "$authn" /etc/rancher/k3s/genkan/.authn.yaml.tmp &&
-  sudo mv /etc/rancher/k3s/genkan/.authn.yaml.tmp /etc/rancher/k3s/genkan/authn.yaml &&
-  rm "$authn"
-```
-
-The `&&` chain leaves the installed configuration untouched if generation or staging fails.
-Renewal also creates a new CA, so **install the newly printed configuration**, not the old one.
-Genkan picks up the new certificate within a minute; kube-apiserver also reloads its file.
-There can be a brief authentication interruption while they converge. Check the reload metric
-above and repeat `kubectl auth whoami` on the Mac after renewal.
-
-## 7. Register kubectl and enrol the first passkey
-
-kubectl's OIDC plugin ([kubelogin](https://github.com/int128/kubelogin)) is a public client
-that receives the code on a loopback redirect:
+Every application that signs in through Genkan is registered as a client. Register `kubectl`
+(through kubelogin, which receives the sign-in result on `127.0.0.1`). `--allow-elevation`
+lets this client ask for admin rights:
 
 ```sh
 genkanctl client create kubectl --type public --allow-elevation \
   --redirect-uri http://127.0.0.1:8000/ --audience kubernetes | kubectl apply -f -
+```
+
+Then get a one-time link for the first admin:
+
+```sh
 genkanctl setup-link --username admin
 ```
 
-Open the printed link on the Mac and create a passkey. The link works once and expires in 60
-minutes; run the command again for a new one.
+Open the printed link in the browser on your computer and create a passkey. The link works
+once and expires after 60 minutes; run the command again if you need a new one.
 
-## 8. kubectl on the Mac
+## 8. Set up kubectl on your computer
 
-Get the cluster's CA certificate (public; it only lets the Mac verify the API server):
+Copy the cluster's CA certificate from the server. It is public; it only lets `kubectl` check that
+it talks to the right API server.
 
 ```sh
-CA=$(ssh parallels@genkan-k3s.shared "grep certificate-authority-data ~/.kube/config | awk '{print \$2}'")
+CA=$(ssh "$SERVER" "grep certificate-authority-data ~/.kube/config | awk '{print \$2}'")
 ```
 
-Write `~/.kube/genkan-k3s.yaml`, with `$CA` substituted. It has two users: a normal one, and
-one that asks for the `elevate` scope and caches its tokens separately.
+Then write a kubeconfig with two contexts:
 
-```yaml
+- `genkan-k3s` for everyday work: read-only by default, and renews itself quietly;
+- `genkan-k3s-admin` for changes: asks for your passkey every time, and keeps its tokens apart
+  from the everyday ones.
+
+```sh
+mkdir -p ~/.kube
+cat > ~/.kube/genkan-k3s.yaml <<EOF
 apiVersion: v1
 kind: Config
 clusters:
 - name: genkan-k3s
   cluster:
-    server: https://genkan-k3s.shared:6443
-    certificate-authority-data: <CA>
+    server: https://genkan.example.test:6443
+    certificate-authority-data: $CA
 users:
 - name: passkey
   user:
     exec:
       apiVersion: client.authentication.k8s.io/v1
       interactiveMode: IfAvailable
-      command: nix
-      args: [shell, "nixpkgs#kubelogin-oidc", -c, kubectl-oidc_login, get-token,
-        --oidc-issuer-url=https://genkan-k3s.shared,
+      command: kubectl
+      args: [oidc-login, get-token,
+        --oidc-issuer-url=https://genkan.example.test,
         --oidc-client-id=kubectl,
         --oidc-use-access-token,
         --listen-address=127.0.0.1:8000,
@@ -424,9 +444,9 @@ users:
     exec:
       apiVersion: client.authentication.k8s.io/v1
       interactiveMode: IfAvailable
-      command: nix
-      args: [shell, "nixpkgs#kubelogin-oidc", -c, kubectl-oidc_login, get-token,
-        --oidc-issuer-url=https://genkan-k3s.shared,
+      command: kubectl
+      args: [oidc-login, get-token,
+        --oidc-issuer-url=https://genkan.example.test,
         --oidc-client-id=kubectl,
         --oidc-use-access-token,
         --oidc-extra-scope=elevate,
@@ -437,10 +457,14 @@ contexts:
 - {name: genkan-k3s, context: {cluster: genkan-k3s, user: passkey}}
 - {name: genkan-k3s-admin, context: {cluster: genkan-k3s, user: passkey-elevated}}
 current-context: genkan-k3s
+EOF
 ```
 
-`--oidc-use-access-token` is required: kube-apiserver accepts only access tokens (they carry
-`client_id`) and rejects ID tokens.
+If you installed kubelogin with Homebrew or Nix rather than krew, set `command: kubelogin`
+(Nix: `kubectl-oidc_login`) and drop `oidc-login` from `args`.
+
+Keep `--oidc-use-access-token`: kube-apiserver accepts only Genkan's access tokens, not ID
+tokens.
 
 ## 9. Try it
 
@@ -448,48 +472,85 @@ current-context: genkan-k3s
 export KUBECONFIG=~/.kube/genkan-k3s.yaml
 kubectl auth whoami                      # opens the browser; user genkan:admin, group genkan:admins
 kubectl get pods -A                      # allowed: genkan:admins has the built-in view role
-kubectl create namespace demo            # Forbidden: a normal token cannot change anything
+kubectl create namespace demo            # Forbidden: an everyday token cannot change anything
 kubectl --context genkan-k3s-admin create namespace demo
-                                         # a fresh passkey sign-in; the token lasts at most
-                                         # 5 minutes, cannot be refreshed, and carries
-                                         # genkan:elevated:admins (cluster-admin)
+                                         # asks for your passkey again; works for 5 minutes
 kubectl --context genkan-k3s-admin auth whoami
+                                         # now also in genkan:elevated:admins (cluster-admin)
 ```
 
-Things to notice:
+What just happened:
 
-- Normal tokens last 10 minutes. Refresh is silent until 12 hours after sign-in, or until the
-  session has been unused for 4 hours (`--refresh-absolute` and `--refresh-idle` defaults).
-  Elevated tokens cannot be refreshed and ask for the passkey again after expiry.
-- `kubectl auth whoami` shows `genkan.engawahq.dev/jti` and `client_id` in its extra fields, so
-  audit events tie each request to one token issuance.
-- Users, passkeys and sessions are custom resources: a passkey is a `Credential`, and a session
-  is a `Grant`. Inspect them with `kubectl -n genkan-system get users,credentials,grants`
-  (as cluster admin on the VM); see [Managing users](managing-users.md) for revocation.
+- **Everyday tokens** last 10 minutes and renew without a prompt. You sign in again 12 hours
+  after the first sign-in, or after 4 hours without using `kubectl`.
+- **Admin tokens** last at most 5 minutes and never renew. When one expires, the admin context
+  asks for your passkey again.
+- **Each token is traceable.** `kubectl auth whoami` shows `genkan.engawahq.dev/jti` and
+  `client_id`. They also appear in Kubernetes audit events, so each request maps to one sign-in.
+- **People, passkeys and sessions are Kubernetes objects** in `genkan-system`: a passkey is a
+  `Credential`, and a signed-in session is a `Grant`. On the server, list them with
+  `kubectl -n genkan-system get users,credentials,grants`.
+  [Managing users](managing-users.md) explains how to work with them.
 
 ## Next
 
-- [Manage users](managing-users.md): invite people, add passkeys, revoke sessions or remove access.
+- [Manage users](managing-users.md): invite people, add passkeys, sign people out or remove
+  them.
 - [Sign in with GitHub](github-sign-in.md) or [Google](google-sign-in.md) as an alternative
-  to the passkey for ordinary access.
+  to the passkey for everyday access.
 - [Register more clients](clients.md), such as Grafana or Argo CD, so they sign people in
   through Genkan too.
 
+## Once a year: renew the internal certificate
+
+The certificate from step 6 is valid for 365 days. If it expires, kube-apiserver can no longer
+fetch Genkan's keys, and every sign-in to the cluster fails. Running `genkanctl kube-config`
+again replaces the certificate automatically when it has less than 30 days left;
+`--renew-certificate` replaces it now.
+
+On the server, with `GENKAN_ISSUER` exported as in step 4:
+
+```sh
+authn=$(mktemp) &&
+  genkanctl kube-config --distro k3s --renew-certificate > "$authn" &&
+  sudo install -m 600 "$authn" /etc/rancher/k3s/genkan/.authn.yaml.tmp &&
+  sudo mv /etc/rancher/k3s/genkan/.authn.yaml.tmp /etc/rancher/k3s/genkan/authn.yaml &&
+  rm "$authn"
+```
+
+Renewal creates a new CA as well, so install the configuration this command prints, not the
+one from step 6. If any step fails, the `&&` chain stops and the installed file stays as it
+was. Sign-ins can fail briefly while Genkan and kube-apiserver both pick up the change (each
+within about a minute). Then run the reload check from step 6, and `kubectl auth whoami` on your computer.
+
+To change the validity, use `--certificate-validity`; see the
+[genkanctl README](../crates/genkanctl/README.md#configure-token-limits-and-certificates).
+
 ## Troubleshooting
 
-- **Browser shows a certificate error, or no passkey prompt:** the mkcert CA is not trusted
-  (`mkcert -install`), or the certificate's name does not match the issuer host.
-- **`kubectl` gets `Unauthorized`:** check the reload metric in step 6. Validation errors make
-  kube-apiserver skip a file until it changes. On k3s, its log is
+- **The browser shows a certificate error, or offers no passkey:** mkcert's CA is not trusted
+  where the browser runs (`mkcert -install`), or the certificate's name does not match the
+  issuer's host name.
+- **`kubectl` says `Unauthorized`:** run the reload check in step 6. If kube-apiserver finds an
+  error in the file, it ignores the file until it changes. On k3s, look for the reason with
   `sudo journalctl -u k3s | grep -i "authentication config"`.
-- **`journalctl` finds no journal files on a cloned VM:** the machine ID changed; restart
-  `systemd-journald`.
-- **Port 8000 in use:** kubelogin listens there for the redirect. Change `--listen-address` and
-  `--oidc-redirect-url` together; any port on `127.0.0.1` matches the registered redirect URI.
+- **Port 8000 is in use:** kubelogin listens there for the browser's redirect. Change
+  `--listen-address` and `--oidc-redirect-url` together; any port on `127.0.0.1` matches the
+  registered redirect URI.
 
 ## Clean up
 
+On the server, uninstall k3s. This removes the cluster, Genkan and everything else installed
+in it:
+
 ```sh
-prlctl stop genkan-k3s && prlctl delete genkan-k3s
-rm ~/.kube/genkan-k3s.yaml; rm -rf ~/.kube/cache/oidc-login ~/.kube/cache/oidc-login-elevated
+sudo /usr/local/bin/k3s-uninstall.sh
+rm -rf ~/genkan-tls ~/authn.yaml ~/install-component.sh
+```
+
+Then, on your computer:
+
+```sh
+rm ~/.kube/genkan-k3s.yaml
+rm -rf ~/.kube/cache/oidc-login ~/.kube/cache/oidc-login-elevated
 ```

@@ -16,7 +16,13 @@ minute, so mount a host *directory* (atomic renames inside it are seen) and star
 
 ```sh
 mkdir -p ~/genkan-authn
-printf 'apiVersion: apiserver.config.k8s.io/v1\nkind: AuthenticationConfiguration\nanonymous:\n  enabled: false\njwt: []\n' > ~/genkan-authn/authn.yaml
+cat > ~/genkan-authn/authn.yaml <<'EOF'
+apiVersion: apiserver.config.k8s.io/v1
+kind: AuthenticationConfiguration
+anonymous:
+  enabled: false
+jwt: []
+EOF
 k3d cluster create genkan --image rancher/k3s:v1.36.5-k3s1 --no-lb --wait \
   --volume "$HOME/genkan-authn:/etc/rancher/k3s/genkan@server:0" \
   --k3s-arg "--kube-apiserver-arg=authentication-config=/etc/rancher/k3s/genkan/authn.yaml@server:0"

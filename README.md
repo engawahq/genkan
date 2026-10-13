@@ -68,8 +68,9 @@ rights, then back to read-only.
 
 ## Get started
 
-The [step-by-step guide](docs/get-started.md) builds a k3s cluster in a VM, installs Genkan and
-signs `kubectl` in with a passkey from your Mac, in about half an hour.
+The [step-by-step guide](docs/get-started.md) installs k3s on an Ubuntu server (a VPS, a
+homelab box or a VM), installs Genkan, and signs `kubectl` in with a passkey from your own
+computer (macOS, Linux or Windows), in about half an hour.
 
 On a cluster you already run, the shape of it is below. Every `genkanctl` subcommand that needs
 an issuer reads `GENKAN_ISSUER`, so these examples do not repeat `--issuer`.

@@ -1,40 +1,36 @@
 # Sign in with Google
 
-Genkan can offer **Continue with Google** next to the passkey on its sign-in page. This guide
-assumes an installed cluster, namespace `genkan-system`, and `genkanctl` and `kubectl` running
-with the cluster admin's kubeconfig.
+Genkan can show **Continue with Google** next to the passkey button on its sign-in page, so
+people can sign in with their Google account for everyday access. This guide assumes Genkan is
+installed in the `genkan-system` namespace and that you run `genkanctl` and `kubectl` with the
+cluster admin's kubeconfig.
 
 ## Before you start
 
-Use an HTTPS issuer on a domain you control, such as `https://genkan.example.com` (replace it
-with your actual issuer throughout this guide). Google's [redirect URI rules][redirect-rules]
-require a hostname under a public suffix, so the local `genkan-k3s.shared` hostname from
-[Get started](get-started.md) cannot be used for this provider. Choose the hostname before
-installing, and use it consistently for Genkan, its TLS certificate, kube-apiserver and client
-configuration. Changing only the shell variable on an existing installation does not change
-its issuer.
+**You need a real domain.** Google accepts only redirect URIs on a public domain
+([rules][redirect-rules]), so the local `genkan.example.test` name from
+[Get started](get-started.md) does not work here. The examples use `https://genkan.example.com`;
+replace it with your issuer throughout. The issuer is fixed when you install Genkan: the same
+name has to appear in Genkan's deployment, its TLS certificate and kube-apiserver's
+configuration. Changing `GENKAN_ISSUER` in your shell later does not move an existing
+installation.
 
 ```sh
 export GENKAN_ISSUER=https://genkan.example.com
 ```
 
-`genkanctl` reads `GENKAN_ISSUER`, so its commands below omit the issuer argument. When following
-links to Managing users, keep your actual issuer rather than copying that guide's local example.
-The browser must reach Genkan at this hostname and trust its TLS certificate. The pod needs
-outbound HTTPS to `oauth2.googleapis.com` (code exchange) and `www.googleapis.com` (signing keys);
-the browser visits `accounts.google.com` to sign in.
+**Network access.** Browsers must reach Genkan at that name and trust its certificate. Genkan's
+pod needs outbound HTTPS to `oauth2.googleapis.com` and `www.googleapis.com`.
 
-## What it does and does not do
+## What to expect
 
-- **Only a linked account can sign in.** Genkan does not create a user on first sign-in or match
-  an account by email, display name or Workspace domain. Groups and display names come from the
-  `User`, not Google.
-- **The identity is Google's stable `sub`, with issuer `https://accounts.google.com`.** Genkan
-  requests only `openid`, not `email` or `profile`. It validates the ID token's signature,
-  issuer, client audience, expiry and nonce. It does not read or require `email_verified`;
-  even a verified email address is not an account-linking rule.
-- **Ordinary access only.** Google sign-in never grants elevated groups, even when the Google
-  account uses MFA. Elevation requires a passkey.
+- **You decide who can sign in.** A Google account works only after it has been linked to a
+  Genkan user (step 3). Genkan never creates users on first sign-in, and never matches accounts
+  by email address, name or Workspace domain. Groups and display names come from the `User`.
+- **Genkan remembers Google's stable account ID** (`sub`), and asks Google for nothing else: no
+  email address, no profile.
+- **Not for admin rights.** Even if the Google account uses two-factor authentication, admin
+  sign-ins always need a passkey.
 
 ## 1. Register a Google OAuth client
 
@@ -42,11 +38,10 @@ Follow Google's [OpenID Connect setup][google-oidc] and [consent-screen guide][g
 
 1. Select or create a project in Google Cloud Console. Under **Google Auth platform →
    Branding**, configure the app name, support email and contact details.
-2. Under **Audience**, choose **Internal** for members of the project's Google Cloud
-   organization, or **External** for other Google accounts. Google controls this restriction;
-   it does not replace Genkan's account-linking requirement. Review Google's
-   [audience and publishing rules][google-audience]. Its testing-mode test-user and seven-day
-   authorization limits have an exception for `openid`-only sign-in, which Genkan uses.
+2. Under **Audience**, choose **Internal** to allow only your Google Workspace organization,
+   or **External** for any Google account. People still need a linked Genkan user either way.
+   Google's [publishing rules][google-audience] limit apps in testing mode, but not apps that
+   ask only for `openid`, as Genkan does.
 3. Under **Data Access**, declare only the `openid` scope; no Google API data access is needed.
 4. Under **Clients → Create Client**, choose **Web application**. Give it a name and add this
    **Authorized redirect URI**, substituting your issuer:
@@ -55,15 +50,15 @@ Follow Google's [OpenID Connect setup][google-oidc] and [consent-screen guide][g
    https://genkan.example.com/upstream/google/callback
    ```
 
-   It must match `<issuer>/upstream/google/callback` exactly. Genkan uses a server-side code
-   exchange, not a JavaScript SDK, so no authorized JavaScript origin is needed.
-5. Save the **Client ID** and **client secret** securely. Genkan needs the secret string, not
-   the downloaded client JSON file.
+   It must be exactly `<issuer>/upstream/google/callback`. Leave **Authorized JavaScript
+   origins** empty.
+5. Note the **Client ID** and the **client secret**. Genkan needs the secret itself, not the
+   JSON file Google offers to download.
 
 ## 2. Store the secret and enable Google
 
-For a new `genkan-config` Secret, run this in Bash to keep the secret out of shell history and
-command arguments:
+Genkan reads secrets from files in a Kubernetes Secret, mounted at `/etc/genkan`. Create it
+like this, so the secret stays out of your shell history and the process list:
 
 ```sh
 read -rs GOOGLE_SECRET     # paste the client secret, then Enter
@@ -72,14 +67,14 @@ printf %s "$GOOGLE_SECRET" | kubectl -n genkan-system create secret generic genk
 unset GOOGLE_SECRET
 ```
 
-If the Secret already exists, add `google-client-secret` with your secret-management tool or
-`kubectl -n genkan-system edit secret genkan-config` (Secret `data` values are base64-encoded).
-Do not replace its other keys, such as the [GitHub secret](github-sign-in.md#2-store-the-client-secret).
+If `genkan-config` already exists (for example with the
+[GitHub secret](github-sign-in.md#2-store-the-client-secret)), add the `google-client-secret`
+key to it instead, with `kubectl -n genkan-system edit secret genkan-config` (values are
+base64-encoded) or your secret-management tool.
 
-Regenerate the manifests with both Google flags and the Secret mount. Invitation links need
-`--invitations`, included here for linking accounts. **Keep your deployed image, namespace,
-`--config-secret` and every existing `--serve-arg`**; omitted options are not preserved. The
-image below is the local walkthrough's image, so substitute yours if different:
+Then regenerate the deployment with the Secret and the two Google options. `genkanctl
+manifests` does not remember earlier options, so pass everything you installed with (image,
+namespace, other `--serve-arg`s) plus the new ones. Keep `--invitations`: step 3 needs it.
 
 ```sh
 GOOGLE_CLIENT_ID=1234567890-example.apps.googleusercontent.com   # replace with your client ID
@@ -92,61 +87,61 @@ genkanctl manifests --image docker.io/library/genkan:dev \
 kubectl -n genkan-system rollout status deploy/genkan
 ```
 
-The Secret is mounted read-only at `/etc/genkan`; its key becomes the file named by
-`--google-client-secret-file`. Both the client ID and secret-file flags are required. The
-sign-in page now offers **Continue with Google**.
+The sign-in page now shows **Continue with Google**.
 
 ## 3. Link an account and sign in
 
-Use [Add someone](managing-users.md#add-someone) for a new user, or
-[Add another passkey or device](managing-users.md#add-another-passkey-or-device) to invite an
-existing username. On the link, choose **Continue with Google**, then select the intended
-Google account. Verify the person's identity before giving them a link: whoever redeems it
-controls that Genkan user. Each link adds one credential, so issue a separate link for a
-passkey or another account.
+People link their Google account with the same one-time link they would use for a passkey:
 
-Genkan creates an immutable `Credential` of type `Google`, with the account's issuer and `sub`,
-a user label and an owner reference to the current `User`. An account already linked here
-cannot be linked again while that credential exists.
+- for a new person, [invite them](managing-users.md#add-someone);
+- for an existing user, [invite the same username again](managing-users.md#add-another-passkey-or-device).
 
-To try ordinary sign-in with the kubelogin setup from Get started, select your Genkan
-kubeconfig, remove the client's cached session and start a fresh sign-in:
+On the link, they choose **Continue with Google** and pick the Google account they want to use.
+Whoever opens the link controls that Genkan user, so make sure it reaches the right person.
+Each link adds one passkey or one account; send another link to add more. A Google account can
+be linked to only one user at a time.
+
+To try it with the `kubectl` setup from Get started, clear the cached session so kubelogin
+opens the browser again:
 
 ```sh
 rm -rf ~/.kube/cache/oidc-login
 kubectl auth whoami          # choose "Continue with Google"
 ```
 
-Requests for the `elevate` scope still require a passkey.
+The admin context still asks for a passkey.
 
-## Credentials, sessions and provider changes
+## Later changes
 
-- To unlink an account, [delete its credential](managing-users.md#see-and-revoke-credentials).
-  This stops new sign-ins but does not end existing Genkan sessions;
-  [delete its grants too](managing-users.md#sign-someone-out). For complete offboarding, follow
-  [Suspend or remove someone](managing-users.md#suspend-or-remove-someone).
-- Genkan reads the client secret at startup. After replacing the Secret key, run
-  `kubectl -n genkan-system rollout restart deploy/genkan` and wait for
-  `kubectl -n genkan-system rollout status deploy/genkan`. Updating the mounted Secret alone
-  does not reload the secret into the running server.
-- To disable Google sign-in, regenerate the manifests without both `--google-*` arguments,
-  keeping all other options, and remove the OAuth client in Google Cloud Console if it is no
-  longer needed. Stored Genkan credentials and sessions remain; revoke them using the shared
-  management flows when required.
+- **Remove someone's access.** A linked Google account is a `Credential`, like a passkey.
+  [Remove it](managing-users.md#remove-a-passkey-or-linked-account) to stop new sign-ins, and
+  [sign the person out](managing-users.md#sign-someone-out) to end running sessions. To take
+  away all access, [suspend or remove the user](managing-users.md#suspend-or-remove-someone).
+- **Replace the client secret.** Genkan reads it only at startup. After updating the Secret,
+  restart Genkan:
+
+  ```sh
+  kubectl -n genkan-system rollout restart deploy/genkan
+  kubectl -n genkan-system rollout status deploy/genkan
+  ```
+
+- **Turn Google sign-in off.** Regenerate the deployment without the two `--google-*` options
+  (keep all the others), and delete the OAuth client in Google Cloud Console if you no longer
+  need it. Linked accounts and running sessions stay until you remove them as above.
 
 ## Troubleshooting
 
 - **`redirect_uri_mismatch`:** check the client ID and the exact authorized redirect URI,
-  including scheme, hostname and `/upstream/google/callback`. The local `.shared` hostname
-  does not meet Google's domain rules.
+  including scheme, hostname and `/upstream/google/callback`. A local name such as
+  `genkan.example.test` does not meet Google's domain rules.
 - **`org_internal` or a Google access-policy error:** check the app's Audience and the account's
   organization policies; see [Google's audience rules][google-audience].
 - **"This account is not linked to any user here":** use an invitation to link the selected
   Google account; a matching email address or name does not suffice.
 - **"This sign-in needs a passkey":** the client requested elevation; use a passkey.
-- **The provider is absent or the pod cannot read the secret:** check both Google flags,
-  `--config-secret`, the Secret key and the file path. Custom pod security settings must retain
-  the generated `fsGroup` and read permissions.
+- **No Google button, or the pod cannot read the secret:** check both `--google-*` options,
+  `--config-secret genkan-config`, the Secret's `google-client-secret` key and the file path. If
+  you customised the pod's security context, keep the generated `fsGroup`.
 - **Sign-in fails after Google returns:** inspect `kubectl -n genkan-system logs deploy/genkan`
   and check pod egress to the token and signing-key hosts listed above.
 

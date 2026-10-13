@@ -36,6 +36,16 @@ browser ──passkey──▶ genkan (in the cluster) ──tokens──▶ kub
                   kube-apiserver ◀──discovery + keys (internal TLS)── verifies tokens itself
 ```
 
+A `kubectl` request goes like this:
+
+1. kubelogin opens the browser at Genkan's sign-in page.
+2. The person signs in with a passkey. kubelogin receives a short-lived access token and a
+   refresh token, and Genkan records the session as a `Grant` object.
+3. `kubectl` sends the token to kube-apiserver.
+4. kube-apiserver checks the token's signature against Genkan's published keys, which it
+   fetches over an internal TLS connection. Genkan is not involved in the request itself.
+5. When the token expires, kubelogin renews it with a refresh token, without the browser.
+
 The admin tool `genkanctl` runs on an administrator's machine with their own kubeconfig. It
 prints the install manifests, writes kube-apiserver's `AuthenticationConfiguration` for the
 distribution, and issues the one-time links people use to enrol a passkey.
@@ -45,14 +55,18 @@ distribution, and issues the one-time links people use to enrol a passkey.
 
 ## Crates
 
-The workspace is a flat `crates/` directory of small crates whose dependencies only point
-downwards ([Kladov][matklad-workspaces]; acyclic, levelled dependencies after Lakos and Martin,
-listed under [References](#references)). Each crate hides one design decision behind a narrow
-interface ([Parnas][parnas]); storage is a set of traits (ports) with in-memory and Kubernetes
-adapters ([Cockburn][cockburn]). The in-cluster server and the administrator's CLI are separate binaries,
-as in Kanidm (`kanidmd`/`kanidm`), etcd (`etcd`/`etcdctl`) and cert-manager (`cmctl`), so code
-that only an administrator should run never ships in the server image. Every crate has a README
-that is also its crate-level documentation (`cargo doc --open`).
+The code is split into small crates in one flat `crates/` directory:
+
+- **Dependencies only point downwards**, with no cycles ([Kladov][matklad-workspaces]; Lakos and
+  Martin, see [References](#references)).
+- **Each crate hides one design decision** behind a narrow interface ([Parnas][parnas]).
+- **Storage is a set of traits** with an in-memory and a Kubernetes implementation (ports and
+  adapters, [Cockburn][cockburn]), so most tests need no cluster.
+- **The server and the admin CLI are separate binaries**, as in Kanidm (`kanidmd`/`kanidm`),
+  etcd (`etcd`/`etcdctl`) and cert-manager (`cmctl`). Code only an administrator should run
+  never ships in the server image.
+
+Every crate has a README that is also its crate-level documentation (`cargo doc --open`).
 
 | Crate | What it holds | Depends on |
 |---|---|---|

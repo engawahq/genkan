@@ -65,72 +65,89 @@ Nothing depends on it.
 
 ## Logging
 
-The server defaults to native tracing JSON: one object per line with `timestamp`, `level`,
-`target` and nested `fields`. JSON omits current span and span-list fields. This is not OTLP
-JSON, syslog, ECS or OCSF. `--log-format text` (or `GENKAN_LOG_FORMAT=text`) explicitly selects
-operator-facing text; ANSI is disabled in both formats. Native text can render enclosing span
-context and does not provide the JSON span-omission contract. Use JSON for structured audit
-ingestion. Owned spans must not carry credential material; inherited dependency span context
-is outside the audit event-field guarantee. Clap help, version and syntax diagnostics and
-`genkanctl` machine-readable stdout are unchanged.
+Genkan writes all logs to stdout. Two kinds of record share that stream:
 
-Without `GENKAN_LOG`, the native `Targets` filter is `warn,genkan=info`: Genkan INFO and
-dependency WARN/ERROR. A supplied value replaces the **complete** filter, including an empty
-value; it is not merged with defaults. `rustls=debug` does not preserve Genkan INFO or unrelated
-WARN diagnostics; use `warn,genkan=info,rustls=debug` to admit both. `genkan::audit=info` selects
-audit independently of module diagnostics. Native target-prefix and target-only semantics apply.
-Invalid directives or non-UTF-8 overrides fall back to `warn,genkan=info` with `reason="invalid_filter"`, without
-echoing the supplied value or parser error. `GENKAN_LOG=off` is allowed.
+- **audit events**: sign-ins, enrolments, token issuance and similar, with a fixed set of
+  fields, always under the target `genkan::audit`;
+- **diagnostics**: everything else, from Genkan's own modules and its dependencies, under their
+  usual Rust module targets.
 
-Authentication/security events use exactly `target="genkan::audit"` with business fields
-`event`, `outcome` (`success` or `failure`) and optional fixed `reason`. Severity is independent
-of outcome. Passkey options and upstream start describe accepted requests, not completed
-sign-ins. `auth.sign_in` succeeds only after local authorization completes;
-`auth.passkey_enrollment` has start/finish phases; `auth.account_link` succeeds after credential
-creation. Invalid pending upstream state remains `auth.upstream_callback`. OAuth code exchange,
-refresh and revocation are distinct operations, never fresh sign-ins; token issuance succeeds
-only after signing. Revocation success with reason `accepted` includes RFC 7009 no-ops and does
-not prove a token existed. Replay/client-binding events describe detection before attempted
-deletion, not successful revocation.
+### Format
 
-Optional `user` is the verified local User object name; `subject` is its local UID, not an
-upstream subject; `client` is an authenticated OAuth client. Unknown identity is omitted.
-Passkey sign-in identity is recorded only after assertion verification; a known credential ID
-alone does not attribute an attempt to its owner. Pre-verification rejections, including disabled
-users, omit identity.
-Setup-token-validated names may have no subject. Method/provider/reason values are controlled.
-Audit targeting intentionally loses the original Rust module target; no duplicate module field
-is added. Operational and dependency diagnostics retain their native targets and need not have
-business fields. Audit event fields omit raw errors and credential/token material. Owned operational
-diagnostics retain categorical reasons plus complete error details for troubleshooting.
-**Operational and dependency diagnostics have no no-secrets guarantee**: error text can include
-backend response details or sensitive data, even at WARN/ERROR. DEBUG/TRACE may expose more.
-Filtering or routing to the audit target does not remove earlier exposure in the mixed stream.
+By default each line is one JSON object, in `tracing`'s native layout: `timestamp`, `level`,
+`target` and the event's `fields`. Span fields are left out. It is not OTLP, syslog, ECS or
+OCSF. `--log-format text` (or `GENKAN_LOG_FORMAT=text`) prints human-readable lines instead;
+these can include span context, so use JSON when a machine collects the logs. Neither format
+uses colour. Command-line help and errors, and `genkanctl`'s output, are not affected.
 
-Select successful fresh sign-ins from a JSON stream:
+### What gets logged
+
+The default filter is `warn,genkan=info`: Genkan at INFO, dependencies at WARN and above. Set
+`GENKAN_LOG` to change it. The value **replaces** the whole filter rather than adding to it, so
+to debug rustls while keeping the rest, write `warn,genkan=info,rustls=debug`, not just
+`rustls=debug`. `genkan::audit=info` selects audit events on their own, and `GENKAN_LOG=off`
+turns logging off. If the value cannot be parsed, Genkan falls back to the default and logs
+`reason="invalid_filter"` without repeating the bad value.
+
+### Audit events
+
+Every audit event has `target="genkan::audit"` and these fields:
+
+| Field | Meaning |
+|---|---|
+| `event` | what happened, for example `auth.sign_in` |
+| `outcome` | `success` or `failure`; independent of the log level |
+| `reason` | optional, one of a fixed set of values |
+| `user` | optional: the verified local `User` name |
+| `subject` | optional: that user's local UID (not a GitHub or Google ID) |
+| `client` | optional: an authenticated OAuth client |
+| `method`, `provider` | how the person signed in; fixed sets of values |
+
+How to read them:
+
+- **`auth.sign_in` with `success`** means a fresh sign-in completed. Starting a passkey or
+  GitHub/Google sign-in is logged as its own event, and does not mean it finished.
+- **Code exchange, refresh and revocation** are separate events, never counted as sign-ins.
+  Revocation reports `accepted` even when the token did not exist, as RFC 7009 requires.
+- **`auth.passkey_enrollment`** logs a start and a finish; **`auth.account_link`** succeeds
+  once the credential exists. A bad GitHub/Google callback stays `auth.upstream_callback`.
+- **Identity is recorded only once verified.** A failed passkey attempt carries no `user`, even
+  if the credential ID belongs to someone; so does a disabled user's rejected attempt. During
+  enrolment with a one-time link, `user` can appear without `subject`.
+- **Replay and wrong-client events** report the detection, not that the token was then revoked.
+
+To list successful fresh sign-ins:
 
 ```sh
 jq -c 'select(.target == "genkan::audit" and .fields.event == "auth.sign_in" and .fields.outcome == "success") | {timestamp, user: .fields.user, subject: .fields.subject, method: .fields.method, provider: .fields.provider}'
 ```
 
-To derive a last *observed* sign-in, compare parsed source timestamps within one configured
-identity domain. Missing records do not prove that a user never signed in.
+The newest such record gives a user's last *observed* sign-in. A missing record does not prove
+that someone never signed in.
 
-An optional downstream [Vector route] can parse the container payload as JSON and route target
-exactly `genkan::audit` to security/audit storage, and other targets to operational/dependency
-storage. Retain and monitor parse failures and unusable envelopes/targets on an error route;
-do not silently drop them. Routing needs no schema version, complete business-field validation,
-`log_kind`, or level/message heuristic. Preserve dependency fields without synthesizing
-`event`/`outcome`. Target classification is metadata, not cryptographic provenance. If a collector
-maps target to `log.logger` or an instrumentation scope, the audit scope is `genkan::audit`.
-No collector deployment or exporter is bundled.
+### Secrets in logs
 
-Secure access, transport, buffering and retention for the **whole** mixed stream. Collector
-redaction cannot undo earlier container-log/buffer exposure. This is best-effort event history,
-not native Kubernetes audit, durable/complete storage, delivery acknowledgement or tamper
-evidence. Filtering, crashes, retries, collection and retention can omit or duplicate records;
-it is not an always-on compliance audit facility. No trace SDK, request/flow ID, event UUID,
-hash chain or audit database is added.
+Audit event fields never contain raw errors, credentials or tokens. **Diagnostics make no such
+promise**: an error message can include details from a backend response, even at WARN or
+ERROR, and DEBUG or TRACE can show more. Because both share one stream, protect access,
+transport and retention of the **whole** stream. Filtering or redacting later does not undo
+what the container log already holds.
+
+### Collecting the logs
+
+Genkan bundles no collector. A downstream tool such as a [Vector route] can parse each line as
+JSON and send target `genkan::audit` to audit storage and everything else to operational
+storage. The target alone is enough to route on. Keep lines that fail to parse on an error
+route rather than dropping them, and pass dependency records through without inventing `event`
+or `outcome` fields. If your collector maps the target to `log.logger` or an instrumentation
+scope, the audit scope is `genkan::audit`. The target labels the record; it does not prove
+where it came from.
+
+### What this is not
+
+This is a best-effort event history, not Kubernetes audit logging and not a compliance-grade
+audit trail. Records can be lost or duplicated by filtering, crashes, retries, collection or
+retention. There are no request IDs, event UUIDs, hash chains or acknowledgements.
 
 [Vector route]: https://vector.dev/docs/reference/configuration/transforms/route/
 
@@ -147,4 +164,4 @@ hash chain or audit database is added.
 [RFC 8414]: https://www.rfc-editor.org/rfc/rfc8414
 [RFC 6750]: https://www.rfc-editor.org/rfc/rfc6750
 
-[the deployment guide]: ../../docs/get-started.md#limit-unauthenticated-traffic-at-the-ingress
+[the deployment guide]: ../../docs/get-started.md#before-going-public-rate-limit-sign-in

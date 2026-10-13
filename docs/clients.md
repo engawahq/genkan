@@ -1,12 +1,15 @@
 # Registering clients
 
-Every application that signs people in through Genkan, `kubectl` included, is an `OAuthClient`
-object in Genkan's namespace. The object name is the `client_id`. `genkanctl client create`
-checks your input, prints the object as JSON, and generates the secret when the client needs
-one. The commands below assume the cluster from [get-started.md](get-started.md): namespace
-`genkan-system`, run with the cluster admin's kubeconfig.
+Before an application can sign people in through Genkan, you register it as a client. Each
+client is an `OAuthClient` object in Genkan's namespace, and its name is the application's
+`client_id`. `kubectl` is a client too; [Get started](get-started.md) registered it.
 
-There are two kinds of client:
+`genkanctl client create` builds the object for you: it checks your input, prints the object,
+and generates a secret when the client needs one. Pipe its output into `kubectl apply`. The
+commands below assume the cluster from [Get started](get-started.md) (namespace
+`genkan-system`) and run with the cluster admin's kubeconfig.
+
+First decide which kind of client the application is:
 
 | Type | For | Authenticates with |
 |---|---|---|
@@ -20,25 +23,32 @@ genkanctl client create kubectl --type public \
   --redirect-uri http://127.0.0.1:8000/ --audience kubernetes | kubectl apply -f -
 ```
 
-A redirect URI is `https://` with a host name (`https://app.example.com/callback`), or
-`http://127.0.0.1/…` or `http://[::1]/…` for apps that receive the code on the user's own
-machine. For those loopback addresses any port matches, so `kubectl` still works when it has to
-listen on a different port. Fragments, user information and plain `http` to other hosts are
-rejected.
+The options:
 
-Genkan compares redirect URIs as exact strings, so `genkanctl` accepts a URI only in the form a
-browser writes it: lowercase scheme and host, no default port, at least a `/` path
-(`https://app.example.com/`, not `https://app.example.com`), `xn--` host names and
-percent-encoded paths instead of non-ASCII, and every `%` followed by two hex digits. It also
-rejects addresses a browser refuses, such as `999.1.1.1` or port `99999`.
+- **`--redirect-uri`** is where the browser goes back to after sign-in. Repeat it for several.
+- **`--audience kubernetes`** lets the client get tokens that kube-apiserver accepts. Add it
+  only when the application calls the Kubernetes API as the signed-in person.
+- **`--allow-elevation`** lets the client ask for admin rights (the user's elevated groups, after
+  a fresh passkey sign-in). Leave it off unless the client is for administering the cluster,
+  like `kubectl`. See [Admin rights](managing-users.md#admin-rights).
 
-`--audience` lists what the client may request tokens for. Add `kubernetes` (the audience
-`genkanctl kube-config` configured) when the app calls the Kubernetes API as the signed-in user.
+### Redirect URIs
 
-`--allow-elevation` lets the client request the `elevate` scope: a short token with the user's
-elevated groups after a fresh passkey sign-in. Leave it off unless the client is meant for
-administration, like the admin `kubectl` context in [get-started.md](get-started.md); see
-[managing-users.md](managing-users.md) for elevated groups.
+A redirect URI is one of:
+
+- `https://` with a host name, such as `https://app.example.com/callback`;
+- `http://127.0.0.1/…` or `http://[::1]/…`, for apps that receive the result on the user's own
+  machine. Any port matches, so `kubectl` still works when it has to listen on another port.
+
+Genkan compares redirect URIs exactly, character by character. To prevent near-misses,
+`genkanctl` accepts a URI only in the form a browser sends it:
+
+- lowercase scheme and host, and no default port (`:443`);
+- at least a `/` path: `https://app.example.com/`, not `https://app.example.com`;
+- non-ASCII written as `xn--` host names and percent-encoded paths.
+
+It rejects fragments (`#…`), user names in the URI, plain `http` to any other host, and
+addresses a browser would refuse, such as `999.1.1.1` or port `99999`.
 
 ## Confidential clients
 
@@ -47,11 +57,13 @@ genkanctl client create grafana --type confidential --display-name Grafana \
   --redirect-uri https://grafana.example.com/login/generic_oauth | kubectl apply -f -
 ```
 
-The object goes to stdout. The client secret goes to stderr, so it shows in your terminal but
-never lands in the object, in `kubectl`'s input or in a GitOps repository. It is shown once:
-the cluster keeps only its SHA-256 hash. Give it to the application right away, for example as
-a Secret in the application's namespace. Pipe it in rather than passing it as an argument, which
-other users can see in the process list:
+The command prints the client secret in your terminal (on stderr), separately from the object.
+The secret never ends up in the object, in `kubectl`'s input or in Git. **It is shown only
+once**: the cluster keeps just its SHA-256 hash.
+
+Give the secret to the application right away, for example as a Secret in the application's
+namespace. Paste it in as below rather than passing it as a command argument, which other users
+on the machine can see in the process list:
 
 ```sh
 read -rs CLIENT_SECRET     # paste the secret, then Enter
@@ -60,16 +72,17 @@ printf %s "$CLIENT_SECRET" | kubectl -n monitoring create secret generic grafana
 unset CLIENT_SECRET
 ```
 
-Configure the application with the issuer URL, the `client_id` (here `grafana`) and that
-secret. It finds the endpoints through `/.well-known/openid-configuration` and sends the secret
-with HTTP Basic (`client_secret_basic`) or in the form (`client_secret_post`).
+Then configure the application with three values: the issuer URL, the `client_id` (here
+`grafana`) and the secret. It finds everything else through
+`<issuer>/.well-known/openid-configuration`. Genkan accepts the secret either way applications
+send it: HTTP Basic (`client_secret_basic`) or a form field (`client_secret_post`).
 
 ### Never choose a secret yourself
 
-Anyone who can read `OAuthClient` objects, or your GitOps repository, can read the hash. Genkan
-hashes without a salt, which is safe only for long random secrets. A password that a person
-picked can be recovered from its hash with a dictionary attack, and Genkan cannot notice because
-it never sees the secret itself. Always let `genkanctl client create` generate it.
+Always let `genkanctl client create` generate the secret. The hash is visible to anyone who can
+read `OAuthClient` objects or your Git repository, and it has no salt. That is safe for a long
+random secret, but a password someone chose can be guessed back from its hash offline, and
+Genkan would never notice.
 
 Without `genkanctl`, generate 32 random bytes and hash them yourself:
 
@@ -105,7 +118,7 @@ genkanctl client create grafana --type confidential --display-name Grafana \
   | kubectl apply --dry-run=client -o yaml -f - > grafana-client.yaml
 ```
 
-The cluster checks the same rules when the object is applied, so a hand-edited object with a
-plain `http` or fragment redirect URI or a malformed `secretHash` fails at `kubectl apply`, not at
-sign-in. The cluster parses URLs with Kubernetes' own `isURL()`, which is looser than a browser,
-so run hand-written redirect URIs through `genkanctl client create` to catch the rest.
+If you edit the object by hand, the cluster checks it when you apply it: a plain `http` or
+fragment redirect URI, or a malformed `secretHash`, fails at `kubectl apply` rather than at
+sign-in. The cluster's URL check is looser than `genkanctl`'s, though, so run new redirect URIs
+through `genkanctl client create` to catch the rest.

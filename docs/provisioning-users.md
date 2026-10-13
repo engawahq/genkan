@@ -1,20 +1,17 @@
 # Provisioning users from a directory
 
-Keep users in step with Okta, Entra ID, Google Workspace, LDAP or an HR system using a small
-sync program that reads the directory and writes `User` objects with the Kubernetes API.
-Genkan does not speak SCIM; the sync program is the bridge to your directory.
+If your team already lives in Okta, Entra ID, Google Workspace, LDAP or an HR system, you can
+keep Genkan's users in step with it. Genkan has no built-in connector (it does not speak SCIM).
+Instead, you run a small sync program that reads your directory and writes `User` objects
+through the Kubernetes API.
 
-This guide sets up the program's permissions and an admission policy that limits the damage
-if it is wrong or compromised. Day-to-day commands are in
-[managing-users.md](managing-users.md).
+This guide sets up:
 
-For the invitation commands, set your installed issuer (the local walkthrough uses this one):
+1. a service account that can write users and nothing else;
+2. an admission policy that limits the damage if the program is buggy or compromised;
+3. the sync program itself, as a shell example.
 
-```sh
-export GENKAN_ISSUER=https://genkan-k3s.shared
-```
-
-`genkanctl` reads it, so the commands do not need an issuer argument.
+For everyday commands, see [Managing users](managing-users.md).
 
 ## What the sync tool does
 
@@ -38,12 +35,13 @@ It does **not**:
   (see [managing-users.md](managing-users.md#suspend-or-remove-someone)); disabling is enough
   to stop sign-ins, and is reversible.
 
-Match people by the directory's own immutable ID, kept in an annotation on the `User`, never by
-email address: email addresses get reassigned.
+Match people by the directory's own permanent ID, kept in an annotation on the `User`. Never
+match by email address: addresses get reused when people leave.
 
 ## 1. A service account with write access to users only
 
-```yaml
+```sh
+kubectl apply -f - <<'EOF'
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -73,17 +71,26 @@ subjects:
 - kind: ServiceAccount
   name: user-sync
   namespace: genkan-system
+EOF
 ```
 
 There is no `delete`, and no access to credentials, invitations, grants or Secrets.
 
 ## 2. An admission policy that bounds it
 
-RBAC cannot restrict writes by label or field value, so a `ValidatingAdmissionPolicy`
-(Kubernetes 1.30 or later) enforces the rest. It applies only to `user-sync` and fails closed.
-Edit the allowlist (`'dev', 'ops'`) to the groups the directory may assign.
+RBAC can say "may write users", but not "may write only these users, with only these groups".
+A `ValidatingAdmissionPolicy` (Kubernetes 1.30 or later) adds those rules. It applies only to
+the `user-sync` account, and if the policy cannot be evaluated, the write is refused.
 
-```yaml
+It enforces that the sync program:
+
+- only changes users it created (label `genkan.engawahq.dev/source=directory`);
+- never assigns or changes elevated groups;
+- only assigns groups from an allowlist. Edit `['dev', 'ops']` below to yours;
+- names each object after its username (see [why](#why-the-name-must-equal-the-username)).
+
+```sh
+kubectl apply -f - <<'EOF'
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -135,16 +142,17 @@ metadata:
 spec:
   policyName: genkan-user-sync
   validationActions: [Deny]
+EOF
 ```
 
-Elevated groups must stay exactly as they were: empty when the tool creates a user, and
-unchanged by its updates. Admission sees the whole resulting object, and server-side apply keeps
-fields the tool's manifest leaves out, so elevated groups an admin added survive every sync.
+An admin can still add elevated groups to a synced user by hand. The sync program's later
+updates leave them alone, because server-side apply keeps fields the program does not send.
 
-Why the username rule: Kubernetes sees every `User` as `genkan:<username>`, so two objects with
-the same username would be the same person to RBAC. Object names are unique, and `genkanctl`
-always names a user after its username, so requiring the two to be equal keeps the tool from
-creating a second `admin`.
+### Why the name must equal the username
+
+Kubernetes sees every `User` as `genkan:<username>`. Two objects with the same username would
+be the same person to RBAC. Object names are unique, so requiring the name to equal the
+username stops the program from creating a second `admin`.
 
 ### Username rules
 
@@ -158,13 +166,15 @@ label starting and ending in a letter or digit. No `@`, `+` or `_`. The exact pa
 
 `genkanctl invite` and `genkanctl setup-link` enforce the same rule.
 
-**Mapping note:** map an email address to a DNS-compatible directory short name, but keep the
-immutable directory ID as the identity check. If two people map to the same name, the check
-described in [The sync loop](#3-the-sync-loop) must stop one from taking over the other's
-`User`. The 63-character cap also keeps usernames within the Kubernetes label-value limit on
-invitations, credentials and grants.
+If your directory identifies people by email address, derive a short name that fits these
+rules (for example `alice.chen` from `alice.chen@example.com`). Two people can end up with the
+same short name, so the sync program must still check the directory ID before updating a user;
+see [the sync loop](#3-the-sync-loop).
 
-Check the policy before trusting it:
+### Test the policy
+
+Before trusting the policy, check that it refuses what it should. Both commands below must
+fail:
 
 ```sh
 as=(--as=system:serviceaccount:genkan-system:user-sync)
@@ -184,11 +194,13 @@ EOF
 
 ## 3. The sync loop
 
-Any language with a Kubernetes client works; this is the shape of it in shell, run as the
-`user-sync` service account (a `CronJob`, or outside the cluster with a token from
-`kubectl -n genkan-system create token user-sync`). `directory-export` stands for whatever
-lists people from your directory as JSON lines `{"id", "username", "name", "groups", "active"}`,
-and exits non-zero when it cannot list everyone.
+Write the program in any language with a Kubernetes client. Run it as the `user-sync` service
+account: as a `CronJob` in the cluster, or elsewhere with a token from
+`kubectl -n genkan-system create token user-sync`.
+
+Below is the shape of it in shell. `directory-export` stands for your own command that lists
+everyone in the directory, one JSON object per line with `id`, `username`, `name`, `groups` and
+`active`, and exits with an error when it cannot list everyone.
 
 ```sh
 #!/usr/bin/env bash
@@ -227,20 +239,21 @@ done <<<"$people"
 exit "$failed"
 ```
 
-The export is read in full first, so an exporter that fails part-way fails the job before any
-write, instead of leaving later users (and their suspensions) out while the job looks
-successful. An empty export is refused too: once the tool disables users missing from the
-export, an empty one would disable everyone. Use whatever completeness check your directory
-offers (a total count, a pagination end marker) inside `directory-export`.
+Why it is written this way:
 
-One refused user must not stop the others: a suspension further down the export still has to
-be written. The loop reports each failure and exits non-zero at the end, so the job shows as
-failed.
+- **It reads the whole export before writing anything.** If the export fails half-way, the job
+  stops before changing anyone, instead of quietly skipping the rest (and their suspensions).
+  Use whatever completeness check your directory offers, such as a total count or an
+  end-of-list marker, inside `directory-export`.
+- **It refuses an empty export.** Once the program disables users missing from the export, an
+  empty export would disable everyone.
+- **One failed user does not stop the others.** A suspension further down the list still has to
+  be written. The loop reports each failure and exits with an error at the end, so the job
+  shows as failed.
 
-The tool owns `displayName`, `groups` and `disabled` of the users it manages (its field
-manager). Change those in the directory, not with `kubectl`: a hand edit makes the next apply
-fail with a field conflict for that user. Elevated groups are the exception, since the tool
-never writes them.
+The program owns `displayName`, `groups` and `disabled` on the users it manages. Change those in
+the directory, not with `kubectl`: a hand edit makes the next sync fail for that user with a
+field conflict. Elevated groups are the exception, since the program never writes them.
 
 Before applying, a real tool should also:
 
@@ -251,6 +264,12 @@ Before applying, a real tool should also:
 - Lowercase usernames and check them against the [username rules](#username-rules) before
   writing.
 
-New people still need a link to enrol. Enable the server's `--invitations` option first
-([Add someone](managing-users.md#add-someone) shows the manifest command). An admin then runs
-`genkanctl invite --username <name>` for each new user and sends the printed link to them.
+## 4. Send new people their links
+
+The sync program creates users, but they still need a one-time link to set up a passkey. An
+admin sends it, as in [Add someone](managing-users.md#add-someone):
+
+```sh
+export GENKAN_ISSUER=https://genkan.example.test     # your issuer
+genkanctl invite --username <name>
+```
