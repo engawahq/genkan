@@ -68,8 +68,8 @@ pub(crate) struct ClientCreateArgs {
     /// `confidential` for servers.
     #[arg(long = "type", value_enum)]
     pub kind: ClientKind,
-    /// Redirect URI (repeatable): `https://`, or `http://127.0.0.1` / `http://[::1]` with a path
-    /// for native apps; any port matches for those.
+    /// Redirect URI (repeatable): `https://` with a host, or `http://127.0.0.1` / `http://[::1]`
+    /// with a path for native apps; any port matches for those.
     #[arg(long = "redirect-uri", required = true)]
     pub redirect_uris: Vec<String>,
     /// Audience the client may request tokens for (repeatable), for example `kubernetes`.

@@ -20,10 +20,12 @@ genkanctl client create kubectl --type public \
   --redirect-uri http://127.0.0.1:8000/ --audience kubernetes | kubectl apply -f -
 ```
 
-A redirect URI is `https://…`, or `http://127.0.0.1/…` or `http://[::1]/…` for apps that
-receive the code on the user's own machine. For those loopback addresses any port matches, so
-`kubectl` still works when it has to listen on a different port. Fragments and plain `http` to
-other hosts are rejected.
+A redirect URI is `https://` with a host name (`https://app.example.com/callback`), or
+`http://127.0.0.1/…` or `http://[::1]/…` for apps that receive the code on the user's own
+machine. For those loopback addresses any port matches, so `kubectl` still works when it has to
+listen on a different port. Fragments, plain `http` to other hosts, and characters that are not
+allowed in a URI (spaces, non-ASCII: write `xn--` names and percent-encoded paths instead) are
+rejected.
 
 `--audience` lists what the client may request tokens for. Add `kubernetes` (the audience
 `genkanctl kube-config` configured) when the app calls the Kubernetes API as the signed-in user.

@@ -43,7 +43,7 @@ pub enum ClientError {
     RedirectUriCount,
     /// A redirect URI that RFC 9700 §2.1 or RFC 8252 §7.3 forbids.
     #[error(
-        "redirect URI {0:?} must be https://, or http://127.0.0.1 or http://[::1] with a path, without a fragment or whitespace, and at most {MAX_REDIRECT_URI} characters"
+        "redirect URI {0:?} must be https:// with a host, or http://127.0.0.1 or http://[::1] with a path; only ASCII URI characters, no fragment, at most {MAX_REDIRECT_URI} characters"
     )]
     InvalidRedirectUri(String),
     /// Too many audiences.
@@ -171,18 +171,20 @@ fn is_client_id(id: &str) -> bool {
 /// Whether the `OAuthClient` schema accepts `uri` as a redirect URI.
 ///
 /// The same rule as [`REDIRECT_URI_PATTERN`](crate::crd::client::REDIRECT_URI_PATTERN), without a
-/// regex engine: `https://` with a non-empty rest, or `http://127.0.0.1` / `http://[::1]` with an optional port
-/// of up to five digits and a path (RFC 8252 §7.3); never a fragment (RFC 6749 §3.1.2) or
-/// whitespace.
+/// regex engine. Either `https://` with a non-empty authority (RFC 3986 §3.2: a host name or an
+/// IPv6 literal, then an optional port), followed by nothing or by a path or query; or
+/// `http://127.0.0.1` / `http://[::1]` with an optional port and a path (RFC 8252 §7.3). Only
+/// RFC 3986 URI characters are allowed, so there is never a fragment (RFC 6749 §3.1.2),
+/// whitespace or non-ASCII, and the URI always fits in the `Location` header of the redirect back
+/// to the client.
 #[must_use]
 pub fn redirect_uri_allowed(uri: &str) -> bool {
-    if uri.chars().count() > MAX_REDIRECT_URI
-        || uri.contains(|c: char| c == '#' || c.is_whitespace())
-    {
+    if uri.len() > MAX_REDIRECT_URI {
         return false;
     }
     if let Some(rest) = uri.strip_prefix("https://") {
-        return !rest.is_empty();
+        let (authority, rest) = rest.split_at(rest.find(['/', '?']).unwrap_or(rest.len()));
+        return https_authority_allowed(authority) && rest.chars().all(is_uri_char);
     }
     let Some(rest) = uri
         .strip_prefix("http://127.0.0.1")
@@ -192,17 +194,50 @@ pub fn redirect_uri_allowed(uri: &str) -> bool {
     };
     let path = match rest.strip_prefix(':') {
         Some(port_and_path) => {
-            let digits = port_and_path
-                .find(|c: char| !c.is_ascii_digit())
-                .unwrap_or(port_and_path.len());
-            if !(1..=5).contains(&digits) {
+            let (port, path) =
+                port_and_path.split_at(port_and_path.find('/').unwrap_or(port_and_path.len()));
+            if !port_allowed(port) {
                 return false;
             }
-            port_and_path.get(digits..).unwrap_or_default()
+            path
         }
         None => rest,
     };
-    path.starts_with('/')
+    path.starts_with('/') && path.chars().all(is_uri_char)
+}
+
+/// `host [":" port]`, where host is a non-empty DNS-style name or a bracketed IPv6 literal.
+fn https_authority_allowed(authority: &str) -> bool {
+    let (host_allowed, after_host) = if let Some(literal) = authority.strip_prefix('[') {
+        let Some((address, after)) = literal.split_once(']') else {
+            return false;
+        };
+        let ipv6 = |c: char| c.is_ascii_hexdigit() || c == ':' || c == '.';
+        (!address.is_empty() && address.chars().all(ipv6), after)
+    } else {
+        let (host, after) = authority.split_at(authority.find(':').unwrap_or(authority.len()));
+        (!host.is_empty() && host.chars().all(is_host_char), after)
+    };
+    host_allowed
+        && (after_host.is_empty() || after_host.strip_prefix(':').is_some_and(port_allowed))
+}
+
+/// One to five digits.
+fn port_allowed(port: &str) -> bool {
+    (1..=5).contains(&port.len()) && port.chars().all(|c| c.is_ascii_digit())
+}
+
+/// The characters of a host name (letters, digits, `.`, `-`, `_`). RFC 3986 also allows
+/// sub-delimiters and percent-encoding in a registered name, but no DNS name uses them and HTTP
+/// libraries reject some of them.
+fn is_host_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "._-".contains(c)
+}
+
+/// The characters of a path and query: RFC 3986 `pchar` (`unreserved`, `sub-delims`, `%`, `:`
+/// and `@`), `/` and `?`. No `#`, so no fragment.
+fn is_uri_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "-._~!$&'()*+,;=%:@/?".contains(c)
 }
 
 #[cfg(test)]
@@ -268,6 +303,9 @@ mod tests {
             "https://dash.example.com/callback",
             "https://dash.example.com",
             "https://dash.example.com:8443/cb?x=1",
+            "https://dash.example.com?x=1",
+            "https://[2001:db8::1]:8443/cb",
+            "https://xn--bcher-kva.example/cb",
             "http://127.0.0.1/",
             "http://127.0.0.1:8000/",
             "http://[::1]:12345/cb",
@@ -289,6 +327,18 @@ mod tests {
             "http://127.0.0.1.example.com/",
             "http://[::1]x/",
             "HTTPS://dash.example.com/",
+            "https:///callback",
+            "https://?x=1",
+            "https://:443/",
+            "https://dash.example.com:/",
+            "https://dash.example.com:443:1/",
+            "https://user@dash.example.com/",
+            "https://[]/",
+            "https://[2001:db8::1/",
+            "https://bücher.example/",
+            "https://dash.example.com/bücher",
+            "https://dash.example.com/<script>",
+            "http://127.0.0.1:8000?x=1",
         ] {
             assert!(!redirect_uri_allowed(forbidden), "{forbidden}");
         }
@@ -296,6 +346,22 @@ mod tests {
             "https://e.com/{}",
             "a".repeat(MAX_REDIRECT_URI)
         )));
+    }
+
+    proptest::proptest! {
+        /// Whatever passes is usable as the redirect: a valid `Location` header value, and an
+        /// absolute URI with a scheme and a non-empty host.
+        #[test]
+        fn allowed_redirect_uris_are_absolute_and_fit_a_location_header(
+            uri in "(https://|http://127\\.0\\.0\\.1|http://\\[::1\\])[ -~\\u{80}-\\u{ff}]{0,24}"
+        ) {
+            if redirect_uri_allowed(&uri) {
+                proptest::prop_assert!(axum::http::HeaderValue::try_from(uri.as_str()).is_ok());
+                let parsed: axum::http::Uri = uri.parse().unwrap();
+                proptest::prop_assert!(parsed.scheme().is_some());
+                proptest::prop_assert!(parsed.host().is_some_and(|host| !host.is_empty()));
+            }
+        }
     }
 
     #[test]

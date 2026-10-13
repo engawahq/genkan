@@ -419,6 +419,14 @@ mod tests {
                 &["https://app.example.com/cb"][..],
                 Some("plaintext-secret"),
             ),
+            ("c7", ClientType::Public, &["https:///callback"][..], None),
+            ("c8", ClientType::Public, &["https://?x=1"][..], None),
+            (
+                "c9",
+                ClientType::Public,
+                &["https://app.example.com/bücher"][..],
+                None,
+            ),
         ] {
             let error = clients
                 .create(&pp, &client(name, kind, uris, secret))

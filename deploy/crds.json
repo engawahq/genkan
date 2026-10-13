@@ -357,10 +357,10 @@
                         "type": "string"
                       },
                       "redirectUris": {
-                        "description": "Redirect URIs, compared by exact string match. Each is `https://`, or\n`http://127.0.0.1` / `http://[::1]` for native apps (RFC 8252 §7.3); no fragment.",
+                        "description": "Redirect URIs, compared by exact string match. Each is `https://` with a host, or\n`http://127.0.0.1` / `http://[::1]` with a path for native apps (RFC 8252 §7.3); ASCII URI\ncharacters only, no fragment.",
                         "items": {
                           "maxLength": 2048,
-                          "pattern": "^(https://[^#\\s]+|http://(127\\.0\\.0\\.1|\\[::1\\])(:[0-9]{1,5})?/[^#\\s]*)$",
+                          "pattern": "^(https://([A-Za-z0-9._-]+|\\[[0-9A-Fa-f:.]+\\])(:[0-9]{1,5})?([/?][A-Za-z0-9._~!$&'()*+,;=%:@/?-]*)?|http://(127\\.0\\.0\\.1|\\[::1\\])(:[0-9]{1,5})?/[A-Za-z0-9._~!$&'()*+,;=%:@/?-]*)$",
                           "type": "string"
                         },
                         "maxItems": 16,
