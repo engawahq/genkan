@@ -17,29 +17,22 @@ scenario is `tests/e2e.rs`:
 
 ## Running it
 
-The test is `#[ignore]`d by default. It needs:
+The test is `#[ignore]`d by default. Follow
+[CONTRIBUTING: Disposable k3d cluster](../../CONTRIBUTING.md#disposable-k3d-cluster) for the
+canonical cluster creation, image build/import and test commands. Run them from the repository
+root on a Linux machine or VM inside `nix develop`.
 
-- a k3s cluster whose kube-apiserver reads its `AuthenticationConfiguration` from a directory on
-  the machine running the test, for example with k3d:
+The scenario needs:
 
-  ```sh
-  mkdir -p "$PWD/authn"
-  printf 'apiVersion: apiserver.config.k8s.io/v1\nkind: AuthenticationConfiguration\nanonymous:\n  enabled: false\njwt: []\n' \
-    > "$PWD/authn/authn.yaml"
-  k3d cluster create genkan --no-lb --wait \
-    --volume "$PWD/authn:/etc/rancher/k3s/genkan@server:0" \
-    --k3s-arg "--kube-apiserver-arg=authentication-config=/etc/rancher/k3s/genkan/authn.yaml@server:0"
-  ```
+- `KUBECONFIG` pointing at the disposable k3s cluster as cluster admin;
+- kube-apiserver reading its `AuthenticationConfiguration` from the mounted host directory;
+- `GENKAN_E2E_IMAGE` naming the image already imported into that cluster;
+- `GENKAN_E2E_AUTHN_DIR` naming the same host directory (CI uses `$RUNNER_TEMP/authn`);
+- optionally, `GENKAN_E2E_MEASUREMENTS` naming a file to receive the measured working set.
 
-- the image loaded into the cluster (`scripts/build-image.sh genkan:e2e`, then
-  `k3d image import genkan:e2e --cluster genkan`);
-- `KUBECONFIG` pointing at the cluster as cluster admin, `GENKAN_E2E_IMAGE` naming the image,
-  `GENKAN_E2E_AUTHN_DIR` naming the host directory above, and optionally
-  `GENKAN_E2E_MEASUREMENTS`, a file the measured working set is written to.
-
-Then run `cargo nextest run --run-ignored only -E 'binary(e2e)'`. The `kubernetes` job in
-`.github/workflows/ci.yml` does all of this on every change. kube-apiserver re-reads the file
-about once a minute and then fetches discovery, so the test waits up to three minutes for it.
+The `kubernetes` job in `.github/workflows/ci.yml` runs this setup on every change.
+kube-apiserver re-reads the file about once a minute and then fetches discovery, so the test
+waits up to three minutes for it.
 
 ## Place in the workspace
 

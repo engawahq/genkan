@@ -35,15 +35,15 @@ Documentation is written in English.
 
 ## Toolchain
 
-`rust-toolchain.toml` is the only place the compiler version is set; rustup reads it directly
-and the Nix flake reads it through fenix `fromToolchainFile`, so both paths build with the same
-compiler. The toolchain is a pinned nightly for the parallel front end (`-Zthreads`), current
-clippy lints and rustfmt's import ordering. No `#![feature]` is used, so moving to stable is a
-configuration change: drop `-Zthreads` from `.cargo/config.toml` and the nightly-only options
-from `rustfmt.toml`. A toolchain bump updates the `sha256` in `flake.nix` in the same change;
-`scripts/bump-toolchain.sh` does both, moving to the newest nightly of the last week that has every
-listed component and target. `.github/workflows/update-toolchain.yml` runs it with
-`nix flake update` on the 1st and 15th of each month and opens one pull request.
+- `rust-toolchain.toml` is the only place the compiler version is set. rustup reads it directly;
+  the Nix flake reads it through fenix `fromToolchainFile`, so both use the same compiler.
+- The pinned nightly enables the parallel front end (`-Zthreads`), current clippy lints and
+  rustfmt's import ordering. No `#![feature]` is used. Moving to stable is a configuration
+  change: drop `-Zthreads` from `.cargo/config.toml` and the nightly-only `rustfmt.toml` options.
+- A toolchain bump also updates the `sha256` in `flake.nix`. `scripts/bump-toolchain.sh` does
+  both, choosing the newest nightly of the last week with every listed component and target.
+- `.github/workflows/update-toolchain.yml` runs that script with `nix flake update` on the 1st
+  and 15th of each month and opens one pull request.
 
 Release binaries are built with `trim-paths = "all"`, so they carry no build-host paths.
 
@@ -97,19 +97,58 @@ is a review signal, not an audit.
 ## Tests
 
 - **Unit and integration tests** run anywhere: `cargo nextest run --workspace`.
-- **Cluster tests** (`#[ignore]`d) need a disposable cluster in `KUBECONFIG` where you are
-  cluster admin. Docker on a Linux machine or VM with k3d is enough:
+- **Cluster tests** and **end-to-end tests** are `#[ignore]`d and require a disposable cluster
+  where you are cluster admin. The setup below is shared with the `kubernetes` job in
+  `.github/workflows/ci.yml`.
 
-  ```sh
-  mkdir -p /tmp/authn && printf 'apiVersion: apiserver.config.k8s.io/v1\nkind: AuthenticationConfiguration\nanonymous:\n  enabled: false\njwt: []\n' > /tmp/authn/authn.yaml
-  k3d cluster create genkan --image rancher/k3s:v1.36.5-k3s1 --no-lb --wait \
-    --volume "/tmp/authn:/etc/rancher/k3s/genkan@server:0" \
-    --k3s-arg "--kube-apiserver-arg=authentication-config=/etc/rancher/k3s/genkan/authn.yaml@server:0"
-  cargo nextest run --run-ignored only -E 'binary(kubernetes)'
-  ```
+### Disposable k3d cluster
 
-- **End to end**: build the image (`scripts/build-image.sh genkan:e2e`, Linux), load it
-  (`k3d image import genkan:e2e -c genkan`) and run
-  `GENKAN_E2E_IMAGE=genkan:e2e GENKAN_E2E_AUTHN_DIR=/tmp/authn cargo nextest run --run-ignored only -E 'binary(e2e)'`.
-  It installs Genkan from its image, enrols a passkey with a software authenticator, signs in,
-  and checks `kubectl auth whoami`, elevation and the pod's memory.
+Run from the Genkan checkout on a Linux machine or VM with Docker running, Nix with flakes,
+and permission to use Docker. Enter `nix develop` for the tools, including k3d and kubectl.
+Do not use a production cluster: the tests create and delete resources and replace the
+API server's authentication configuration.
+
+CI uses `$RUNNER_TEMP/authn`; locally, give `RUNNER_TEMP` a fresh disposable directory:
+
+```sh
+nix develop
+export RUNNER_TEMP=$(mktemp -d)
+export KUBECONFIG="$RUNNER_TEMP/kubeconfig"
+mkdir -p "$RUNNER_TEMP/authn"
+printf 'apiVersion: apiserver.config.k8s.io/v1\nkind: AuthenticationConfiguration\nanonymous:\n  enabled: false\njwt: []\n' \
+  > "$RUNNER_TEMP/authn/authn.yaml"
+k3d cluster create genkan --image rancher/k3s:v1.36.5-k3s1 --no-lb --wait --timeout 300s \
+  --volume "$RUNNER_TEMP/authn:/etc/rancher/k3s/genkan@server:0" \
+  --k3s-arg "--kube-apiserver-arg=authentication-config=/etc/rancher/k3s/genkan/authn.yaml@server:0"
+export KUBECONFIG=$(k3d kubeconfig write genkan)
+kubectl get nodes                         # Ready
+cargo nextest run --locked --run-ignored only -E 'binary(kubernetes)'
+```
+
+The separate kubeconfig prevents k3d from changing your normal cluster context.
+Mount the directory, not just `authn.yaml`: kube-apiserver must see atomic file replacements.
+Keep `anonymous.enabled: false` unchanged; kube-apiserver cannot change it during a reload.
+
+Build and import the image, then run the end-to-end scenario against the same cluster:
+
+```sh
+./scripts/build-image.sh genkan:e2e
+k3d image import genkan:e2e --cluster genkan
+GENKAN_E2E_IMAGE=genkan:e2e \
+GENKAN_E2E_AUTHN_DIR="$RUNNER_TEMP/authn" \
+GENKAN_E2E_MEASUREMENTS="$RUNNER_TEMP/measurements.json" \
+  cargo nextest run --locked --run-ignored only -E 'binary(e2e)'
+```
+
+The scenario installs Genkan, enrols a software passkey, signs in, and checks
+`kubectl auth whoami`, elevation and the pod's memory. See the
+[genkan-e2e README](crates/genkan-e2e/README.md) for its assertions and reload timing.
+
+When finished:
+
+```sh
+k3d cluster delete genkan
+```
+
+The temporary directory holds the authentication configuration and optional measurements;
+remove it when you no longer need those results.
