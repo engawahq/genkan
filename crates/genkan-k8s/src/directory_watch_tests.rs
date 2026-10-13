@@ -42,11 +42,17 @@ async fn kubernetes(
     let (request, _) = request.into_parts();
     assert_eq!(request.method, Method::GET);
     let path = request.uri.path();
-    let resource = path
-        .strip_prefix("/apis/genkan.engawahq.dev/v1alpha1/namespaces/test/")
+    let collection = path
+        .strip_prefix("/apis/genkan.engawahq.dev/v1alpha1/")
         .unwrap();
+    let namespaced = collection.strip_prefix("namespaces/test/");
+    let resource = namespaced.unwrap_or(collection);
     let mut backend = backend.lock().await;
     if let Some((kind, name)) = resource.split_once('/') {
+        assert!(
+            namespaced.is_some(),
+            "namespaced resources require a scoped GET"
+        );
         *backend.gets.entry(resource.to_owned()).or_default() += 1;
         if backend.fail_gets {
             return status(StatusCode::INTERNAL_SERVER_ERROR, "InternalError");
@@ -586,4 +592,43 @@ async fn clones_keep_watchers_alive_until_last_directory_drops() {
     assert!(!watcher.is_finished());
     drop(clone);
     wait_for(|| watcher.is_finished()).await;
+}
+
+#[tokio::test]
+async fn all_namespace_indexes_read_objects_in_their_metadata_namespace() {
+    let (mut mock, client) =
+        Mock::start(vec![client("known")], vec![user("alice", "uid-alice")]).await;
+    let mut construction = std::pin::pin!(KubeDirectory::new(
+        Api::all(client.clone()),
+        Api::all(client),
+    ));
+    assert_pending(construction.as_mut());
+    for resource in [CLIENTS, USERS] {
+        let reply = mock.take_list(resource).await;
+        reply_list(reply, &mock.snapshot(resource).await);
+    }
+    let directory = bounded(construction).await.unwrap();
+    assert_eq!(
+        directory
+            .user_by_subject("uid-alice")
+            .await
+            .unwrap()
+            .unwrap()
+            .name,
+        "alice"
+    );
+    assert_eq!(
+        directory.client("known").await.unwrap().unwrap().id,
+        "known"
+    );
+    mock.connect_watch(CLIENTS).await;
+    let mut duplicate = mock.backend.lock().await.objects[CLIENTS]["known"].clone();
+    duplicate["metadata"]["namespace"] = json!("other");
+    duplicate["metadata"]["uid"] = json!("other-client");
+    mock.event(CLIENTS, "ADDED", &metadata(&duplicate));
+    wait_for(|| directory.client_index.len() == 2).await;
+    assert!(directory.client("known").await.unwrap().is_none());
+    let gets = &mock.backend.lock().await.gets;
+    assert_eq!(gets.get("users/alice"), Some(&1));
+    assert_eq!(gets.get("oauthclients/known"), Some(&1));
 }

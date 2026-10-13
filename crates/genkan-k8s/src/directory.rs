@@ -15,6 +15,7 @@
 //!
 //! [UID]: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#uids
 
+use std::borrow::Cow;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
@@ -112,9 +113,8 @@ impl KubeDirectory {
         })
     }
 
-    async fn read_user(&self, name: &str) -> Result<Option<User>, StoreError> {
-        Ok(self
-            .users
+    async fn read_user(api: &Api<UserObject>, name: &str) -> Result<Option<User>, StoreError> {
+        Ok(api
             .get_opt(name)
             .await
             .map_err(|e| backend(&e))?
@@ -130,6 +130,21 @@ where
     match api.namespace() {
         Some(namespace) => Api::namespaced(client, namespace),
         None => Api::all(client),
+    }
+}
+
+/// All-namespaces watches still require a namespace for an individual object GET.
+fn indexed_api<'a, K>(api: &'a Api<K>, metadata: &PartialObjectMeta<K>) -> Option<Cow<'a, Api<K>>>
+where
+    K: Resource<Scope = NamespaceResourceScope, DynamicType = ()> + Clone,
+{
+    if api.namespace().is_some() {
+        Some(Cow::Borrowed(api))
+    } else {
+        Some(Cow::Owned(Api::namespaced(
+            api.clone().into_client(),
+            metadata.metadata.namespace.as_deref()?,
+        )))
     }
 }
 
@@ -168,17 +183,26 @@ fn backend(error: &kube::Error) -> StoreError {
 impl Directory for KubeDirectory {
     async fn client(&self, id: &str) -> Result<Option<Client>, StoreError> {
         let indexed = self.clients.namespace().map_or_else(
-            // Preserve the all-namespaces API contract; names alone are not store keys there.
+            // A name shared across namespaces is not an unambiguous client identifier.
             || {
-                self.client_index
-                    .find(|object| object.metadata.name.as_deref() == Some(id))
+                let mut matches = self
+                    .client_index
+                    .state_filter(|object| object.metadata.name.as_deref() == Some(id));
+                if matches.len() == 1 {
+                    matches.pop()
+                } else {
+                    None
+                }
             },
             |namespace| self.client_index.get(&ObjectRef::new(id).within(namespace)),
         );
-        if indexed.is_none() {
+        let Some(metadata) = indexed else {
             return Ok(None);
-        }
-        let result = self.clients.get_opt(id).await;
+        };
+        let Some(api) = indexed_api(&self.clients, &metadata) else {
+            return Ok(None);
+        };
+        let result = api.get_opt(id).await;
         Ok(result.map_err(|e| backend(&e))?.map(|object| {
             let id = object.name_any();
             let spec = object.spec;
@@ -195,7 +219,7 @@ impl Directory for KubeDirectory {
     }
 
     async fn user(&self, name: &str) -> Result<Option<User>, StoreError> {
-        self.read_user(name).await
+        Self::read_user(&self.users, name).await
     }
 
     async fn user_by_subject(&self, subject: &str) -> Result<Option<User>, StoreError> {
@@ -210,8 +234,10 @@ impl Directory for KubeDirectory {
         let Some(name) = metadata.metadata.name.as_deref() else {
             return Ok(None);
         };
-        Ok(self
-            .read_user(name)
+        let Some(api) = indexed_api(&self.users, metadata) else {
+            return Ok(None);
+        };
+        Ok(Self::read_user(&api, name)
             .await?
             .filter(|user| user.subject == subject))
     }
