@@ -235,7 +235,7 @@ pub async fn run<K, C>(
                         schedule.remove(name);
                     }
                 }
-                Some(Err(error)) => tracing::warn!(%kind, %error, "watch error; retrying with backoff"),
+                Some(Err(_error)) => tracing::warn!(%kind, reason = "watch_failed", "watch error; retrying with backoff"),
                 None => break,
             },
             () = tokio::time::sleep(sleep_for) => {
@@ -254,7 +254,7 @@ where
     for due in schedule.due(now) {
         match delete_if_unchanged(api, &due.name, &due.uid, &due.resource_version).await {
             Ok(DeleteOutcome::Deleted) => {
-                tracing::debug!(%kind, name = %due.name, "deleted expired object");
+                tracing::debug!(%kind, "deleted expired object");
                 schedule.remove(&due.name);
             }
             Ok(DeleteOutcome::NotFound) => schedule.remove(&due.name),
@@ -262,8 +262,8 @@ where
             Ok(DeleteOutcome::Changed) => {
                 schedule.postpone(&due.name, now.saturating_add(RETRY_AFTER));
             }
-            Err(error) => {
-                tracing::warn!(%kind, name = %due.name, %error, "deleting expired object failed; will retry");
+            Err(_error) => {
+                tracing::warn!(%kind, reason = "deletion_failed", "deleting expired object failed; will retry");
                 schedule.postpone(&due.name, now.saturating_add(RETRY_AFTER));
             }
         }

@@ -5,6 +5,8 @@
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::fmt::Write as _;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     use axum::Router;
@@ -31,11 +33,14 @@ mod tests {
     use genkan_signin::upstream::{self, UPSTREAM_COOKIE, Upstream};
     use genkan_store::{
         Client, ClientType, CredentialStore as _, MemoryCredentialStore, MemoryDirectory,
-        MemoryGrantStore, MemorySetupStore, NewExternal, User, external_credential_name,
+        MemoryGrantStore, MemorySetupStore, NewExternal, SetupStore as _, User,
+        external_credential_name,
     };
+    use genkan_test_support::logging::Capture;
     use http_body_util::BodyExt as _;
     use serde_json::{Value, json};
     use tower::ServiceExt as _;
+    use tracing::instrument::WithSubscriber as _;
 
     const ISSUER: &str = "https://login.example.com";
     const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
@@ -44,6 +49,7 @@ mod tests {
     const GOOGLE_SUB: &str = "110169484474386276334";
     const INVITATION: &str = "inv-1.invitation-secret-with-plenty-of-entropy";
 
+    const SECRET_ERROR: &str = "secret-bearing-upstream-http-error-sentinel";
     /// What the fake providers know about the current attempt.
     #[derive(Default)]
     struct Fake {
@@ -55,6 +61,8 @@ mod tests {
         published_key: Mutex<Option<Arc<SigningKey>>>,
         /// Overrides for Google's ID token claims.
         id_token_overrides: Mutex<Value>,
+        fail_http: AtomicBool,
+        secrets: Mutex<Vec<String>>,
     }
 
     #[derive(Clone)]
@@ -86,6 +94,10 @@ mod tests {
         }
         let key = fake.google_key.lock().unwrap().clone().unwrap();
         let id_token = sign_compact(&key, "JWT", &claims).unwrap();
+        fake.secrets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(id_token.clone());
         reply(
             StatusCode::OK,
             &json!({ "access_token": "g", "id_token": id_token }),
@@ -106,11 +118,12 @@ mod tests {
             &self,
             request: Request<Bytes>,
         ) -> impl Future<Output = Result<Response<Bytes>, HttpError>> + Send {
-            let uri = request.uri().to_string();
-            std::future::ready(
+            std::future::ready(if self.0.fail_http.load(Ordering::SeqCst) {
+                Err(HttpError(SECRET_ERROR.into()))
+            } else {
                 self.answer(&request)
-                    .ok_or_else(|| HttpError(format!("unexpected request to {uri}"))),
-            )
+                    .ok_or_else(|| HttpError(SECRET_ERROR.into()))
+            })
         }
     }
 
@@ -281,6 +294,8 @@ mod tests {
         status: StatusCode,
         headers: HeaderMap,
         body: String,
+        audit: Option<Value>,
+        logs: String,
     }
 
     impl Reply {
@@ -299,19 +314,187 @@ mod tests {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the test request boundary keeps protocol, audit and generated-secret assertions together"
+    )]
     async fn call(app: &Router, request: Request<Body>) -> Reply {
-        let response = app.clone().oneshot(request).await.unwrap();
+        let capture = Capture::new();
+        let path = request.uri().path().to_owned();
+        let provider = path.split('/').nth(2).map(str::to_owned);
+        let cookies = request
+            .headers()
+            .get(header::COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let query_secrets: Vec<_> =
+            form_urlencoded::parse(request.uri().query().unwrap_or_default().as_bytes())
+                .filter(|(key, _)| matches!(key.as_ref(), "code" | "state"))
+                .map(|(_, value)| value.into_owned())
+                .collect();
+        let (request_parts, body) = request.into_parts();
+        let body = body.collect().await.unwrap().to_bytes();
+        let submitted: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        let response = app
+            .clone()
+            .oneshot(Request::from_parts(request_parts, Body::from(body)))
+            .with_subscriber(capture.dispatch())
+            .await
+            .unwrap();
         let (parts, body) = response.into_parts();
+        let response_body =
+            String::from_utf8_lossy(&body.collect().await.unwrap().to_bytes()).into_owned();
+        let records = capture.records();
+        let audits: Vec<_> = records
+            .iter()
+            .filter(|r| r["target"] == "genkan::audit")
+            .collect();
+        if path.starts_with("/upstream/") {
+            assert_eq!(audits.len(), 1, "{records:?}");
+            let fields = &audits[0]["fields"];
+            assert_eq!(fields["method"], "upstream");
+            assert_eq!(
+                fields["outcome"],
+                if parts.status.is_success() || parts.status == StatusCode::SEE_OTHER {
+                    "success"
+                } else {
+                    "failure"
+                }
+            );
+            if path.ends_with("/start") {
+                assert_eq!(fields["event"], "auth.upstream_start");
+                if !parts.status.is_success() {
+                    let problem: Value = serde_json::from_str(&response_body).unwrap();
+                    assert_eq!(
+                        fields["reason"],
+                        problem["type"]
+                            .as_str()
+                            .unwrap()
+                            .strip_prefix("urn:genkan:problem:")
+                            .unwrap()
+                    );
+                }
+            } else {
+                assert!(matches!(
+                    fields["event"].as_str(),
+                    Some("auth.upstream_callback" | "auth.sign_in" | "auth.account_link")
+                ));
+                if parts.status == StatusCode::BAD_REQUEST {
+                    assert!(fields["reason"].as_str().is_some());
+                }
+            }
+            if let Some(kind) = provider.as_deref().and_then(Kind::from_id) {
+                assert_eq!(fields["provider"], kind.id());
+            } else {
+                assert!(fields.get("provider").is_none());
+            }
+            assert!(fields.get("client").is_none());
+        }
+        let owned: Vec<_> = records
+            .iter()
+            .filter(|r| {
+                r["target"]
+                    .as_str()
+                    .is_some_and(|target| target.starts_with("genkan"))
+            })
+            .collect();
+        let serialized = serde_json::to_string(&owned).unwrap();
+        for secret in query_secrets.iter().map(String::as_str).chain(
+            cookies
+                .split(';')
+                .filter_map(|p| p.trim().split_once('=').map(|(_, v)| v)),
+        ) {
+            if !secret.is_empty() {
+                assert!(!serialized.contains(secret), "callback secret leaked");
+            }
+        }
+        for secret in [
+            SECRET_ERROR,
+            GOOGLE_SUB,
+            "gh-secret",
+            "google-secret",
+            "gh-access",
+            INVITATION,
+            &GITHUB_ID.to_string(),
+        ] {
+            assert!(
+                !serialized.contains(secret),
+                "upstream secret or subject leaked"
+            );
+        }
+        if let Some(token) = submitted["token"].as_str() {
+            assert!(!serialized.contains(token), "enrollment token leaked");
+        }
+        for value in parts.headers.get_all(header::SET_COOKIE) {
+            let value = value
+                .to_str()
+                .unwrap()
+                .split(';')
+                .next()
+                .unwrap()
+                .split_once('=')
+                .unwrap()
+                .1;
+            if !value.is_empty() {
+                assert!(!serialized.contains(value), "generated cookie leaked");
+            }
+        }
+        let redirect = parts
+            .headers
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+            .or_else(|| {
+                serde_json::from_str::<Value>(&response_body)
+                    .ok()
+                    .and_then(|v| v["redirect_to"].as_str().map(str::to_owned))
+            });
+        if let Some(url) = redirect {
+            for (key, secret) in
+                form_urlencoded::parse(url.split_once('?').map_or("", |(_, q)| q).as_bytes())
+            {
+                if matches!(key.as_ref(), "code" | "state" | "nonce" | "code_challenge") {
+                    assert!(
+                        !serialized.contains(secret.as_ref()),
+                        "generated redirect secret leaked"
+                    );
+                }
+            }
+        }
+        if let Ok(tokens) = serde_json::from_str::<Value>(&response_body) {
+            for key in ["access_token", "id_token", "refresh_token"] {
+                if let Some(token) = tokens[key].as_str() {
+                    assert!(!serialized.contains(token), "issued token leaked");
+                }
+            }
+        }
         Reply {
             status: parts.status,
             headers: parts.headers,
-            body: String::from_utf8_lossy(&body.collect().await.unwrap().to_bytes()).into_owned(),
+            body: response_body,
+            audit: audits.first().map(|r| (*r).clone()),
+            logs: serialized,
         }
+    }
+
+    fn assert_audit(
+        reply: &Reply,
+        event: &str,
+        reason: Option<&str>,
+        user: Option<&str>,
+        subject: Option<&str>,
+    ) {
+        let fields = &reply.audit.as_ref().unwrap()["fields"];
+        assert_eq!(fields["event"], event);
+        assert_eq!(fields.get("reason").and_then(Value::as_str), reason);
+        assert_eq!(fields.get("user").and_then(Value::as_str), user);
+        assert_eq!(fields.get("subject").and_then(Value::as_str), subject);
     }
 
     async fn authorize(h: &Harness, scope: &str) -> String {
         let uri = format!(
-            "/authorize?client_id=kubectl&redirect_uri=http%3A%2F%2F127.0.0.1%3A8000%2F&response_type=code&scope={scope}&code_challenge={CHALLENGE}&code_challenge_method=S256&state=s"
+            "/authorize?client_id=kubectl&redirect_uri=http%3A%2F%2F127.0.0.1%3A8000%2F&response_type=code&scope={scope}&code_challenge={CHALLENGE}&code_challenge_method=S256&state=oauth-state-secret-sentinel"
         );
         let reply = call(&h.app, Request::get(uri).body(Body::empty()).unwrap()).await;
         reply.cookie(FLOW_COOKIE)
@@ -348,7 +531,7 @@ mod tests {
     }
 
     async fn callback(h: &Harness, provider: &str, query: &str, cookies: &str) -> Reply {
-        call(
+        let reply = call(
             &h.app,
             Request::get(format!("/upstream/{provider}/callback?{query}"))
                 .header(header::COOKIE, cookies)
@@ -356,7 +539,37 @@ mod tests {
                 .body(Body::empty())
                 .unwrap(),
         )
-        .await
+        .await;
+        for token in h
+            .fake
+            .secrets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+        {
+            assert!(
+                !reply.logs.contains(token),
+                "generated provider ID token leaked"
+            );
+        }
+        for pair in cookies.split(';') {
+            if let Some((UPSTREAM_COOKIE, sealed)) = pair.trim().split_once('=')
+                && let Some(pending) = h
+                    .service
+                    .sign_in
+                    .oauth
+                    .sealer
+                    .open("genkan/upstream/v1", sealed)
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            {
+                for key in ["state", "nonce", "verifier", "link", "id"] {
+                    if let Some(secret) = pending[key].as_str() {
+                        assert!(!reply.logs.contains(secret), "sealed pending secret leaked");
+                    }
+                }
+            }
+        }
+        reply
     }
 
     async fn link(h: &Harness, kind: Kind, subject: &str, user: &str) {
@@ -394,6 +607,13 @@ mod tests {
         link(&h, Kind::GitHub, &GITHUB_ID.to_string(), "alice").await;
         let reply = sign_in(&h, "github", "code-1").await;
         assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+        assert_audit(
+            &reply,
+            "auth.sign_in",
+            None,
+            Some("alice"),
+            Some("uid-alice"),
+        );
         let location = reply.headers[header::LOCATION].to_str().unwrap();
         assert!(
             location.starts_with("http://127.0.0.1:8000/?code="),
@@ -440,6 +660,7 @@ mod tests {
         let h = harness().await;
         let reply = sign_in(&h, "github", "code-1").await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+        assert_audit(&reply, "auth.sign_in", Some("account_unlinked"), None, None);
         assert!(
             reply.body.contains("not linked to any user"),
             "{}",
@@ -449,6 +670,13 @@ mod tests {
         link(&h, Kind::Google, GOOGLE_SUB, "zed").await;
         let reply = sign_in(&h, "google", "code-2").await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST, "disabled user");
+        assert_audit(
+            &reply,
+            "auth.sign_in",
+            Some("user_unavailable"),
+            Some("zed"),
+            Some("uid-zed"),
+        );
 
         // The same state twice: the second is refused.
         link(&h, Kind::GitHub, &GITHUB_ID.to_string(), "alice").await;
@@ -460,13 +688,23 @@ mod tests {
             "{FLOW_COOKIE}={flow}; {UPSTREAM_COOKIE}={}",
             started.cookie(UPSTREAM_COOKIE)
         );
-        assert_eq!(
-            callback(&h, "github", &query, &cookies).await.status,
-            StatusCode::SEE_OTHER
+        let first = callback(&h, "github", &query, &cookies).await;
+        assert_eq!(first.status, StatusCode::SEE_OTHER);
+        assert_audit(
+            &first,
+            "auth.sign_in",
+            None,
+            Some("alice"),
+            Some("uid-alice"),
         );
-        assert_eq!(
-            callback(&h, "github", &query, &cookies).await.status,
-            StatusCode::BAD_REQUEST
+        let second_attempt = callback(&h, "github", &query, &cookies).await;
+        assert_eq!(second_attempt.status, StatusCode::BAD_REQUEST);
+        assert_audit(
+            &second_attempt,
+            "auth.sign_in",
+            Some("invalid_state"),
+            None,
+            None,
         );
 
         // A forged state, or no cookie, is refused.
@@ -480,8 +718,16 @@ mod tests {
         );
         let forged = callback(&h, "github", "code=code-4&state=forged", &cookies).await;
         assert_eq!(forged.status, StatusCode::BAD_REQUEST);
+        assert_audit(&forged, "auth.sign_in", Some("invalid_state"), None, None);
         let no_cookie = callback(&h, "github", "code=code-4&state=x", "").await;
         assert_eq!(no_cookie.status, StatusCode::BAD_REQUEST);
+        assert_audit(
+            &no_cookie,
+            "auth.upstream_callback",
+            Some("invalid_pending"),
+            None,
+            None,
+        );
     }
 
     #[tokio::test]
@@ -519,6 +765,7 @@ mod tests {
         let reply = callback(&h, "google", &query, &cookies).await;
         assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
         assert!(reply.body.contains("Account linked"));
+        assert_audit(&reply, "auth.account_link", None, Some("dana"), None);
         let name = external_credential_name(Kind::Google.issuer(), GOOGLE_SUB);
         assert_eq!(
             h.service
@@ -537,6 +784,7 @@ mod tests {
         // And the linked account now signs in as dana.
         let reply = sign_in(&h, "google", "code-2").await;
         assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+        assert_audit(&reply, "auth.sign_in", None, Some("dana"), Some("uid-dana"));
     }
 
     #[tokio::test]
@@ -557,6 +805,13 @@ mod tests {
             *h.fake.id_token_overrides.lock().unwrap() = json!({ claim: value });
             let reply = sign_in(&h, "google", &format!("code-{claim}")).await;
             assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{claim}={value}");
+            assert_audit(
+                &reply,
+                "auth.sign_in",
+                Some("provider_verification_failed"),
+                None,
+                None,
+            );
         }
         // Another audience is refused even when azp names this client (OIDC Core §3.1.3.7 step 3).
         *h.fake.id_token_overrides.lock().unwrap() =
@@ -579,5 +834,186 @@ mod tests {
         *h.fake.google_key.lock().unwrap() = Some(rogue);
         let reply = sign_in(&h, "google", "code-rogue").await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+        assert_audit(
+            &reply,
+            "auth.sign_in",
+            Some("provider_verification_failed"),
+            None,
+            None,
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_provider_does_not_succeed_before_local_authorization() {
+        for failure in ["invalid_flow", "expired_flow", "missing_flow"] {
+            let h = harness().await;
+            link(&h, Kind::Google, GOOGLE_SUB, "alice").await;
+            let flow = authorize(&h, "openid").await;
+            let started = start(&h, "google", &json!({}), &format!("{FLOW_COOKIE}={flow}")).await;
+            let query = provider_issues_code(
+                &h,
+                started.json()["redirect_to"].as_str().unwrap(),
+                "secret-code-local-rejection",
+            );
+            let rejected_flow = match failure {
+                "invalid_flow" => "secret-forged-flow".to_owned(),
+                "expired_flow" => {
+                    let oauth = &h.service.sign_in.oauth;
+                    let mut flow: Value = serde_json::from_slice(
+                        &oauth.sealer.open(endpoints::FLOW_PURPOSE, &flow).unwrap(),
+                    )
+                    .unwrap();
+                    flow["expires_at"] = json!(0);
+                    oauth
+                        .sealer
+                        .seal(endpoints::FLOW_PURPOSE, &serde_json::to_vec(&flow).unwrap())
+                        .unwrap()
+                }
+                "missing_flow" => String::new(),
+                _ => unreachable!(),
+            };
+            let mut cookies = format!("{UPSTREAM_COOKIE}={}", started.cookie(UPSTREAM_COOKIE));
+            if failure != "missing_flow" {
+                write!(cookies, "; {FLOW_COOKIE}={rejected_flow}").unwrap();
+            }
+            let reply = callback(&h, "google", &query, &cookies).await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+            let reason = if failure == "missing_flow" {
+                "missing_flow"
+            } else {
+                "authorization_failed"
+            };
+            assert_audit(
+                &reply,
+                "auth.sign_in",
+                Some(reason),
+                Some("alice"),
+                Some("uid-alice"),
+            );
+            assert_eq!(
+                reply.audit.as_ref().unwrap()["fields"]["outcome"],
+                "failure"
+            );
+            assert!(
+                h.fake.codes.lock().unwrap().is_empty(),
+                "provider code was verified first"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn callback_classification_requires_verified_unexpired_pending() {
+        let h = harness().await;
+        let started = start(&h, "google", &json!({ "token": INVITATION }), "").await;
+        let oauth = &h.service.sign_in.oauth;
+        let mut pending: Value = serde_json::from_slice(
+            &oauth
+                .sealer
+                .open("genkan/upstream/v1", &started.cookie(UPSTREAM_COOKIE))
+                .unwrap(),
+        )
+        .unwrap();
+        pending["expires_at"] = json!(0);
+        let expired = oauth
+            .sealer
+            .seal("genkan/upstream/v1", &serde_json::to_vec(&pending).unwrap())
+            .unwrap();
+        for (provider, cookies) in [
+            ("google", format!("{UPSTREAM_COOKIE}={expired}")),
+            (
+                "google",
+                format!("{UPSTREAM_COOKIE}=secret-invalid-pending"),
+            ),
+            ("unknown-secret-provider", String::new()),
+            (
+                "github",
+                format!("{UPSTREAM_COOKIE}={}", started.cookie(UPSTREAM_COOKIE)),
+            ),
+        ] {
+            let reply = callback(
+                &h,
+                provider,
+                "code=secret-code&state=secret-state",
+                &cookies,
+            )
+            .await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+            assert_audit(
+                &reply,
+                "auth.upstream_callback",
+                Some("invalid_pending"),
+                None,
+                None,
+            );
+            assert!(!reply.logs.contains("unknown-secret-provider"));
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_denial_and_secret_bearing_http_failure_have_fixed_reasons() {
+        let h = harness().await;
+        link(&h, Kind::Google, GOOGLE_SUB, "alice").await;
+        let flow = authorize(&h, "openid").await;
+        let started = start(&h, "google", &json!({}), &format!("{FLOW_COOKIE}={flow}")).await;
+        let cookies = format!("{UPSTREAM_COOKIE}={}", started.cookie(UPSTREAM_COOKIE));
+        let denied = callback(&h, "google", "error=secret-provider-error", &cookies).await;
+        assert_audit(&denied, "auth.sign_in", Some("provider_denied"), None, None);
+        assert!(!denied.logs.contains("secret-provider-error"));
+        h.fake.fail_http.store(true, Ordering::SeqCst);
+        let failed = sign_in(&h, "google", "secret-code-http-failure").await;
+        assert_eq!(failed.status, StatusCode::BAD_REQUEST);
+        assert_audit(
+            &failed,
+            "auth.sign_in",
+            Some("provider_verification_failed"),
+            None,
+            None,
+        );
+        assert!(!failed.body.contains(SECRET_ERROR));
+    }
+
+    #[tokio::test]
+    async fn link_failures_are_not_fresh_sign_ins() {
+        for already_linked in [false, true] {
+            let h = harness().await;
+            let started = start(&h, "google", &json!({ "token": INVITATION }), "").await;
+            let query = provider_issues_code(
+                &h,
+                started.json()["redirect_to"].as_str().unwrap(),
+                "secret-code-link-failure",
+            );
+            if already_linked {
+                link(&h, Kind::Google, GOOGLE_SUB, "alice").await;
+            } else {
+                // The valid invitation was consumed while the user was at the provider.
+                let token = h
+                    .service
+                    .sign_in
+                    .setup
+                    .load(INVITATION)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                h.service.sign_in.setup.consume(&token).await.unwrap();
+            }
+            let reply = callback(
+                &h,
+                "google",
+                &query,
+                &format!("{UPSTREAM_COOKIE}={}", started.cookie(UPSTREAM_COOKIE)),
+            )
+            .await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+            let reason = if already_linked {
+                "account_already_linked"
+            } else {
+                "invalid_setup"
+            };
+            assert_audit(&reply, "auth.account_link", Some(reason), None, None);
+            assert_eq!(
+                reply.audit.as_ref().unwrap()["fields"]["outcome"],
+                "failure"
+            );
+        }
     }
 }

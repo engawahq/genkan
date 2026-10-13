@@ -8,6 +8,10 @@ end-to-end tests of enrolment and sign-in.
   discoverable requests (an empty allow list).
 - `VerifiedUser` is the device's user check: presence and verification (biometric or PIN)
   always pass, so the tests exercise Genkan's user-verification requirement with the UV flag set.
+- `logging::Capture` supplies an isolated native JSON tracing subscriber and parsed records.
+  Attach its `Dispatch` to each complete asynchronous scenario with `with_subscriber` rather
+  than setting a global subscriber. Current-span and span-list fields are disabled, matching
+  the server's JSON output.
 
-It depends on no other Genkan crate. It is a development dependency of `genkan-signin` and the
-end-to-end tests, and is never part of a release build.
+It depends on no other Genkan crate. It is a development dependency of `genkan-signin`,
+`genkan-oauth` and the end-to-end tests, and is never part of a release build.

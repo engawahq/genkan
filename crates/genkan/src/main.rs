@@ -6,8 +6,8 @@ use std::process::ExitCode;
 
 use clap::Parser as _;
 use genkan::cli::{LogFormat, ServeArgs};
-use genkan::output;
-use tracing_subscriber::filter::{LevelFilter, Targets};
+use genkan::serve::ServeError;
+use tracing_subscriber::filter::Targets;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
@@ -19,8 +19,12 @@ fn serve(args: &ServeArgs) -> ExitCode {
     init_logging(args.log_format);
     let config = match args.config() {
         Ok(config) => config,
-        Err(error) => {
-            output::stderr(&format!("error: {error}"));
+        Err(_error) => {
+            tracing::error!(
+                event = "server.configuration",
+                reason = "invalid_configuration",
+                "configuration failed"
+            );
             return ExitCode::from(2);
         }
     };
@@ -30,37 +34,56 @@ fn serve(args: &ServeArgs) -> ExitCode {
         .build()
     {
         Ok(runtime) => runtime,
-        Err(error) => {
-            output::stderr(&format!("error: starting the async runtime: {error}"));
+        Err(_error) => {
+            tracing::error!(
+                reason = "runtime_creation_failed",
+                "starting the async runtime failed"
+            );
             return ExitCode::FAILURE;
         }
     };
     match runtime.block_on(genkan::serve::serve(config)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            tracing::error!(%error, "exiting");
+            let reason = match error {
+                ServeError::Kubernetes(_) => "kubernetes_unavailable",
+                ServeError::Keys(_) => "signing_keys_failed",
+                ServeError::Directory(_) => "directory_unavailable",
+                ServeError::Crypto => "sealing_key_failed",
+                ServeError::Config(_) => "invalid_configuration",
+                ServeError::Io(_) => "http_failed",
+            };
+            tracing::error!(reason, "exiting");
             ExitCode::FAILURE
         }
     }
 }
 
-/// Logs go to stderr. `GENKAN_LOG` takes comma-separated `target=level` directives, for example
-/// `info,genkan=debug`; an invalid value falls back to `info` with a warning.
+/// One mixed stdout stream; `GENKAN_LOG` replaces the complete native target filter.
 fn init_logging(format: LogFormat) {
-    let directives = std::env::var("GENKAN_LOG").unwrap_or_default();
-    let (filter, invalid) = match directives.parse::<Targets>() {
-        Ok(filter) if !directives.is_empty() => (filter, None),
-        Ok(_) => (Targets::new().with_default(LevelFilter::INFO), None),
-        Err(error) => (Targets::new().with_default(LevelFilter::INFO), Some(error)),
+    let fallback = || "warn,genkan=info".parse::<Targets>().unwrap_or_default();
+    let (filter, invalid) = match std::env::var("GENKAN_LOG") {
+        Ok(directives) => match directives.parse::<Targets>() {
+            Ok(filter) => (filter, false),
+            Err(_error) => (fallback(), true),
+        },
+        Err(_unset) => (fallback(), false),
     };
+    // The fmt subscriber's own INFO ceiling must not mask explicit DEBUG/TRACE directives.
     let builder = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
+        .with_max_level(tracing::Level::TRACE)
         .with_ansi(false);
     match format {
-        LogFormat::Json => builder.json().finish().with(filter).init(),
+        LogFormat::Json => builder
+            .json()
+            .with_current_span(false)
+            .with_span_list(false)
+            .finish()
+            .with(filter)
+            .init(),
         LogFormat::Text => builder.finish().with(filter).init(),
     }
-    if let Some(error) = invalid {
-        tracing::warn!(%error, "ignoring invalid GENKAN_LOG");
+    if invalid {
+        tracing::warn!(reason = "invalid_filter", "ignoring invalid GENKAN_LOG");
     }
 }

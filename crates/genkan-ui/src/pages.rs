@@ -98,8 +98,8 @@ pub fn accept_language(headers: &HeaderMap) -> Option<&str> {
 fn render(status: StatusCode, page: &impl Template) -> Response {
     let mut response = match page.render() {
         Ok(html) => (status, Html(html)).into_response(),
-        Err(error) => {
-            tracing::error!(%error, "rendering a page failed");
+        Err(_error) => {
+            tracing::error!(reason = "page_render_failed", "rendering a page failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     };

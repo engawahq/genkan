@@ -103,8 +103,11 @@ impl TlsListener {
                 };
                 let (stream, peer) = match tcp.accept().await {
                     Ok(accepted) => accepted,
-                    Err(error) => {
-                        tracing::warn!(%error, "internal listener: accept failed");
+                    Err(_error) => {
+                        tracing::warn!(
+                            reason = "accept_failed",
+                            "internal listener: accept failed"
+                        );
                         tokio::time::sleep(Duration::from_millis(50)).await;
                         continue;
                     }
@@ -117,11 +120,17 @@ impl TlsListener {
                         Ok(Ok(stream)) => {
                             drop(tx.send((stream, peer)).await);
                         }
-                        Ok(Err(error)) => {
-                            tracing::debug!(%error, %peer, "internal listener: TLS handshake failed");
+                        Ok(Err(_error)) => {
+                            tracing::debug!(
+                                reason = "tls_handshake_failed",
+                                "internal listener: TLS handshake failed"
+                            );
                         }
                         Err(_elapsed) => {
-                            tracing::debug!(%peer, "internal listener: TLS handshake timed out");
+                            tracing::debug!(
+                                reason = "tls_handshake_timeout",
+                                "internal listener: TLS handshake timed out"
+                            );
                         }
                     }
                     drop(permit);

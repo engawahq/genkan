@@ -1404,6 +1404,7 @@ dependencies = [
  "genkan-core",
  "genkan-keys",
  "genkan-store",
+ "genkan-test-support",
  "genkan-ui",
  "http-body-util",
  "jsonwebtoken",
@@ -1467,6 +1468,9 @@ dependencies = [
  "async-trait",
  "passkey",
  "public-suffix",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

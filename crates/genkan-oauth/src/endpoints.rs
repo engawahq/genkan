@@ -180,8 +180,8 @@ async fn authorize<D: Directory, G: GrantStore, C: Clock>(
         None => None,
         Some(id) => match server.directory.client(id).await {
             Ok(client) => client,
-            Err(error) => {
-                tracing::error!(%error, "client lookup failed");
+            Err(_error) => {
+                tracing::error!(reason = "storage_failed", "client lookup failed");
                 return local_error(lang, &OAuthError::server());
             }
         },
@@ -356,36 +356,62 @@ async fn token<D: Directory, G: GrantStore, C: Clock>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !is_form(&headers) {
-        return NOT_FORM.into_response();
+    let mut event = "oauth.token_request";
+    let mut client = None;
+    let not_form = !is_form(&headers);
+    let result = async {
+        if not_form {
+            return Err(AuthFailure {
+                error: NOT_FORM,
+                basic: false,
+            });
+        }
+        let params = Params::parse(&body).map_err(|error| AuthFailure {
+            error,
+            basic: false,
+        })?;
+        event = match params.get("grant_type") {
+            Some("authorization_code") => "oauth.code_exchange",
+            Some("refresh_token") => "oauth.refresh",
+            Some(_) | None => "oauth.token_request",
+        };
+        let authenticated = authenticate(&server.directory, &headers, &params).await?;
+        let client = client.insert(authenticated);
+        match params.get("grant_type") {
+            Some("authorization_code") => exchange_code(&server, client, &params).await,
+            Some("refresh_token") => refresh(&server, client, &params).await,
+            Some(_) => Err(OAuthError::new(
+                ErrorCode::UnsupportedGrantType,
+                "unsupported grant_type",
+            )),
+            None => Err(OAuthError::new(
+                ErrorCode::InvalidRequest,
+                "grant_type is required",
+            )),
+        }
+        .map_err(|error| AuthFailure {
+            error,
+            basic: false,
+        })
     }
-    let params = match Params::parse(&body) {
-        Ok(params) => params,
-        Err(error) => return error.into_response(),
-    };
-    let client = match authenticate(&server.directory, &headers, &params).await {
-        Ok(client) => client,
-        Err(failure) => return auth_failure(failure),
-    };
-    let result = match params.get("grant_type") {
-        Some("authorization_code") => exchange_code(&server, &client, &params).await,
-        Some("refresh_token") => refresh(&server, &client, &params).await,
-        Some(_) => Err(OAuthError::new(
-            ErrorCode::UnsupportedGrantType,
-            "unsupported grant_type",
-        )),
-        None => Err(OAuthError::new(
-            ErrorCode::InvalidRequest,
-            "grant_type is required",
-        )),
-    };
+    .await;
     match result {
         Ok(tokens) => {
             let mut response = axum::Json(tokens).into_response();
             no_store(&mut response);
             response
         }
-        Err(error) => error.into_response(),
+        Err(failure) => {
+            tracing::warn!(
+                target: "genkan::audit",
+                event,
+                outcome = "failure",
+                reason = if not_form { "not_form" } else { failure.error.error.as_str() },
+                client = client.as_ref().map(|client| client.id.as_str()),
+                "token request failed"
+            );
+            auth_failure(failure)
+        }
     }
 }
 
@@ -394,11 +420,15 @@ const INVALID_GRANT: OAuthError = OAuthError::new(
     "the grant is invalid, expired, revoked or was issued to another client",
 );
 
-fn store_error(error: impl std::fmt::Display) -> OAuthError {
-    tracing::error!(%error, "storage failed");
+fn store_error(_error: impl std::fmt::Display) -> OAuthError {
+    tracing::error!(reason = "storage_failed", "storage failed");
     OAuthError::server()
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep code consumption, issuance and its final audit outcome in protocol order"
+)]
 async fn exchange_code<D: Directory, G: GrantStore, C: Clock>(
     server: &AuthorizationServer<D, G, C>,
     client: &Client,
@@ -411,7 +441,18 @@ async fn exchange_code<D: Directory, G: GrantStore, C: Clock>(
     ))?;
     let claims: CodeClaims = code::open(&server.sealer, code).ok_or(INVALID_GRANT)?;
     // RFC 6749 §4.1.3: the code was issued to this client; redirect_uri, if sent, is identical.
-    if claims.expires_at <= now || claims.request.client_id != client.id {
+    if claims.expires_at <= now {
+        return Err(INVALID_GRANT);
+    }
+    if claims.request.client_id != client.id {
+        tracing::warn!(
+            target: "genkan::audit",
+            event = "oauth.client_binding",
+            outcome = "failure",
+            reason = "client_mismatch",
+            client = %client.id,
+            "authorization code client mismatch detected"
+        );
         return Err(INVALID_GRANT);
     }
     if params
@@ -435,7 +476,14 @@ async fn exchange_code<D: Directory, G: GrantStore, C: Clock>(
             .first_use(&claims.id, claims.expires_at, &grant_name, now)
     {
         // RFC 6749 §4.1.2: deny, and revoke what the first redemption produced.
-        tracing::warn!(client = %client.id, "authorization code reused; revoking its grant");
+        tracing::warn!(
+            target: "genkan::audit",
+            event = "oauth.replay",
+            outcome = "failure",
+            reason = "code_reused",
+            client = %client.id,
+            "authorization code reuse detected"
+        );
         server.grants.revoke(&issued).await.map_err(store_error)?;
         return Err(INVALID_GRANT);
     }
@@ -472,6 +520,14 @@ async fn exchange_code<D: Directory, G: GrantStore, C: Clock>(
         CreateGrant::Created => {}
         // Another process redeemed the same code first.
         CreateGrant::AlreadyExists => {
+            tracing::warn!(
+                target: "genkan::audit",
+                event = "oauth.replay",
+                outcome = "failure",
+                reason = "code_reused",
+                client = %client.id,
+                "authorization code reuse detected"
+            );
             server
                 .grants
                 .revoke(&grant.name)
@@ -480,7 +536,7 @@ async fn exchange_code<D: Directory, G: GrantStore, C: Clock>(
             return Err(INVALID_GRANT);
         }
     }
-    issue_tokens(
+    let tokens = issue_tokens(
         server,
         client,
         &user,
@@ -489,7 +545,18 @@ async fn exchange_code<D: Directory, G: GrantStore, C: Clock>(
         Some(&refresh_token),
         server.lifetimes.access_token,
         now,
-    )
+    )?;
+    tracing::info!(
+        target: "genkan::audit",
+        event = "oauth.code_exchange",
+        outcome = "success",
+        user = %user.name,
+        subject = %user.subject,
+        client = %client.id,
+        elevated = false,
+        "authorization code exchanged"
+    );
+    Ok(tokens)
 }
 
 /// Tokens for an `elevate` request: the user's groups plus `elevated:<group>` for each elevated
@@ -528,14 +595,7 @@ fn elevated_tokens<D: Directory, G: GrantStore, C: Clock>(
         expires_at: now.saturating_add(lifetime),
         initial_hash: String::new(),
     };
-    tracing::info!(
-        user = %user.name,
-        client = %client.id,
-        groups = ?user.elevated_groups,
-        lifetime_seconds = lifetime.as_secs(),
-        "elevated token issued"
-    );
-    issue_tokens(
+    let tokens = issue_tokens(
         server,
         client,
         &elevated,
@@ -544,7 +604,19 @@ fn elevated_tokens<D: Directory, G: GrantStore, C: Clock>(
         None,
         lifetime,
         now,
-    )
+    )?;
+    tracing::info!(
+        target: "genkan::audit",
+        event = "oauth.code_exchange",
+        outcome = "success",
+        user = %user.name,
+        subject = %user.subject,
+        client = %client.id,
+        elevated = true,
+        lifetime_seconds = lifetime.as_secs(),
+        "elevated token issued"
+    );
+    Ok(tokens)
 }
 
 async fn active_user<D: Directory, G: GrantStore, C: Clock>(
@@ -570,7 +642,10 @@ fn issue_tokens<D: Directory, G: GrantStore, C: Clock>(
     now: UnixTime,
 ) -> Result<TokenResponse, OAuthError> {
     let keys = server.keys.borrow().clone().ok_or_else(|| {
-        tracing::error!("token requested before signing keys were published");
+        tracing::error!(
+            reason = "keys_unavailable",
+            "token requested before signing keys were published"
+        );
         OAuthError::new(
             ErrorCode::TemporarilyUnavailable,
             "signing keys are not ready",
@@ -612,8 +687,15 @@ async fn check_refresh_client<D: Directory, G: GrantStore, C: Clock>(
     if stored.spec.client == client.id {
         return Ok(());
     }
+    tracing::warn!(
+        target: "genkan::audit",
+        event = "oauth.client_binding",
+        outcome = "failure",
+        reason = "client_mismatch",
+        client = %client.id,
+        "refresh token client mismatch detected"
+    );
     if presented.proves_possession(stored) {
-        tracing::warn!(client = %client.id, "refresh token presented by another client; revoking");
         server
             .grants
             .revoke(presented.grant())
@@ -623,6 +705,10 @@ async fn check_refresh_client<D: Directory, G: GrantStore, C: Clock>(
     Err(INVALID_GRANT)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep rotation, user recheck and final issuance outcome in protocol order"
+)]
 async fn refresh<D: Directory, G: GrantStore, C: Clock>(
     server: &AuthorizationServer<D, G, C>,
     client: &Client,
@@ -678,7 +764,14 @@ async fn refresh<D: Directory, G: GrantStore, C: Clock>(
         Rotation::Rotated(grant) => grant,
         Rotation::Replay => {
             // RFC 9700 §4.14.2: a rotated token was used again; revoke the whole family.
-            tracing::warn!(client = %client.id, "refresh token reuse detected; revoking the family");
+            tracing::warn!(
+                target: "genkan::audit",
+                event = "oauth.replay",
+                outcome = "failure",
+                reason = "refresh_reused",
+                client = %client.id,
+                "refresh token reuse detected"
+            );
             server
                 .grants
                 .revoke(presented.grant())
@@ -714,7 +807,7 @@ async fn refresh<D: Directory, G: GrantStore, C: Clock>(
         scopes: without_elevation(scopes),
         ..grant.spec
     };
-    issue_tokens(
+    let tokens = issue_tokens(
         server,
         client,
         &user,
@@ -723,7 +816,17 @@ async fn refresh<D: Directory, G: GrantStore, C: Clock>(
         Some(&next),
         server.lifetimes.access_token,
         now,
-    )
+    )?;
+    tracing::info!(
+        target: "genkan::audit",
+        event = "oauth.refresh",
+        outcome = "success",
+        user = %user.name,
+        subject = %user.subject,
+        client = %client.id,
+        "refresh token exchanged"
+    );
+    Ok(tokens)
 }
 
 /// Refresh never yields elevated groups. Elevated grants are never stored, so this only guards
@@ -810,44 +913,86 @@ async fn revoke<D: Directory, G: GrantStore, C: Clock>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !is_form(&headers) {
-        return NOT_FORM.into_response();
-    }
-    let params = match Params::parse(&body) {
-        Ok(params) => params,
-        Err(error) => return error.into_response(),
-    };
-    let client = match authenticate(&server.directory, &headers, &params).await {
-        Ok(client) => client,
-        Err(failure) => return auth_failure(failure),
-    };
-    let Some(token) = params.get("token") else {
-        return OAuthError::new(ErrorCode::InvalidRequest, "token is required").into_response();
-    };
-    if let Some(refresh) = RefreshToken::parse(token) {
-        match server.grants.get(refresh.grant()).await {
-            // RFC 7009 §2.1: verify both the owning client and possession of its token.
-            Ok(Some(grant))
-                if grant.spec.client == client.id && refresh.proves_possession(&grant) =>
-            {
-                if let Err(error) = server.grants.revoke(refresh.grant()).await {
-                    return store_error(error).into_response();
-                }
-            }
-            Ok(_) => {}
-            Err(error) => return store_error(error).into_response(),
+    let mut client = None;
+    let not_form = !is_form(&headers);
+    let result = async {
+        if not_form {
+            return Err(AuthFailure {
+                error: NOT_FORM,
+                basic: false,
+            });
         }
-    } else if token.split('.').count() == 3 {
-        // Access and ID tokens are verified offline (kube-apiserver among others) and cannot be
-        // revoked; say so instead of pretending (RFC 7009 §2.2.1).
-        return OAuthError::new(
-            ErrorCode::UnsupportedTokenType,
-            "access tokens cannot be revoked; they expire within minutes",
-        )
-        .into_response();
+        let params = Params::parse(&body).map_err(|error| AuthFailure {
+            error,
+            basic: false,
+        })?;
+        let authenticated = authenticate(&server.directory, &headers, &params).await?;
+        let client = client.insert(authenticated);
+        let token = params.get("token").ok_or(AuthFailure {
+            error: OAuthError::new(ErrorCode::InvalidRequest, "token is required"),
+            basic: false,
+        })?;
+        if let Some(refresh) = RefreshToken::parse(token) {
+            let grant = server
+                .grants
+                .get(refresh.grant())
+                .await
+                .map_err(|error| AuthFailure {
+                    error: store_error(error),
+                    basic: false,
+                })?;
+            // RFC 7009 §2.1: verify both the owning client and possession of its token.
+            if grant.is_some_and(|grant| {
+                grant.spec.client == client.id && refresh.proves_possession(&grant)
+            }) {
+                server
+                    .grants
+                    .revoke(refresh.grant())
+                    .await
+                    .map_err(|error| AuthFailure {
+                        error: store_error(error),
+                        basic: false,
+                    })?;
+            }
+        } else if token.split('.').count() == 3 {
+            // Access and ID tokens are verified offline (kube-apiserver among others) and cannot
+            // be revoked; say so instead of pretending (RFC 7009 §2.2.1).
+            return Err(AuthFailure {
+                error: OAuthError::new(
+                    ErrorCode::UnsupportedTokenType,
+                    "access tokens cannot be revoked; they expire within minutes",
+                ),
+                basic: false,
+            });
+        }
+        Ok(())
     }
-    // RFC 7009 §2.2: 200 for revoked and for invalid tokens alike.
-    let mut response = StatusCode::OK.into_response();
-    no_store(&mut response);
-    response
+    .await;
+    match result {
+        Ok(()) => {
+            tracing::info!(
+                target: "genkan::audit",
+                event = "oauth.revocation_request",
+                outcome = "success",
+                reason = "accepted",
+                client = client.as_ref().map(|client| client.id.as_str()),
+                "revocation request accepted"
+            );
+            // RFC 7009 §2.2: 200 for revoked and for invalid tokens alike.
+            let mut response = StatusCode::OK.into_response();
+            no_store(&mut response);
+            response
+        }
+        Err(failure) => {
+            tracing::warn!(
+                target: "genkan::audit",
+                event = "oauth.revocation_request",
+                outcome = "failure",
+                reason = if not_form { "not_form" } else { failure.error.error.as_str() },
+                client = client.as_ref().map(|client| client.id.as_str()),
+                "revocation request failed"
+            );
+            auth_failure(failure)
+        }
+    }
 }

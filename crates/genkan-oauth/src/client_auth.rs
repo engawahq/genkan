@@ -113,8 +113,8 @@ pub async fn authenticate<D: Directory>(
     let client = directory
         .client(&presented.id)
         .await
-        .map_err(|error| {
-            tracing::error!(%error, "client lookup failed");
+        .map_err(|_error| {
+            tracing::error!(reason = "storage_failed", "client lookup failed");
             AuthFailure {
                 error: OAuthError::server(),
                 basic,

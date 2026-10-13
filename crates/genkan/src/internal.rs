@@ -68,29 +68,35 @@ pub async fn run<C: Clock>(
         let material = match secrets.get_opt(internal_tls::SECRET).await {
             Ok(Some(secret)) => match internal_tls::parse(&secret) {
                 Ok(material) => material,
-                Err(error) => {
-                    tracing::error!(%error, secret = internal_tls::SECRET, "internal listener: unusable certificate");
+                Err(_error) => {
+                    tracing::error!(
+                        reason = "invalid_certificate",
+                        "internal listener: unusable certificate"
+                    );
                     continue;
                 }
             },
             Ok(None) => {
                 if !reported_missing {
                     tracing::info!(
-                        secret = internal_tls::SECRET,
+                        reason = "certificate_unavailable",
                         "internal listener waits for its certificate; run `genkanctl kube-config`"
                     );
                     reported_missing = true;
                 }
                 continue;
             }
-            Err(error) => {
-                tracing::warn!(%error, "internal listener: reading the certificate failed");
+            Err(_error) => {
+                tracing::warn!(
+                    reason = "certificate_read_failed",
+                    "internal listener: reading the certificate failed"
+                );
                 continue;
             }
         };
         let Some(url) = config.url.clone().or_else(|| material.url.clone()) else {
             tracing::error!(
-                annotation = internal_tls::URL_ANNOTATION,
+                reason = "certificate_url_missing",
                 "internal listener: the certificate Secret does not say where kube-apiserver reaches it"
             );
             continue;
@@ -107,8 +113,8 @@ pub async fn run<C: Clock>(
         });
         resolver.set(Arc::clone(&material.key));
     }
-    if let Err(error) = server.await {
-        tracing::error!(%error, "internal listener failed");
+    if let Err(_error) = server.await {
+        tracing::error!(reason = "internal_task_failed", "internal listener failed");
     }
 }
 
@@ -136,11 +142,11 @@ fn start(
         let stopped = async move {
             drop(shutdown.wait_for(|stop| *stop).await);
         };
-        if let Err(error) = axum::serve(listener, app)
+        if let Err(_error) = axum::serve(listener, app)
             .with_graceful_shutdown(stopped)
             .await
         {
-            tracing::error!(%error, "internal listener stopped");
+            tracing::error!(reason = "http_failed", "internal listener stopped");
         }
     })
 }

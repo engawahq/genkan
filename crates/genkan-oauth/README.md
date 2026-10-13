@@ -42,6 +42,23 @@ page). Used by `genkan` (the server), `genkan-signin` (which calls `complete_aut
   sign-in.
 - Every redirect is `303 See Other` and carries `iss` (RFC 9207).
 
+## Event logs
+
+Token and revocation outcomes use the `genkan::audit` tracing target. `oauth.code_exchange`
+and `oauth.refresh` succeed only after all requested tokens have been signed; an elevated code
+exchange also carries `elevated=true`. These operations are not fresh sign-ins. Failures are
+emitted at the handler's final result boundary with a fixed OAuth reason, or `not_form`.
+Only an authenticated client is recorded; issuance success uses the already-verified local
+user name and subject.
+
+`oauth.replay` and `oauth.client_binding` describe detection before attempted deletion, not
+proof that deletion succeeded. `oauth.revocation_request` with `outcome=success` and
+`reason=accepted` means the request was accepted, including RFC 7009's invalid-token no-op.
+Storage and signing diagnostics retain their module targets and fixed categorical reasons.
+Owned records omit tokens, codes, credentials, groups and raw errors; dependency diagnostics
+do not share this guarantee. See the server README for stdout formatting, filtering and
+best-effort collection limits.
+
 ## References
 
 - [RFC 6749] OAuth 2.0; [RFC 7636] PKCE; [RFC 9700] OAuth 2.0 Security BCP; [RFC 9068] JWT

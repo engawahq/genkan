@@ -4,7 +4,7 @@
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Duration;
 
     use axum::Router;
@@ -16,19 +16,24 @@ mod tests {
     use genkan_core::config::BaseUrl;
     use genkan_core::crypto::{Sealer, hash_secret};
     use genkan_keys::Algorithm;
-    use genkan_keys::manager::KeyManager;
+    use genkan_keys::manager::{KeyManager, Published};
     use genkan_keys::rotation::RotationPolicy;
     use genkan_keys::store::MemoryKeyStore;
     use genkan_oauth::authorize::Authentication;
     use genkan_oauth::endpoints::{FLOW_COOKIE, complete_authorization, router};
     use genkan_oauth::{AuthorizationServer, Lifetimes, OneTimeIds};
-    use genkan_store::{Client, ClientType, MemoryDirectory, MemoryGrantStore, User};
+    use genkan_store::{
+        Client, ClientType, CreateGrant, Grant, GrantStore, MemoryDirectory, MemoryGrantStore,
+        NewGrant, Rotation, StoreError, User,
+    };
+    use genkan_test_support::logging::Capture;
     use http_body_util::BodyExt as _;
     use jsonwebtoken::jwk::JwkSet;
     use jsonwebtoken::{DecodingKey, Validation, decode, decode_header};
     use serde_json::Value;
     use tokio::sync::Barrier;
     use tower::ServiceExt as _;
+    use tracing::instrument::WithSubscriber as _;
 
     const ISSUER: &str = "https://login.example.com";
     const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
@@ -52,13 +57,54 @@ mod tests {
         }
     }
 
-    type Server = AuthorizationServer<MemoryDirectory, MemoryGrantStore, TestClock>;
+    #[derive(Default)]
+    struct TestGrantStore {
+        memory: MemoryGrantStore,
+        fail_revoke: AtomicBool,
+    }
+
+    impl GrantStore for TestGrantStore {
+        async fn create(
+            &self,
+            grant: &NewGrant,
+            idle: UnixTime,
+        ) -> Result<CreateGrant, StoreError> {
+            self.memory.create(grant, idle).await
+        }
+
+        async fn get(&self, name: &str) -> Result<Option<Grant>, StoreError> {
+            self.memory.get(name).await
+        }
+
+        async fn rotate(
+            &self,
+            name: &str,
+            presented: &str,
+            next: &str,
+            now: UnixTime,
+            idle: UnixTime,
+        ) -> Result<Rotation, StoreError> {
+            self.memory.rotate(name, presented, next, now, idle).await
+        }
+
+        async fn revoke(&self, name: &str) -> Result<(), StoreError> {
+            if self.fail_revoke.load(Ordering::SeqCst) {
+                Err(StoreError("oauth-storage-secret-sentinel".into()))
+            } else {
+                self.memory.revoke(name).await
+            }
+        }
+    }
+
+    type Server = AuthorizationServer<MemoryDirectory, TestGrantStore, TestClock>;
 
     struct Harness {
         server: Arc<Server>,
         app: Router,
         clock: TestClock,
         jwks: JwkSet,
+        capture: Capture,
+        keys_sender: tokio::sync::watch::Sender<Option<Arc<Published>>>,
     }
 
     async fn harness() -> Harness {
@@ -76,6 +122,7 @@ mod tests {
         manager.reconcile().await.unwrap();
         let keys = manager.subscribe();
         let jwks: JwkSet = serde_json::from_slice(&keys.borrow().clone().unwrap().jwks()).unwrap();
+        let (keys_sender, keys) = tokio::sync::watch::channel(keys.borrow().clone());
 
         let directory = MemoryDirectory::default();
         directory.put_client(Client {
@@ -111,19 +158,27 @@ mod tests {
             issuer: BaseUrl::parse("issuer", ISSUER).unwrap(),
             lifetimes,
             directory,
-            grants: MemoryGrantStore::default(),
+            grants: TestGrantStore::default(),
             clock: clock.clone(),
             keys,
             sealer: Sealer::ephemeral().unwrap(),
             used_codes: OneTimeIds::default(),
             used_request_uris: OneTimeIds::default(),
         });
-        let app = router(Arc::clone(&server));
+        let capture = Capture::new();
+        let dispatch = capture.dispatch();
+        let app = router(Arc::clone(&server)).layer(axum::middleware::from_fn(
+            move |request: Request<Body>, next: axum::middleware::Next| {
+                next.run(request).with_subscriber(dispatch.clone())
+            },
+        ));
         Harness {
             server,
             app,
             clock,
             jwks,
+            capture,
+            keys_sender,
         }
     }
 
@@ -289,6 +344,72 @@ mod tests {
         (header, data.claims)
     }
 
+    fn audit_outcomes(h: &Harness, event: &str, outcomes: &[&str]) -> Vec<Value> {
+        let records: Vec<_> = h
+            .capture
+            .records()
+            .into_iter()
+            .filter(|record| {
+                record["target"] == "genkan::audit" && record["fields"]["event"] == event
+            })
+            .collect();
+        assert_eq!(records.len(), outcomes.len(), "{records:#?}");
+        for (record, outcome) in records.iter().zip(outcomes) {
+            assert_eq!(record["fields"]["outcome"], *outcome, "{record:#?}");
+            if *outcome == "success" && matches!(event, "oauth.code_exchange" | "oauth.refresh") {
+                assert_eq!(record["fields"]["user"], "alice");
+                assert_eq!(record["fields"]["subject"], "uid-alice");
+                assert_eq!(record["fields"]["client"], "kubectl");
+            }
+        }
+        assert!(
+            h.capture
+                .records()
+                .iter()
+                .all(|record| { record["fields"]["event"] != "auth.sign_in" }),
+            "OAuth operations are not fresh sign-ins"
+        );
+        records
+    }
+
+    fn assert_no_secrets(h: &Harness, secrets: &[&str]) {
+        let owned: Vec<_> = h
+            .capture
+            .records()
+            .into_iter()
+            .filter(|record| {
+                record["target"] == "genkan::audit"
+                    || record["target"]
+                        .as_str()
+                        .is_some_and(|target| target.starts_with("genkan_oauth"))
+            })
+            .collect();
+        assert!(
+            !owned.is_empty(),
+            "secret exclusion requires captured owned records"
+        );
+        for record in &owned {
+            assert!(record.get("span").is_none());
+            assert!(record.get("spans").is_none());
+        }
+        let serialized = serde_json::to_string(&owned).unwrap();
+        for secret in secrets.iter().copied().chain([
+            VERIFIER,
+            CHALLENGE,
+            WEB_SECRET,
+            "state-1",
+            "nonce-1",
+            "cluster-admins",
+            "oauth-storage-secret-sentinel",
+        ]) {
+            assert!(
+                !serialized.contains(secret),
+                "owned records contain secret: {secret}"
+            );
+        }
+        assert!(!serialized.contains(&STANDARD.encode(format!("web:{WEB_SECRET}"))));
+    }
+
     #[tokio::test]
     async fn code_flow_issues_tokens_kubernetes_can_use() {
         let h = harness().await;
@@ -310,6 +431,7 @@ mod tests {
         assert_eq!(param(&location, "state").as_deref(), Some("state-1"));
         assert_eq!(param(&location, "iss").as_deref(), Some(ISSUER), "RFC 9207");
         let code = param(&location, "code").unwrap();
+        let flow = flow_cookie(&reply);
 
         let reply = exchange(&h, &code).await;
         assert_eq!(reply.status, StatusCode::OK);
@@ -342,8 +464,24 @@ mod tests {
             id.get("client_id").is_none(),
             "ID tokens never look like access tokens"
         );
+        let events = audit_outcomes(&h, "oauth.code_exchange", &["success"]);
+        assert_eq!(events[0]["fields"]["elevated"], false);
+        assert_no_secrets(
+            &h,
+            &[
+                &code,
+                &flow,
+                body["access_token"].as_str().unwrap(),
+                body["id_token"].as_str().unwrap(),
+                body["refresh_token"].as_str().unwrap(),
+            ],
+        );
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "exercise both client authentication methods, challenges and secret exclusion in one scenario"
+    )]
     #[tokio::test]
     async fn confidential_client_gets_rs256_id_tokens_and_must_authenticate() {
         let h = harness().await;
@@ -375,6 +513,7 @@ mod tests {
         // Wrong secret over Basic: 401 with a Basic challenge.
         let code = sign_in(&h, "alice", &authorize).await;
         let pairs = as_refs(&form(&code));
+        let first_code = code.clone();
         let pairs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let reply = post(&h.app, "/token", &pairs, Some(("web", "wrong"))).await;
         assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
@@ -403,6 +542,7 @@ mod tests {
         // client_secret_basic works; the ID token is RS256 as registered.
         let reply = post(&h.app, "/token", &pairs, Some(("web", WEB_SECRET))).await;
         assert_eq!(reply.status, StatusCode::OK);
+        let basic_tokens = reply.json();
         let (header, id) = verify(&h, reply.json()["id_token"].as_str().unwrap(), "web");
         assert_eq!(header.alg, jsonwebtoken::Algorithm::RS256);
         assert!(
@@ -420,10 +560,9 @@ mod tests {
         let pairs = as_refs(&form(&code));
         let mut pairs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
         pairs.extend([("client_id", "web"), ("client_secret", WEB_SECRET)]);
-        assert_eq!(
-            post(&h.app, "/token", &pairs, None).await.status,
-            StatusCode::OK
-        );
+        let reply = post(&h.app, "/token", &pairs, None).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let post_tokens = reply.json();
 
         // A public client must not send a secret; unknown clients are rejected.
         let reply = post(
@@ -442,6 +581,52 @@ mod tests {
         )
         .await;
         assert_eq!(reply.error(), "invalid_client");
+        let events: Vec<_> = h
+            .capture
+            .records()
+            .into_iter()
+            .filter(|record| {
+                record["target"] == "genkan::audit"
+                    && record["fields"]["event"] == "oauth.code_exchange"
+            })
+            .collect();
+        assert_eq!(events.len(), 5);
+        for (event, outcome) in events
+            .iter()
+            .zip(["failure", "failure", "failure", "success", "success"])
+        {
+            assert_eq!(event["fields"]["outcome"], outcome);
+            if outcome == "success" {
+                assert_eq!(event["fields"]["client"], "web");
+                assert_eq!(event["fields"]["user"], "alice");
+                assert_eq!(event["fields"]["subject"], "uid-alice");
+            } else {
+                for identity in ["client", "user", "subject"] {
+                    assert!(event["fields"].get(identity).is_none());
+                }
+            }
+        }
+        let failed_refresh = audit_outcomes(&h, "oauth.refresh", &["failure", "failure"]);
+        assert!(
+            failed_refresh
+                .iter()
+                .all(|record| record["fields"].get("client").is_none())
+        );
+        assert_no_secrets(
+            &h,
+            &[
+                &first_code,
+                &code,
+                &STANDARD.encode("web:wrong"),
+                "nobody",
+                basic_tokens["access_token"].as_str().unwrap(),
+                basic_tokens["id_token"].as_str().unwrap(),
+                basic_tokens["refresh_token"].as_str().unwrap(),
+                post_tokens["access_token"].as_str().unwrap(),
+                post_tokens["id_token"].as_str().unwrap(),
+                post_tokens["refresh_token"].as_str().unwrap(),
+            ],
+        );
     }
 
     #[tokio::test]
@@ -457,6 +642,21 @@ mod tests {
         assert_eq!(second.error(), "invalid_grant");
         // RFC 6749 §4.1.2: tokens issued from the reused code are revoked.
         assert_eq!(refresh(&h, &refresh_token).await.error(), "invalid_grant");
+        audit_outcomes(&h, "oauth.code_exchange", &["success", "failure"]);
+        audit_outcomes(&h, "oauth.refresh", &["failure"]);
+        let replay = audit_outcomes(&h, "oauth.replay", &["failure"]);
+        assert_eq!(replay[0]["fields"]["reason"], "code_reused");
+        assert_eq!(replay[0]["fields"]["client"], "kubectl");
+        assert!(replay[0]["fields"].get("user").is_none());
+        assert_no_secrets(
+            &h,
+            &[
+                &code,
+                &refresh_token,
+                first.json()["access_token"].as_str().unwrap(),
+                first.json()["id_token"].as_str().unwrap(),
+            ],
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -545,16 +745,27 @@ mod tests {
         .await;
         assert_eq!(reply.error(), "invalid_grant");
         assert_eq!(exchange(&h, "not-a-code").await.error(), "invalid_grant");
+        let events = audit_outcomes(
+            &h,
+            "oauth.code_exchange",
+            &[
+                "failure", "failure", "failure", "success", "failure", "failure", "failure",
+            ],
+        );
+        assert_eq!(events[5]["fields"]["client"], "web");
+        let binding = audit_outcomes(&h, "oauth.client_binding", &["failure"]);
+        assert_eq!(binding[0]["fields"]["reason"], "client_mismatch");
+        assert_eq!(binding[0]["fields"]["client"], "web");
+        assert!(binding[0]["fields"].get("user").is_none());
+        assert_no_secrets(&h, &[&code, &late]);
     }
 
     #[tokio::test]
     async fn refresh_rotates_and_reuse_revokes_the_family() {
         let h = harness().await;
         let code = sign_in(&h, "alice", &kubectl_authorize(&[])).await;
-        let first = exchange(&h, &code).await.json()["refresh_token"]
-            .as_str()
-            .unwrap()
-            .to_owned();
+        let issued = exchange(&h, &code).await.json();
+        let first = issued["refresh_token"].as_str().unwrap().to_owned();
 
         h.clock.advance(300);
         let reply = refresh(&h, &first).await;
@@ -566,13 +777,35 @@ mod tests {
         assert_eq!(id["auth_time"], START, "auth_time is the original sign-in");
         assert!(id.get("nonce").is_none());
 
-        let third = refresh(&h, &second).await.json()["refresh_token"]
-            .as_str()
-            .unwrap()
-            .to_owned();
+        let rotated = refresh(&h, &second).await.json();
+        let third = rotated["refresh_token"].as_str().unwrap().to_owned();
         // Someone replays the second token (already rotated): the whole family dies.
         assert_eq!(refresh(&h, &second).await.error(), "invalid_grant");
         assert_eq!(refresh(&h, &third).await.error(), "invalid_grant");
+        audit_outcomes(&h, "oauth.code_exchange", &["success"]);
+        audit_outcomes(
+            &h,
+            "oauth.refresh",
+            &["success", "success", "failure", "failure"],
+        );
+        let detection = audit_outcomes(&h, "oauth.replay", &["failure"]);
+        assert_eq!(detection[0]["fields"]["reason"], "refresh_reused");
+        assert_eq!(detection[0]["fields"]["client"], "kubectl");
+        assert_no_secrets(
+            &h,
+            &[
+                &code,
+                &first,
+                &second,
+                &third,
+                reply.json()["access_token"].as_str().unwrap(),
+                reply.json()["id_token"].as_str().unwrap(),
+                issued["access_token"].as_str().unwrap(),
+                issued["id_token"].as_str().unwrap(),
+                rotated["access_token"].as_str().unwrap(),
+                rotated["id_token"].as_str().unwrap(),
+            ],
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -969,6 +1202,18 @@ mod tests {
                     assert_eq!(reply.status, StatusCode::OK);
                 }
                 assert_eq!(refresh(&h, &current).await.error(), "invalid_grant");
+                if wrong_client {
+                    let binding = audit_outcomes(&h, "oauth.client_binding", &["failure"]);
+                    assert_eq!(binding[0]["fields"]["reason"], "client_mismatch");
+                    assert_eq!(binding[0]["fields"]["client"], "web");
+                    audit_outcomes(&h, "oauth.refresh", &["success", "failure", "failure"]);
+                } else {
+                    let revocation = audit_outcomes(&h, "oauth.revocation_request", &["success"]);
+                    assert_eq!(revocation[0]["fields"]["reason"], "accepted");
+                    assert_eq!(revocation[0]["fields"]["client"], "kubectl");
+                    audit_outcomes(&h, "oauth.refresh", &["success", "failure"]);
+                }
+                assert_no_secrets(&h, &[&first, &current]);
             }
         }
     }
@@ -990,10 +1235,8 @@ mod tests {
         )
         .await;
         assert_eq!(reply.status, StatusCode::OK);
-        let token = refresh(&h, token).await.json()["refresh_token"]
-            .as_str()
-            .unwrap()
-            .to_owned();
+        let rotated = refresh(&h, token).await.json();
+        let token = rotated["refresh_token"].as_str().unwrap().to_owned();
 
         let reply = post(
             &h.app,
@@ -1024,6 +1267,29 @@ mod tests {
         )
         .await;
         assert_eq!(reply.status, StatusCode::OK);
+        let events = audit_outcomes(
+            &h,
+            "oauth.revocation_request",
+            &["success", "success", "failure", "success"],
+        );
+        assert_eq!(events[0]["fields"]["client"], "web");
+        for index in [0, 1, 3] {
+            assert_eq!(events[index]["fields"]["reason"], "accepted");
+            assert!(events[index]["fields"].get("user").is_none());
+            assert!(events[index]["fields"].get("subject").is_none());
+        }
+        assert_eq!(events[2]["fields"]["reason"], "unsupported_token_type");
+        assert_no_secrets(
+            &h,
+            &[
+                &token,
+                body["access_token"].as_str().unwrap(),
+                body["id_token"].as_str().unwrap(),
+                body["refresh_token"].as_str().unwrap(),
+                rotated["access_token"].as_str().unwrap(),
+                rotated["id_token"].as_str().unwrap(),
+            ],
+        );
     }
 
     const PASSKEY: &[&str] = &["swk", "mfa"];
@@ -1064,6 +1330,18 @@ mod tests {
         // UserInfo reports base groups only.
         let info = userinfo(&h, tokens["access_token"].as_str()).await.json();
         assert_eq!(info["groups"], serde_json::json!(["admins"]));
+        let events = audit_outcomes(&h, "oauth.code_exchange", &["success"]);
+        assert_eq!(events[0]["fields"]["elevated"], true);
+        assert_eq!(events[0]["fields"]["lifetime_seconds"], 300);
+        assert!(events[0]["fields"].get("groups").is_none());
+        assert_no_secrets(
+            &h,
+            &[
+                &code,
+                tokens["access_token"].as_str().unwrap(),
+                tokens["id_token"].as_str().unwrap(),
+            ],
+        );
     }
 
     #[tokio::test]
@@ -1284,6 +1562,250 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn signing_failures_never_report_issuance_success() {
+        // Both missing key publication and a clock before signer activation fail code issuance.
+        // Elevated issuance has no stored grant but must obey exactly the same final boundary.
+        for elevated in [false, true] {
+            for missing in [false, true] {
+                let h = harness_with(elevating()).await;
+                if missing {
+                    h.keys_sender.send(None).unwrap();
+                } else {
+                    h.clock.0.store(START - 1, Ordering::SeqCst);
+                }
+                let uri = if elevated {
+                    elevate_uri()
+                } else {
+                    kubectl_authorize(&[])
+                };
+                let code = sign_in_with(&h, "alice", &uri, PASSKEY).await;
+                let reply = exchange(&h, &code).await;
+                let reason = if missing {
+                    "temporarily_unavailable"
+                } else {
+                    "server_error"
+                };
+                assert_eq!(reply.error(), reason);
+                let events = audit_outcomes(&h, "oauth.code_exchange", &["failure"]);
+                assert_eq!(events[0]["fields"]["reason"], reason);
+                assert_eq!(events[0]["fields"]["client"], "kubectl");
+                assert!(events[0]["fields"].get("user").is_none());
+                let operational = if missing {
+                    "keys_unavailable"
+                } else {
+                    "no_active_signer"
+                };
+                assert!(h.capture.records().iter().any(|record| {
+                    matches!(
+                        record["target"].as_str(),
+                        Some("genkan_oauth::endpoints" | "genkan_oauth::tokens")
+                    ) && record["fields"]["reason"] == operational
+                }));
+                assert_no_secrets(&h, &[&code]);
+            }
+        }
+
+        // Rotation still happens before signing; restoring keys cannot reuse the old token.
+        let h = harness().await;
+        let code = sign_in(&h, "alice", &kubectl_authorize(&[])).await;
+        let issued = exchange(&h, &code).await.json();
+        let token = issued["refresh_token"].as_str().unwrap();
+        let keys = h.server.keys.borrow().clone();
+        h.keys_sender.send(None).unwrap();
+        assert_eq!(refresh(&h, token).await.error(), "temporarily_unavailable");
+        h.keys_sender.send(keys).unwrap();
+        assert_eq!(refresh(&h, token).await.error(), "invalid_grant");
+        let events = audit_outcomes(&h, "oauth.refresh", &["failure", "failure"]);
+        assert_eq!(events[0]["fields"]["reason"], "temporarily_unavailable");
+        let replay = audit_outcomes(&h, "oauth.replay", &["failure"]);
+        assert_eq!(replay[0]["fields"]["reason"], "refresh_reused");
+        assert_no_secrets(
+            &h,
+            &[
+                &code,
+                token,
+                issued["access_token"].as_str().unwrap(),
+                issued["id_token"].as_str().unwrap(),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn detection_and_revocation_failures_do_not_claim_deletion() {
+        for detection in ["code", "refresh", "binding", "revoke"] {
+            let h = harness().await;
+            let code = sign_in(&h, "alice", &kubectl_authorize(&[])).await;
+            let issued = exchange(&h, &code).await.json();
+            let token = issued["refresh_token"].as_str().unwrap();
+            let mut secrets = vec![code.clone(), token.to_owned()];
+            h.server.grants.fail_revoke.store(true, Ordering::SeqCst);
+            let (reply, operation, client) = match detection {
+                "code" => (exchange(&h, &code).await, "oauth.code_exchange", "kubectl"),
+                "refresh" => {
+                    let rotated = refresh(&h, token).await.json();
+                    for field in ["refresh_token", "access_token", "id_token"] {
+                        secrets.push(rotated[field].as_str().unwrap().to_owned());
+                    }
+                    (refresh(&h, token).await, "oauth.refresh", "kubectl")
+                }
+                "binding" => (
+                    post(
+                        &h.app,
+                        "/token",
+                        &[("grant_type", "refresh_token"), ("refresh_token", token)],
+                        Some(("web", WEB_SECRET)),
+                    )
+                    .await,
+                    "oauth.refresh",
+                    "web",
+                ),
+                "revoke" => (
+                    post(
+                        &h.app,
+                        "/revoke",
+                        &[("token", token), ("client_id", "kubectl")],
+                        None,
+                    )
+                    .await,
+                    "oauth.revocation_request",
+                    "kubectl",
+                ),
+                _ => unreachable!(),
+            };
+            assert_eq!(reply.error(), "server_error");
+            let expected = if matches!(detection, "code" | "refresh") {
+                vec!["success", "failure"]
+            } else {
+                vec!["failure"]
+            };
+            let events = audit_outcomes(&h, operation, &expected);
+            let failed = events.last().unwrap();
+            assert_eq!(failed["fields"]["reason"], "server_error");
+            assert_eq!(failed["fields"]["client"], client);
+            assert!(h.capture.records().iter().any(|record| {
+                record["target"] == "genkan_oauth::endpoints"
+                    && record["fields"]["reason"] == "storage_failed"
+            }));
+            if detection != "revoke" {
+                let (event, reason) = match detection {
+                    "code" => ("oauth.replay", "code_reused"),
+                    "refresh" => ("oauth.replay", "refresh_reused"),
+                    "binding" => ("oauth.client_binding", "client_mismatch"),
+                    _ => unreachable!(),
+                };
+                let detected = audit_outcomes(&h, event, &["failure"]);
+                assert_eq!(detected[0]["fields"]["reason"], reason);
+                assert_eq!(detected[0]["fields"]["client"], client);
+                assert!(detected[0]["fields"].get("user").is_none());
+            }
+            assert_no_secrets(&h, &secrets.iter().map(String::as_str).collect::<Vec<_>>());
+            let family = genkan_oauth::refresh::RefreshToken::parse(token).unwrap();
+            assert!(
+                h.server.grants.get(family.grant()).await.unwrap().is_some(),
+                "failed deletion must leave the family in storage"
+            );
+            assert_no_secrets(
+                &h,
+                &[
+                    issued["access_token"].as_str().unwrap(),
+                    issued["id_token"].as_str().unwrap(),
+                ],
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn token_and_revoke_failures_preserve_basic_challenges_and_unknown_identity() {
+        for path in ["/token", "/revoke"] {
+            let h = harness().await;
+            let reply = post(
+                &h.app,
+                path,
+                &[
+                    ("grant_type", "authorization_code"),
+                    ("code", "unverified-code-sentinel"),
+                    ("token", "unverified-token-sentinel"),
+                ],
+                Some(("web", "wrong-client-secret-sentinel")),
+            )
+            .await;
+            assert_eq!(reply.error(), "invalid_client");
+            assert_eq!(
+                reply.headers[header::WWW_AUTHENTICATE],
+                r#"Basic realm="genkan""#
+            );
+            let event = if path == "/token" {
+                "oauth.code_exchange"
+            } else {
+                "oauth.revocation_request"
+            };
+            let events = audit_outcomes(&h, event, &["failure"]);
+            assert_eq!(events[0]["fields"]["reason"], "invalid_client");
+            for identity in ["client", "user", "subject"] {
+                assert!(events[0]["fields"].get(identity).is_none());
+            }
+            assert_no_secrets(
+                &h,
+                &[
+                    "unverified-code-sentinel",
+                    "unverified-token-sentinel",
+                    "wrong-client-secret-sentinel",
+                    &STANDARD.encode("web:wrong-client-secret-sentinel"),
+                ],
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn revocation_failures_cover_form_parsing_and_missing_token() {
+        let h = harness().await;
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/revoke")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"token":"non-form-token-sentinel"}"#))
+            .unwrap();
+        assert_eq!(send(&h.app, request).await.error(), "invalid_request");
+        let duplicate = post(
+            &h.app,
+            "/revoke",
+            &[
+                ("token", "first-token-sentinel"),
+                ("token", "second-token-sentinel"),
+                ("client_id", "kubectl"),
+            ],
+            None,
+        )
+        .await;
+        assert_eq!(duplicate.error(), "invalid_request");
+        assert_eq!(
+            post(&h.app, "/revoke", &[("client_id", "kubectl")], None)
+                .await
+                .error(),
+            "invalid_request"
+        );
+        let events = audit_outcomes(
+            &h,
+            "oauth.revocation_request",
+            &["failure", "failure", "failure"],
+        );
+        assert_eq!(events[0]["fields"]["reason"], "not_form");
+        assert_eq!(events[1]["fields"]["reason"], "invalid_request");
+        assert_eq!(events[2]["fields"]["reason"], "invalid_request");
+        assert!(events[0]["fields"].get("client").is_none());
+        assert!(events[1]["fields"].get("client").is_none());
+        assert_eq!(events[2]["fields"]["client"], "kubectl");
+        assert_no_secrets(
+            &h,
+            &[
+                "non-form-token-sentinel",
+                "first-token-sentinel",
+                "second-token-sentinel",
+            ],
+        );
+    }
+
+    #[tokio::test]
     async fn token_endpoint_rejects_malformed_requests() {
         let h = harness().await;
         let reply = post(
@@ -1303,5 +1825,30 @@ mod tests {
             .body(Body::from("{}"))
             .unwrap();
         assert_eq!(send(&h.app, request).await.status, StatusCode::BAD_REQUEST);
+        let duplicate = post(
+            &h.app,
+            "/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("grant_type", "refresh_token"),
+                ("code", "duplicate-form-code-sentinel"),
+                ("client_id", "kubectl"),
+            ],
+            None,
+        )
+        .await;
+        assert_eq!(duplicate.error(), "invalid_request");
+        let events = audit_outcomes(
+            &h,
+            "oauth.token_request",
+            &["failure", "failure", "failure", "failure"],
+        );
+        assert_eq!(events[0]["fields"]["reason"], "unsupported_grant_type");
+        assert_eq!(events[0]["fields"]["client"], "kubectl");
+        assert_eq!(events[1]["fields"]["reason"], "invalid_request");
+        assert_eq!(events[2]["fields"]["reason"], "not_form");
+        assert!(events[2]["fields"].get("client").is_none());
+        assert!(events[3]["fields"].get("client").is_none());
+        assert_no_secrets(&h, &["password", "duplicate-form-code-sentinel"]);
     }
 }

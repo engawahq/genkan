@@ -177,8 +177,8 @@ impl<S: KeyStore, C: Clock> KeyManager<S, C> {
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    if let Err(error) = self.reconcile().await {
-                        tracing::warn!(%error, "signing key reconciliation failed; will retry");
+                    if let Err(_error) = self.reconcile().await {
+                        tracing::warn!(reason = "key_reconciliation_failed", "signing key reconciliation failed; will retry");
                     }
                 }
                 _ = shutdown.changed() => break,

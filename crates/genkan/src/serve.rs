@@ -120,7 +120,7 @@ pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
             let namespace = namespace
                 .clone()
                 .unwrap_or_else(|| client.default_namespace().to_owned());
-            tracing::info!(%namespace, %key_secret, "using Kubernetes storage");
+            tracing::info!("using Kubernetes storage");
             let keys = SecretKeyStore::new(
                 Api::namespaced(client.clone(), &namespace),
                 key_secret.clone(),
@@ -331,18 +331,22 @@ async fn run<S: KeyStore, D: Directory, G: GrantStore, K: CredentialStore, T: Se
         .await;
     shutdown_tx.send_replace(true);
     for task in background.into_iter().chain([rotator]) {
-        if let Err(error) = task.await {
-            tracing::error!(%error, "background task failed");
+        if let Err(_error) = task.await {
+            tracing::error!(reason = "background_task_failed", "background task failed");
         }
     }
-    tracing::info!("stopped");
-    Ok(outcome?)
+    outcome?;
+    tracing::info!(event = "server.stopped", "stopped");
+    Ok(())
 }
 
 async fn shutdown_signal() {
     let interrupt = async {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            tracing::error!(%error, "cannot listen for SIGINT");
+        if let Err(_error) = tokio::signal::ctrl_c().await {
+            tracing::error!(
+                reason = "sigint_listener_failed",
+                "cannot listen for SIGINT"
+            );
             std::future::pending::<()>().await;
         }
     };
@@ -352,8 +356,11 @@ async fn shutdown_signal() {
             Ok(mut signal) => {
                 signal.recv().await;
             }
-            Err(error) => {
-                tracing::error!(%error, "cannot listen for SIGTERM");
+            Err(_error) => {
+                tracing::error!(
+                    reason = "sigterm_listener_failed",
+                    "cannot listen for SIGTERM"
+                );
                 std::future::pending::<()>().await;
             }
         }

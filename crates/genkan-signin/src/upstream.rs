@@ -159,6 +159,7 @@ where
     S: SetupStore,
     H: HttpClient,
 {
+    let normalized_provider = Kind::from_id(&provider).map(Kind::id);
     let result: Result<Response, Problem> = async {
         let sign_in = &service.sign_in;
         check_request(&headers, sign_in.oauth.issuer.as_str())?;
@@ -209,6 +210,14 @@ where
         Ok(response)
     }
     .await;
+    match &result {
+        Ok(_) => {
+            tracing::info!(target: "genkan::audit", event = "auth.upstream_start", outcome = "success", method = "upstream", provider = normalized_provider, "upstream request started");
+        }
+        Err(problem) => {
+            tracing::warn!(target: "genkan::audit", event = "auth.upstream_start", outcome = "failure", method = "upstream", provider = normalized_provider, reason = problem.kind, "upstream request failed");
+        }
+    }
     result.unwrap_or_else(IntoResponse::into_response)
 }
 
@@ -242,132 +251,163 @@ where
     let sign_in = &service.sign_in;
     let oauth = &sign_in.oauth;
     let now = oauth.now();
-    let params: Vec<(String, String)> =
-        form_urlencoded::parse(query.unwrap_or_default().as_bytes())
-            .into_owned()
-            .collect();
-    let param = |name: &str| {
-        params
-            .iter()
-            .find(|(k, _)| k == name)
-            .map(|(_, v)| v.as_str())
-    };
-
-    let pending: Option<Pending> = cookie(&headers, UPSTREAM_COOKIE)
-        .and_then(|sealed| oauth.sealer.open(PURPOSE, sealed))
-        .and_then(|json| serde_json::from_slice(&json).ok());
-    let Some(pending) = pending.filter(|p| p.expires_at > now && p.provider == provider) else {
-        return failure(lang, m.upstream_failed);
-    };
-    let Some(provider) = Kind::from_id(&pending.provider)
-        .and_then(|kind| service.providers.iter().find(|p| p.kind() == kind))
-    else {
-        return failure(lang, m.upstream_failed);
-    };
-    // The provider refused, or the user cancelled (RFC 6749 §4.1.2.1).
-    let (Some(code), Some(state)) = (param("code"), param("state")) else {
-        return failure(lang, m.upstream_failed);
-    };
-    if !ct_eq(state.as_bytes(), pending.state.as_bytes())
-        || service
-            .used_states
-            .first_use(&pending.id, pending.expires_at, "", now)
-            != Use::First
-    {
-        return failure(lang, m.upstream_failed);
-    }
-    let exchange = Exchange {
-        code,
-        verifier: &pending.verifier,
-        redirect_uri: &redirect_uri(oauth.issuer.as_str(), provider.kind()),
-        nonce: &pending.nonce,
-    };
-    let subject = match provider.identify(&service.http, exchange, now).await {
-        Ok(subject) => subject,
-        Err(error) => {
-            tracing::warn!(%error, provider = provider.kind().id(), "upstream sign-in failed");
-            return failure(lang, m.upstream_failed);
-        }
-    };
-    let issuer = provider.kind().issuer();
-    let name = external_credential_name(issuer, &subject);
-    let linked = match sign_in.credentials.linked_user(&name).await {
-        Ok(linked) => linked,
-        Err(error) => {
-            tracing::error!(%error, "credential lookup failed");
-            return failure(lang, m.generic_error);
-        }
-    };
-
-    let Some(token) = pending.link else {
-        // Signing in.
-        let Some(user) = linked else {
-            tracing::info!(
-                provider = provider.kind().id(),
-                "an unlinked account tried to sign in"
-            );
-            return failure(lang, m.upstream_not_linked);
+    let normalized_provider = Kind::from_id(&provider).map(Kind::id);
+    let mut event = "auth.upstream_callback";
+    let mut identity = None;
+    let mut link_user = None;
+    // Keep the protocol checks in order, but emit only after the complete operation has a result.
+    // The error carries a controlled reason and the existing localized browser response.
+    let result: Result<Response, (&str, &str)> = async {
+        let params: Vec<(String, String)> =
+            form_urlencoded::parse(query.unwrap_or_default().as_bytes())
+                .into_owned()
+                .collect();
+        let param = |name: &str| {
+            params
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
         };
-        let active = matches!(oauth.directory.user(&user).await, Ok(Some(u)) if !u.disabled);
-        let Some(flow) = cookie(&headers, FLOW_COOKIE).filter(|_| active) else {
-            return failure(lang, m.upstream_failed);
+        let pending: Option<Pending> = cookie(&headers, UPSTREAM_COOKIE)
+            .and_then(|sealed| oauth.sealer.open(PURPOSE, sealed))
+            .and_then(|json| serde_json::from_slice(&json).ok());
+        let pending = pending
+            .filter(|p| p.expires_at > now && p.provider == provider)
+            .ok_or(("invalid_pending", m.upstream_failed))?;
+        event = if pending.link.is_some() {
+            "auth.account_link"
+        } else {
+            "auth.sign_in"
         };
-        let authentication = Authentication {
-            user: user.clone(),
-            auth_time: now,
-            amr: Vec::new(),
+        let provider = Kind::from_id(&pending.provider)
+            .and_then(|kind| service.providers.iter().find(|p| p.kind() == kind))
+            .ok_or(("provider_unavailable", m.upstream_failed))?;
+        // The provider refused, or the user cancelled (RFC 6749 §4.1.2.1).
+        let (Some(code), Some(state)) = (param("code"), param("state")) else {
+            return Err(("provider_denied", m.upstream_failed));
         };
-        return complete_authorization(oauth, flow, authentication).map_or_else(
-            |_| failure(lang, m.upstream_failed),
-            |location| {
-                tracing::info!(%user, provider = provider.kind().id(), "signed in upstream");
-                let mut response = StatusCode::SEE_OTHER.into_response();
-                if let Ok(value) = HeaderValue::try_from(location) {
-                    response.headers_mut().insert(header::LOCATION, value);
-                }
-                response
-                    .headers_mut()
-                    .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-                clear_cookie(&mut response, UPSTREAM_COOKIE, "Lax");
-                clear_cookie(&mut response, FLOW_COOKIE, "Lax");
-                response
-            },
-        );
-    };
-
-    // Linking with an enrolment link: same single-use gate as enrolling a passkey.
-    if linked.is_some() {
-        return failure(lang, m.upstream_already_linked);
-    }
-    let Ok(stored) = valid_setup_token(&sign_in.setup, &token, now).await else {
-        return failure(lang, m.setup_invalid);
-    };
-    match sign_in.setup.consume(&stored).await {
-        Ok(Consume::Consumed) => {}
-        Ok(Consume::AlreadyUsed) => return failure(lang, m.setup_invalid),
-        Err(error) => {
-            tracing::error!(%error, "consuming the enrolment token failed");
-            return failure(lang, m.generic_error);
+        if !ct_eq(state.as_bytes(), pending.state.as_bytes())
+            || service
+                .used_states
+                .first_use(&pending.id, pending.expires_at, "", now)
+                != Use::First
+        {
+            return Err(("invalid_state", m.upstream_failed));
         }
-    }
-    let external = NewExternal {
-        name,
-        user: stored.user.clone(),
-        kind: provider.kind().credential_type(),
-        issuer: issuer.to_owned(),
-        subject,
-    };
-    match sign_in.credentials.link(&external).await {
-        Ok(CreateCredential::Created) => {
-            tracing::info!(user = %stored.user, provider = provider.kind().id(), "upstream account linked");
-            let mut response = notice_page(lang, m.upstream_linked_title, m.upstream_linked_body);
+        let exchange = Exchange {
+            code,
+            verifier: &pending.verifier,
+            redirect_uri: &redirect_uri(oauth.issuer.as_str(), provider.kind()),
+            nonce: &pending.nonce,
+        };
+        let subject = provider
+            .identify(&service.http, exchange, now)
+            .await
+            .map_err(|_error| ("provider_verification_failed", m.upstream_failed))?;
+        let issuer = provider.kind().issuer();
+        let name = external_credential_name(issuer, &subject);
+        let linked = sign_in
+            .credentials
+            .linked_user(&name)
+            .await
+            .map_err(|_error| {
+                tracing::error!(
+                    reason = "credential_lookup_failed",
+                    "credential lookup failed"
+                );
+                ("credential_lookup_failed", m.generic_error)
+            })?;
+        let Some(token) = pending.link else {
+            let user = linked.ok_or(("account_unlinked", m.upstream_not_linked))?;
+            identity = oauth
+                .directory
+                .user(&user)
+                .await
+                .map_err(|_error| ("user_lookup_failed", m.upstream_failed))?;
+            let user = identity
+                .as_ref()
+                .ok_or(("user_unavailable", m.upstream_failed))?;
+            if user.disabled {
+                return Err(("user_unavailable", m.upstream_failed));
+            }
+            let flow = cookie(&headers, FLOW_COOKIE).ok_or(("missing_flow", m.upstream_failed))?;
+            let authentication = Authentication {
+                user: user.name.clone(),
+                auth_time: now,
+                amr: Vec::new(),
+            };
+            let location = complete_authorization(oauth, flow, authentication)
+                .map_err(|_error| ("authorization_failed", m.upstream_failed))?;
+            let mut response = StatusCode::SEE_OTHER.into_response();
+            if let Ok(value) = HeaderValue::try_from(location) {
+                response.headers_mut().insert(header::LOCATION, value);
+            }
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
             clear_cookie(&mut response, UPSTREAM_COOKIE, "Lax");
+            clear_cookie(&mut response, FLOW_COOKIE, "Lax");
+            return Ok(response);
+        };
+        // Linking with an enrolment link: same single-use gate as enrolling a passkey.
+        if linked.is_some() {
+            return Err(("account_already_linked", m.upstream_already_linked));
+        }
+        let stored = valid_setup_token(&sign_in.setup, &token, now)
+            .await
+            .map_err(|_problem| ("invalid_setup", m.setup_invalid))?;
+        link_user = Some(stored.user.clone());
+        match sign_in.setup.consume(&stored).await {
+            Ok(Consume::Consumed) => {}
+            Ok(Consume::AlreadyUsed) => return Err(("setup_already_used", m.setup_invalid)),
+            Err(_error) => {
+                tracing::error!(
+                    reason = "setup_consume_failed",
+                    "consuming the enrolment token failed"
+                );
+                return Err(("setup_consume_failed", m.generic_error));
+            }
+        }
+        let external = NewExternal {
+            name,
+            user: stored.user,
+            kind: provider.kind().credential_type(),
+            issuer: issuer.to_owned(),
+            subject,
+        };
+        match sign_in.credentials.link(&external).await {
+            Ok(CreateCredential::Created) => {
+                let mut response =
+                    notice_page(lang, m.upstream_linked_title, m.upstream_linked_body);
+                clear_cookie(&mut response, UPSTREAM_COOKIE, "Lax");
+                Ok(response)
+            }
+            Ok(CreateCredential::AlreadyExists) => {
+                Err(("account_already_linked", m.upstream_already_linked))
+            }
+            Err(_error) => {
+                tracing::error!(
+                    reason = "credential_link_failed",
+                    "linking the account failed"
+                );
+                Err(("credential_link_failed", m.generic_error))
+            }
+        }
+    }
+    .await;
+    let user = identity
+        .as_ref()
+        .map(|u| u.name.as_str())
+        .or(link_user.as_deref());
+    let subject = identity.as_ref().map(|u| u.subject.as_str());
+    match result {
+        Ok(response) => {
+            tracing::info!(target: "genkan::audit", event, outcome = "success", method = "upstream", provider = normalized_provider, user, subject, "upstream operation completed");
             response
         }
-        Ok(CreateCredential::AlreadyExists) => failure(lang, m.upstream_already_linked),
-        Err(error) => {
-            tracing::error!(%error, "linking the account failed");
-            failure(lang, m.generic_error)
+        Err((reason, detail)) => {
+            tracing::warn!(target: "genkan::audit", event, outcome = "failure", method = "upstream", provider = normalized_provider, reason, user, subject, "upstream operation failed");
+            failure(lang, detail)
         }
     }
 }

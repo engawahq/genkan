@@ -1,5 +1,7 @@
 #![doc = include_str!("../README.md")]
 
+pub mod logging;
+
 use passkey::authenticator::{Authenticator, UiHint, UserCheck, UserValidationMethod};
 use passkey::client::Client as PasskeyClient;
 use passkey::types::ctap2::{Aaguid, Ctap2Error};
