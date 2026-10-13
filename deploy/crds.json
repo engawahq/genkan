@@ -46,7 +46,7 @@
                 "description": "A person who can sign in to Genkan.",
                 "properties": {
                   "spec": {
-                    "description": "A person who can sign in. The admin (or GitOps) owns `spec`; Genkan writes only `status`.\n\nKubernetes sees the user as `genkan:<username>` with groups `genkan:<group>`.",
+                    "description": "A person who can sign in. The admin (or GitOps) owns `spec`; Genkan only reads it.\n\nKubernetes sees the user as `genkan:<username>` with groups `genkan:<group>`.",
                     "properties": {
                       "disabled": {
                         "default": false,
@@ -99,27 +99,6 @@
                       "username"
                     ],
                     "type": "object"
-                  },
-                  "status": {
-                    "description": "Runtime state written by Genkan through the status subresource.",
-                    "nullable": true,
-                    "properties": {
-                      "lastSignInAt": {
-                        "description": "When the user last signed in, in Unix seconds.",
-                        "format": "int64",
-                        "minimum": 0.0,
-                        "nullable": true,
-                        "type": "integer"
-                      },
-                      "sessionEpoch": {
-                        "default": 0,
-                        "description": "Incremented to sign the user out of every browser session.",
-                        "format": "int64",
-                        "minimum": 0.0,
-                        "type": "integer"
-                      }
-                    },
-                    "type": "object"
                   }
                 },
                 "required": [
@@ -135,10 +114,7 @@
               }
             ],
             "served": true,
-            "storage": true,
-            "subresources": {
-              "status": {}
-            }
+            "storage": true
           }
         ]
       }

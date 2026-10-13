@@ -8,7 +8,7 @@
 use kube::{CustomResource, KubeSchema};
 use serde::{Deserialize, Serialize};
 
-/// A person who can sign in. The admin (or GitOps) owns `spec`; Genkan writes only `status`.
+/// A person who can sign in. The admin (or GitOps) owns `spec`; Genkan only reads it.
 ///
 /// Kubernetes sees the user as `genkan:<username>` with groups `genkan:<group>`.
 #[derive(
@@ -19,7 +19,6 @@ use serde::{Deserialize, Serialize};
     version = "v1alpha1",
     kind = "User",
     namespaced,
-    status = "UserStatus",
     shortname = "gkuser",
     category = "genkan",
     selectable = ".spec.username",
@@ -79,18 +78,4 @@ pub struct UserSpec {
         )
     )]
     pub elevated_groups: Vec<String>,
-}
-
-/// Runtime state written by Genkan through the status subresource.
-#[derive(KubeSchema, Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct UserStatus {
-    /// Incremented to sign the user out of every browser session.
-    #[serde(default)]
-    #[schemars(range(min = 0))]
-    pub session_epoch: i64,
-    /// When the user last signed in, in Unix seconds.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 0))]
-    pub last_sign_in_at: Option<i64>,
 }

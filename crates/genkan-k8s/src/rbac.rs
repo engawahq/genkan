@@ -12,8 +12,8 @@
 //!   ([RBAC], [RBAC good practices]), so Genkan has none of these on Secrets: the installer creates
 //!   the empty key Secret and the cluster admin's `genkanctl` writes the other two.
 //! - **Configuration is read-only.** Users, credentials and clients are written by admins or
-//!   GitOps; Genkan reads them, writes `users/status`, and creates or deletes credentials when a
-//!   passkey is enrolled or an account is linked.
+//!   GitOps; Genkan reads them and creates or deletes credentials when a passkey is enrolled or an
+//!   account is linked. It has no write access to users.
 //! - **Runtime state is Genkan's.** Full access to grants; invitations it can read and redeem
 //!   (`delete`), but not create.
 //! - **Nothing else.** No cluster-scoped rights, nothing in other namespaces, no RBAC objects, no
@@ -89,7 +89,6 @@ pub fn rules() -> Vec<PolicyRule> {
             &["get", "list", "watch"],
         ),
         // Runtime state Genkan owns.
-        rule(&[GROUP], &["users/status"], &[], &["update"]),
         rule(&[GROUP], &["credentials"], &[], &["create", "delete"]),
         rule(
             &[GROUP],

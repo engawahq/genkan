@@ -98,17 +98,6 @@
             "genkan.engawahq.dev"
           ],
           "resources": [
-            "users/status"
-          ],
-          "verbs": [
-            "update"
-          ]
-        },
-        {
-          "apiGroups": [
-            "genkan.engawahq.dev"
-          ],
-          "resources": [
             "credentials"
           ],
           "verbs": [

@@ -5,9 +5,9 @@
 //! (pre-login flows, WebAuthn challenges, authorization codes) never reaches the API server.
 //! Each kind exists because a native object cannot do its job:
 //!
-//! - [`user::User`]: admins or GitOps own `spec` while Genkan writes runtime fields. Only a custom
-//!   resource has a status subresource, so neither side overwrites the other. Admission checks
-//!   usernames and groups, and whoever manages users needs no access to Secrets.
+//! - [`user::User`]: admins or GitOps own `spec`; Genkan only reads it. A custom resource provides
+//!   admission checks for usernames and groups, and whoever manages users needs no access to
+//!   Secrets. Session state belongs to [`grant::Grant`], not the user.
 //! - [`credential::Credential`]: the name is derived from the credential's unique key, so a
 //!   duplicate `create` fails with `409` across replicas. A `ConfigMap` could do that, but has no
 //!   schema for the type union and is readable by the namespace `view` role. A kind of its own also

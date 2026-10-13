@@ -492,7 +492,7 @@ mod tests {
             ),
             Some(403)
         );
-        // Denied: writing users' spec (only status).
+        // Denied: writing users (configuration is read-only).
         let users: Api<User> = env.genkan_api();
         let user = User::new(
             "bob",

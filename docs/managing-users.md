@@ -11,7 +11,7 @@ export GENKAN_ISSUER=https://genkan-k3s.shared
 
 | Object | Short name | Who writes it |
 |---|---|---|
-| `User` | `gkuser` | you (`spec`); Genkan writes only `status` |
+| `User` | `gkuser` | you (`spec`); Genkan only reads it |
 | `Credential` | `gkcred` | Genkan, when someone enrols a passkey or links an account; you, to revoke |
 | `Invitation` | `gkinvite` | `genkanctl invite`; Genkan deletes it when redeemed or expired |
 | `Grant` | `gkgrant` | Genkan, one per signed-in session (refresh-token family) |
