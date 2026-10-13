@@ -148,6 +148,8 @@ Tests are in `genkan-oauth/tests/oauth.rs` unless noted.
 |---|---|---|---|
 | Elevated groups only after a passkey sign-in (`amr` contains `swk`) | `genkan-oauth/src/endpoints.rs` | `elevation_needs_the_feature_a_passkey_and_eligible_groups`; `genkan-signin/tests/upstream.rs: start_requires_a_pending_request_and_refuses_elevation` | Met |
 | Short, non-refreshable elevated tokens; refresh never yields elevated groups | `endpoints.rs` | `elevation_issues_short_lived_tokens_without_refresh` | Met |
+| Only clients with `allowElevation` may ask: `invalid_scope` at `/authorize` and `/par`, `invalid_grant` at `/token` if the flag was removed meanwhile | `genkan-oauth/src/authorize.rs`, `endpoints.rs` | `authorize::tests::elevate_needs_the_feature_and_the_client_opt_in`, `elevation_needs_the_client_to_allow_it` | Met |
+| The sign-in page says the application is asking for elevated access, and for how long | `genkan-ui/src/pages.rs`, `templates/login.html` | `genkan-signin/tests/pages.rs: login_says_when_elevated_access_is_requested` | Met |
 | Elevated codes single use under concurrency | `endpoints.rs` | `an_elevated_code_is_redeemed_at_most_once_under_concurrency` | Met |
 | kube-apiserver rejects elevated groups in long or stale tokens | `genkan-k8s/src/kube_config.rs` | *(e2e)* | Met |
 | First admin: read-only base group, cluster admin only when elevated | `genkan-k8s/src/rbac.rs`, `setup.rs` | *(e2e)* `passkey_sign_in_then_kubectl_auth_whoami` | Met |

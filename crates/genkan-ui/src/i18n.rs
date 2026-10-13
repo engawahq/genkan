@@ -126,6 +126,9 @@ pub struct Messages {
     pub noscript_body: &'static str,
     pub no_request_title: &'static str,
     pub no_request_body: &'static str,
+    pub elevated_title: &'static str,
+    /// `%app%` and `%minutes%` are replaced when the page is rendered.
+    pub elevated_body: &'static str,
     pub working: &'static str,
     pub generic_error: &'static str,
     pub setup_title: &'static str,
@@ -167,6 +170,8 @@ pub const EN: Messages = Messages {
     noscript_body: "Passkeys need JavaScript. Turn it on for this site and reload the page.",
     no_request_title: "Nothing to sign in to",
     no_request_body: "Start from the application or command you want to use, such as kubectl. It will send you here.",
+    elevated_title: "Elevated access requested",
+    elevated_body: "%app% is asking for temporary elevated access, valid for %minutes% min. Continue only if you started this yourself from %app%.",
     working: "Waiting for your passkey…",
     generic_error: "Something went wrong. Try again.",
     setup_title: "Set up your passkey",
@@ -208,6 +213,8 @@ pub const ZH_TW: Messages = Messages {
     noscript_body: "通行密鑰需要 JavaScript。請為這個網站啟用後重新載入頁面。",
     no_request_title: "目前沒有要登入的服務",
     no_request_body: "請從要使用的應用程式或指令（例如 kubectl）開始，它會把你帶到這裡。",
+    elevated_title: "要求提升權限",
+    elevated_body: "%app% 要求暫時提升權限，有效 %minutes% 分鐘。只有在你自己從 %app% 發起這次登入時才繼續。",
     working: "正在等待通行密鑰…",
     generic_error: "發生錯誤，請再試一次。",
     setup_title: "設定通行密鑰",
@@ -249,6 +256,8 @@ pub const ZH_CN: Messages = Messages {
     noscript_body: "通行密钥需要 JavaScript。请为此网站启用后重新加载页面。",
     no_request_title: "当前没有需要登录的服务",
     no_request_body: "请从要使用的应用或命令（例如 kubectl）开始，它会把你带到这里。",
+    elevated_title: "请求提升权限",
+    elevated_body: "%app% 请求临时提升权限，有效期 %minutes% 分钟。仅当你自己从 %app% 发起此次登录时才继续。",
     working: "正在等待通行密钥…",
     generic_error: "出现错误，请重试。",
     setup_title: "设置通行密钥",
@@ -329,6 +338,10 @@ mod tests {
             let m = lang.messages();
             assert!(
                 !m.login_title.is_empty() && !m.setup_done_body.is_empty(),
+                "{lang:?}"
+            );
+            assert!(
+                m.elevated_body.contains("%app%") && m.elevated_body.contains("%minutes%"),
                 "{lang:?}"
             );
         }

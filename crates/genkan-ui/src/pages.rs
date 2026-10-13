@@ -1,6 +1,8 @@
 //! Rendering the pages: sign-in, enrolment, errors and notices. Routing and the data behind each
 //! page belong to the caller.
 
+use std::time::Duration;
+
 use askama::Template;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
@@ -29,6 +31,7 @@ struct LoginPage<'a> {
     assets: &'a Versions,
     client: Option<&'a str>,
     subtitle: String,
+    elevation_notice: Option<String>,
     login_hint: Option<&'a str>,
     providers: &'a [ProviderButton],
 }
@@ -123,10 +126,16 @@ pub fn error_page(lang: Lang, detail: &str) -> Response {
 
 /// Renders the sign-in page. Without a pending request (`client` is `None`) it explains that
 /// there is nothing to sign in to; `providers` adds "Continue with …" buttons.
+///
+/// `elevation` is the lifetime of the elevated token when the request asks for one. The page
+/// then says so before the passkey prompt: otherwise approving elevated access looks exactly
+/// like a routine sign-in, and prompt fatigue works against the user. The text stays generic,
+/// since the user's elevated groups are unknown before sign-in.
 #[must_use]
 pub fn login_page(
     lang: Lang,
     client: Option<&str>,
+    elevation: Option<Duration>,
     login_hint: Option<&str>,
     providers: &[ProviderButton],
 ) -> Response {
@@ -135,6 +144,14 @@ pub fn login_page(
         || m.login_subtitle.to_owned(),
         |c| format!("{} {c}", m.login_continue_to),
     );
+    let elevation_notice = client.zip(elevation).map(|(client, lifetime)| {
+        // Whole minutes, rounded up, so the page never understates how long access lasts.
+        let minutes = lifetime.as_secs().div_ceil(60).max(1);
+        // `%minutes%` first, so a display name containing it is shown verbatim.
+        m.elevated_body
+            .replace("%minutes%", &minutes.to_string())
+            .replace("%app%", client)
+    });
     let page = LoginPage {
         lang,
         langs: &Lang::ALL,
@@ -142,6 +159,7 @@ pub fn login_page(
         assets: &VERSIONS,
         client,
         subtitle,
+        elevation_notice,
         login_hint,
         providers,
     };

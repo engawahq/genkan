@@ -12,6 +12,9 @@
     {%- if client.is_none() %}
     {% call ui::alert(m.no_request_title, "default", "WarningCircle", live = "") %}{{ m.no_request_body }}{% endcall %}
     {%- else %}
+    {%- if let Some(notice) = elevation_notice %}
+    {% call ui::alert(m.elevated_title, "default", "Key", id = "elevation", live = "") %}{{ notice }}{% endcall %}
+    {%- endif %}
     {#- Present and empty from first paint, so screen readers announce what the script writes. -#}
     <div id="status" role="status" aria-live="polite" class="empty:sr-only text-sm text-muted-foreground"></div>
     <div id="error" role="alert" class="empty:sr-only text-sm text-destructive"></div>

@@ -339,6 +339,7 @@ spec:
   type: Public
   redirectUris: ["http://127.0.0.1:8000/"]
   audiences: [kubernetes]
+  allowElevation: true
 EOF
 genkanctl setup-link --issuer $ISSUER --username admin
 ```

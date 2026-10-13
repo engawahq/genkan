@@ -46,6 +46,7 @@ mod tests {
             audiences: vec![],
             secret_hash: None,
             id_token_alg: Algorithm::Es256,
+            allow_elevation: true,
         });
         let server = Arc::new(AuthorizationServer {
             issuer: BaseUrl::parse("issuer", "https://login.example.com").unwrap(),
@@ -329,6 +330,51 @@ mod tests {
                 .to_owned();
             let page = get(&app, "/login", &[("cookie", &cookie)]).await;
             assert_eq!(page.body.contains("data-provider"), offered, "{scope}");
+        }
+    }
+
+    #[tokio::test]
+    async fn login_says_when_elevated_access_is_requested() {
+        let app = app().await;
+        for (scope, lang, notice) in [
+            ("openid", "en", None),
+            (
+                "openid+elevate",
+                "en",
+                Some("Cluster Dashboard is asking for temporary elevated access, valid for 5 min."),
+            ),
+            (
+                "openid+elevate",
+                "zh-TW",
+                Some("Cluster Dashboard 要求暫時提升權限，有效 5 分鐘。"),
+            ),
+        ] {
+            let reply = get(
+                &app,
+                &format!(
+                    "/authorize?response_type=code&client_id=dashboard&redirect_uri=https%3A%2F%2Fdashboard.example.com%2Fcb\
+                     &scope={scope}&code_challenge={CHALLENGE}&code_challenge_method=S256"
+                ),
+                &[],
+            )
+            .await;
+            let cookie = reply.headers[header::SET_COOKIE]
+                .to_str()
+                .unwrap()
+                .split(';')
+                .next()
+                .unwrap()
+                .to_owned();
+            let page = get(&app, &format!("/login?lang={lang}"), &[("cookie", &cookie)]).await;
+            assert_hardened(&page);
+            assert_eq!(
+                page.body.contains("id=\"elevation\""),
+                notice.is_some(),
+                "{scope} {lang}"
+            );
+            if let Some(text) = notice {
+                assert!(page.body.contains(text), "{scope} {lang}");
+            }
         }
     }
 }

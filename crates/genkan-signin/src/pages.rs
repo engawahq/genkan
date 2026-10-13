@@ -50,12 +50,14 @@ async fn login<D: Directory, G: GrantStore, C: Clock>(
             }
         },
     };
-    // Elevation needs a passkey, so upstream providers are not offered for it.
+    // Elevation needs a passkey, so upstream providers are not offered for it, and the page
+    // says that the application is asking for elevated access.
     let elevated = flow.as_ref().is_some_and(|f| f.request.is_elevated());
     let login_hint = flow.and_then(|f| f.request.login_hint);
     login_page(
         lang,
         client.as_deref(),
+        server.lifetimes.elevated_token.filter(|_| elevated),
         login_hint.as_deref(),
         if elevated { &[] } else { &providers },
     )

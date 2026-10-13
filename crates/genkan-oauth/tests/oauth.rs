@@ -86,6 +86,7 @@ mod tests {
             audiences: vec!["kubernetes".into()],
             secret_hash: None,
             id_token_alg: Algorithm::Es256,
+            allow_elevation: true,
         });
         directory.put_client(Client {
             id: "web".into(),
@@ -95,6 +96,7 @@ mod tests {
             audiences: vec![],
             secret_hash: Some(hash_secret(WEB_SECRET.as_bytes())),
             id_token_alg: Algorithm::Rs256,
+            allow_elevation: false,
         });
         for (name, disabled) in [("alice", false), ("bob", true)] {
             directory.put_user(User {
@@ -1119,6 +1121,58 @@ mod tests {
         )
         .await;
         assert_eq!(reply.error(), "invalid_scope");
+    }
+
+    fn kubectl_client(allow_elevation: bool) -> Client {
+        Client {
+            id: "kubectl".into(),
+            display_name: None,
+            kind: ClientType::Public,
+            redirect_uris: vec![KUBECTL_REDIRECT.into()],
+            audiences: vec!["kubernetes".into()],
+            secret_hash: None,
+            id_token_alg: Algorithm::Es256,
+            allow_elevation,
+        }
+    }
+
+    #[tokio::test]
+    async fn elevation_needs_the_client_to_allow_it() {
+        let h = harness_with(elevating()).await;
+        h.server.directory.put_client(kubectl_client(false));
+
+        // `/authorize`: invalid_scope, redirected with state.
+        let reply = get(&h.app, &elevate_uri()).await;
+        assert_eq!(reply.status, StatusCode::SEE_OTHER);
+        let location = reply.location();
+        assert_eq!(param(&location, "error").as_deref(), Some("invalid_scope"));
+        assert_eq!(param(&location, "state").as_deref(), Some("state-1"));
+        // The same client still signs users in normally.
+        let code = sign_in_with(&h, "alice", &kubectl_authorize(&[]), PASSKEY).await;
+        assert_eq!(exchange(&h, &code).await.status, StatusCode::OK);
+
+        // `/par`: invalid_scope.
+        let pushed = [
+            ("client_id", "kubectl"),
+            ("redirect_uri", KUBECTL_REDIRECT),
+            ("response_type", "code"),
+            ("scope", "openid elevate"),
+            ("code_challenge", CHALLENGE),
+            ("code_challenge_method", "S256"),
+        ];
+        let reply = post(&h.app, "/par", &pushed, None).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+        assert_eq!(reply.error(), "invalid_scope");
+        h.server.directory.put_client(kubectl_client(true));
+        assert_eq!(
+            post(&h.app, "/par", &pushed, None).await.status,
+            StatusCode::CREATED
+        );
+
+        // Allowed at `/authorize`, taken away before `/token`: the code is refused.
+        let code = sign_in_with(&h, "alice", &elevate_uri(), PASSKEY).await;
+        h.server.directory.put_client(kubectl_client(false));
+        assert_eq!(exchange(&h, &code).await.error(), "invalid_grant");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

@@ -55,7 +55,8 @@ tests; `genkan-test-support` provides the software authenticator for the tests.
   as [OpenID Connect Core 1.0 §3.1.3.7][oidc] requires.
 - **Elevation is passkey-only.** Upstream sign-ins carry no `amr` value and give no evidence of
   user verification, so a request for elevated access offers no providers and refuses to start
-  one (`needs-passkey`).
+  one (`needs-passkey`). The page also tells the user that the application is asking for
+  elevated access, and for how long, so approving it does not look like a routine sign-in.
 
 ## References
 

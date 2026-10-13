@@ -78,6 +78,17 @@ This works the same for directory-managed users: the sync tool never touches ele
 The install binds `genkan:elevated:admins` to `cluster-admin`. Bind other elevated groups to
 narrower roles in the same way.
 
+When global elevation is enabled, only clients registered with `allowElevation: true` may ask
+for it; other clients that send the `elevate` scope get `invalid_scope`. Turn it on for the
+client you administer the cluster with (the `kubectl` client in [Get started](get-started.md))
+and leave it off for web applications that only sign users in. Turning it off takes effect at once, including for
+sign-ins already in progress. The sign-in page tells the user when an application is asking for
+elevated access, and for how long.
+
+```sh
+kubectl -n genkan-system patch gkclient kubectl --type=merge -p '{"spec":{"allowElevation":true}}'
+```
+
 ## Add another passkey or device
 
 Most passkeys sync through the platform's account (iCloud Keychain, Google Password Manager),

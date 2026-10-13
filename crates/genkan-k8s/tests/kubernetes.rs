@@ -358,6 +358,7 @@ mod tests {
                     audiences: vec![],
                     secret_hash: secret.map(Into::into),
                     id_token_signing_alg: None,
+                    allow_elevation: false,
                 },
             )
         };
@@ -920,6 +921,7 @@ mod tests {
                         audiences: vec!["kubernetes".into()],
                         secret_hash: None,
                         id_token_signing_alg: None,
+                        allow_elevation: false,
                     },
                 ),
             )

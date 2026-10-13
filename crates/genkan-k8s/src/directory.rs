@@ -214,6 +214,7 @@ impl Directory for KubeDirectory {
                 audiences: spec.audiences,
                 secret_hash: spec.secret_hash,
                 id_token_alg: spec.id_token_signing_alg.unwrap_or(Algorithm::Es256),
+                allow_elevation: spec.allow_elevation,
             }
         }))
     }

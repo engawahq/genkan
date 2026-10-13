@@ -114,6 +114,7 @@ mod tests {
             audiences: vec!["kubernetes".into()],
             secret_hash: None,
             id_token_alg: Algorithm::Es256,
+            allow_elevation: true,
         });
         directory.put_user(User {
             name: "admin".into(),

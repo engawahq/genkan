@@ -72,4 +72,10 @@ pub struct OAuthClientSpec {
     /// Algorithm for ID tokens: `ES256` (default) or `RS256` for clients that need it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id_token_signing_alg: Option<genkan_keys::Algorithm>,
+
+    /// Whether this client may request the `elevate` scope, which yields a short token carrying
+    /// the user's `elevated:<group>` groups after a passkey sign-in. Off by default: turn it on
+    /// only for clients meant for administration, such as an admin `kubectl` context.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_elevation: bool,
 }

@@ -9,14 +9,16 @@
 //!
 //! # Elevation
 //!
-//! Privileged Kubernetes access is not part of normal tokens. A client asks for the `elevate`
-//! scope; after a passkey sign-in, the token endpoint returns an access token whose groups add
-//! `elevated:<group>` for each of the user's elevated groups, valid for
-//! [`crate::Lifetimes::elevated_token`] (5 minutes by default), with no refresh token and no
-//! stored grant. Privilege therefore ends when the token does, and only another passkey sign-in
-//! renews it. kube-apiserver understands groups natively, so RBAC binds powerful roles only to
-//! the `elevated:` names; the installed bindings give the first admin's base group the read-only
-//! `view` role and `cluster-admin` only to its elevated group. The generated
+//! Privileged Kubernetes access is not part of normal tokens. A client registered with
+//! `allowElevation` asks for the `elevate` scope (other clients get `invalid_scope`, and a code
+//! whose client lost the flag before redemption is `invalid_grant`); the sign-in page tells the
+//! user that the application is asking for elevated access; after a passkey sign-in, the token
+//! endpoint returns an access token whose groups add `elevated:<group>` for each of the user's
+//! elevated groups, valid for [`crate::Lifetimes::elevated_token`] (5 minutes by default), with no
+//! refresh token and no stored grant. Privilege therefore ends when the token does, and only
+//! another passkey sign-in renews it. kube-apiserver understands groups natively, so RBAC binds
+//! powerful roles only to the `elevated:` names; the installed bindings give the first admin's base
+//! group the read-only `view` role and `cluster-admin` only to its elevated group. The generated
 //! `AuthenticationConfiguration` also rejects a token with an `elevated:` group unless it is
 //! short-lived and was issued right after sign-in (`exp - iat` and `iat - auth_time` are
 //! bounded), so an issuer bug cannot hand out lasting privilege.
@@ -503,8 +505,13 @@ fn elevated_tokens<D: Directory, G: GrantStore, C: Clock>(
     claims: &CodeClaims,
     now: UnixTime,
 ) -> Result<TokenResponse, OAuthError> {
-    // Elevation was switched off after this code was issued.
+    // Elevation was switched off, or taken from the client, after this code was issued. The
+    // client was just read from the directory, so removing `allowElevation` takes effect for
+    // codes still in flight.
     let lifetime = server.lifetimes.elevated_token.ok_or(INVALID_GRANT)?;
+    if !client.allow_elevation {
+        return Err(INVALID_GRANT);
+    }
     if user.elevated_groups.is_empty() {
         return Err(OAuthError::new(
             ErrorCode::InvalidScope,

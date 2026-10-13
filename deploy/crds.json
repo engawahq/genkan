@@ -327,6 +327,10 @@
                   "spec": {
                     "description": "A registered OAuth 2.0 / OpenID Connect client. The object name is the `client_id`.\n\nAdmission rules reject redirect URIs that RFC 9700 §2.1 and OAuth 2.1 forbid, so a\nmistake in a GitOps repository fails at `kubectl apply`, not at login.",
                     "properties": {
+                      "allowElevation": {
+                        "description": "Whether this client may request the `elevate` scope, which yields a short token carrying\nthe user's `elevated:<group>` groups after a passkey sign-in. Off by default: turn it on\nonly for clients meant for administration, such as an admin `kubectl` context.",
+                        "type": "boolean"
+                      },
                       "audiences": {
                         "description": "Audiences this client may request tokens for (RFC 8707 resource indicators), for example\nthe `audiences` entry of the cluster's AuthenticationConfiguration.",
                         "items": {

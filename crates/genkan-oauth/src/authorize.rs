@@ -17,7 +17,7 @@
 //! - only `response_type=code` with `response_mode=query`;
 //! - PKCE S256 is required for every client, confidential ones included (RFC 9700 §2.1.1); `plain`
 //!   is refused, as in OAuth 2.1;
-//! - unknown scopes are ignored;
+//! - unknown scopes are ignored; `elevate` from a client not allowed to elevate is `invalid_scope`;
 //! - the access-token audience is one value from the client's allowlist: the RFC 8707 `resource` if
 //!   sent, otherwise the client's only audience, otherwise the client ID; an ambiguous or
 //!   disallowed resource is `invalid_target` (RFC 9068 §3);
@@ -148,7 +148,8 @@ fn loopback_match(registered: &str, requested: &str) -> bool {
 /// Validates an authorization request against its client.
 ///
 /// `client` is `None` when the `client_id` is unknown. The `elevate` scope is understood only if
-/// `elevation` is enabled, and ignored otherwise like any unknown scope.
+/// `elevation` is enabled, and ignored otherwise like any unknown scope; when it is understood,
+/// a client without [`Client::allow_elevation`] gets `invalid_scope`.
 ///
 /// # Errors
 ///
@@ -235,7 +236,16 @@ pub fn validate(
 
     let mut scopes: Vec<String> = Vec::new();
     for scope in params.get("scope").unwrap_or_default().split(' ') {
-        let known = SUPPORTED_SCOPES.contains(&scope) || (elevation && scope == ELEVATE_SCOPE);
+        let elevate = elevation && scope == ELEVATE_SCOPE;
+        // Refused rather than ignored: a client that expects elevation would otherwise get an
+        // ordinary token and fail later, far from the cause (RFC 6749 §4.1.2.1 `invalid_scope`).
+        if elevate && !client.allow_elevation {
+            return Err(reject(
+                ErrorCode::InvalidScope,
+                "this client may not request the elevate scope",
+            ));
+        }
+        let known = SUPPORTED_SCOPES.contains(&scope) || elevate;
         if known && !scopes.iter().any(|s| s == scope) {
             scopes.push(scope.to_owned());
         }
@@ -368,6 +378,7 @@ mod tests {
             audiences: audiences.iter().map(|a| (*a).into()).collect(),
             secret_hash: None,
             id_token_alg: genkan_keys::Algorithm::Es256,
+            allow_elevation: false,
         }
     }
 
@@ -523,6 +534,33 @@ mod tests {
                 .unwrap()
                 .force_login
         );
+    }
+
+    #[test]
+    fn elevate_needs_the_feature_and_the_client_opt_in() {
+        let elevate = Params::parse(
+            format!("client_id=kubectl&redirect_uri=http%3A%2F%2F127.0.0.1%3A8000%2F&response_type=code&scope=openid%20elevate&state=s1&code_challenge={CHALLENGE}&code_challenge_method=S256").as_bytes(),
+        )
+        .unwrap();
+        let mut c = client(&[]);
+        // Elevation off: ignored like any unknown scope, whatever the client allows.
+        for allow in [false, true] {
+            c.allow_elevation = allow;
+            let request = validate(&elevate, Some(&c), false).unwrap();
+            assert!(!request.is_elevated());
+        }
+        // Elevation on: only a client that opted in may ask.
+        c.allow_elevation = false;
+        assert_eq!(
+            redirected(validate(&elevate, Some(&c), true)),
+            ErrorCode::InvalidScope
+        );
+        assert!(
+            validate(&params(""), Some(&c), true).is_ok(),
+            "requests without elevate are unaffected"
+        );
+        c.allow_elevation = true;
+        assert!(validate(&elevate, Some(&c), true).unwrap().is_elevated());
     }
 
     #[test]

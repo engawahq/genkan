@@ -39,7 +39,7 @@ page). Used by `genkan` (the server), `genkan-signin` (which calls `complete_aut
   cannot substitute another identity. Access-token claims are unchanged; existing tokens
   remain usable without refresh.
 - Elevated groups exist only in short, non-refreshable tokens issued right after a passkey
-  sign-in.
+  sign-in, and only to clients registered with `allowElevation`; others get `invalid_scope`.
 - Every redirect is `303 See Other` and carries `iss` (RFC 9207).
 
 ## References

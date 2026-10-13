@@ -58,6 +58,9 @@ pub struct Client {
     pub secret_hash: Option<String>,
     /// Algorithm for this client's ID tokens.
     pub id_token_alg: genkan_keys::Algorithm,
+    /// Whether the client may request the `elevate` scope. Off unless the administrator turns it
+    /// on, so signing users in never implies obtaining their elevated groups.
+    pub allow_elevation: bool,
 }
 
 /// A user, as needed to issue tokens.
