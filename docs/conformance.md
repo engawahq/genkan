@@ -30,7 +30,7 @@ its container image.
 | RFC 9126 PAR | RFC | Met |
 | RFC 9207 Authorization server issuer identification | RFC | Met |
 | OpenID Connect Core 1.0 | Final (errata set 2) | Partial: no single sign-on sessions, so every authorization request asks for a sign-in |
-| W3C WebAuthn Level 3 | Recommendation | Met for registration, discoverable sign-in and conditional mediation; a server-side test with a forged UV flag is open |
+| W3C WebAuthn Level 3 | Recommendation | Met for registration, discoverable sign-in and conditional mediation |
 | NIST SP 800-63B-4 | Final, Jul. 2025 | Partial: user-verified passkeys (AAL2-capable); no sessions to time out yet |
 | Cookies (draft-ietf-httpbis-rfc6265bis) | Draft | Met for the `__Host-` cookies used |
 | RFC 9457 Problem Details | RFC | Met for the sign-in endpoints |
@@ -176,7 +176,7 @@ Tests are in `genkan-signin/tests/signin.rs` unless noted.
 | Project requirement | Setup link works once and expires; no first-visitor admin | MUST | `lib.rs` (consume before storing), `genkan-k8s/src/setup.rs` | `setup_token_is_single_use`, `concurrent_enrolments_with_one_token_add_one_passkey`, `setup_token_expires_and_must_match`, `setup_link_is_single_use_and_replaceable` *(cluster, 64 concurrent)* | Met |
 | Project requirement | Invitations work once, only for the invited user; the service account cannot create them | MUST | `lib.rs`, `genkan-k8s/src/setup.rs`, `invitations.rs` | `invitation_enrols_the_invited_user_once`, `invitations_are_single_use_and_admin_only` *(cluster)* | Met |
 | WebAuthn §5.4.4, §5.4.6 | Discoverable credential, user verification required | — | `passkeys.rs` | `genkan-signin: passkeys::tests::registration_requires_resident_keys_and_uv` | Met |
-| WebAuthn §7.1, §7.2 | UV verified; user handle is the owner's; challenge single use | MUST | `passkeys.rs`, `lib.rs` | `passkeys_without_user_verification_are_refused` (client side), `unknown_passkeys_and_disabled_users_cannot_sign_in`, `assertions_cannot_be_replayed` | Partial: no server-side forged-UV test |
+| WebAuthn §7.1, §7.2 | UV verified; user handle is the owner's; challenge single use | MUST | `passkeys.rs`, `lib.rs` | `passkeys_without_user_verification_are_refused` (registration, client side), `sign_in_without_user_verification_is_refused` and `elevation_without_user_verification_is_refused` (signed assertion with UV clear, refused with no code or tokens; UV-positive control completes), `unknown_passkeys_and_disabled_users_cannot_sign_in`, `assertions_cannot_be_replayed` | Met |
 | WebAuthn conditional mediation | Autofill (`autocomplete="username webauthn"`) | — | `passkeys.rs`, `ui/src/login.ts` | `genkan-signin/tests/pages.rs: login_offers_passkey_autofill_for_a_pending_request` | Met |
 | RFC 9457 §3 | Problem details | — | `problem.rs` | `requests_from_other_sites_are_refused` | Met |
 | Fetch Metadata | Cross-site state-changing requests refused | — | `lib.rs` `check_request` | `requests_from_other_sites_are_refused`, `genkan-signin: tests::same_origin_checks` | Met |

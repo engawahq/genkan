@@ -414,6 +414,124 @@ mod tests {
         .await
     }
 
+    /// Redeems the authorization code in a successful `/login` reply; returns the token response.
+    async fn exchange(h: &Harness, reply: &Reply) -> Value {
+        let location = reply.body["redirect_to"].as_str().unwrap();
+        assert!(location.starts_with("http://127.0.0.1:8000/?code="));
+        let code = form_urlencoded::parse(location.split_once('?').unwrap().1.as_bytes())
+            .find(|(k, _)| k == "code")
+            .unwrap()
+            .1
+            .into_owned();
+        let body = form_urlencoded::Serializer::new(String::new())
+            .extend_pairs([
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("code_verifier", VERIFIER),
+                ("client_id", "kubectl"),
+            ])
+            .finish();
+        let request = Request::post("/token")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap();
+        let response = h.app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
+    }
+
+    /// The flags byte of an assertion's authenticator data (after the 32-byte RP ID hash).
+    fn authenticator_flags(assertion: &Value) -> u8 {
+        let data = assertion["response"]["authenticatorData"].as_str().unwrap();
+        URL_SAFE_NO_PAD.decode(data).unwrap()[32]
+    }
+
+    const FLAG_UP: u8 = 0x01;
+    const FLAG_UV: u8 = 0x04;
+
+    /// Opens the authorization request `authorize` and starts one sign-in ceremony. `device`
+    /// first answers it without user verification: the client is told UV is `discouraged`
+    /// (only the request options change, and they are not signed), so the authenticator signs
+    /// authenticator data with UV clear while the challenge, origin, RP ID and signature stay
+    /// valid. The server must refuse that, issue nothing, and leave the ceremony and request
+    /// usable; the same ceremony answered with UV then completes. Returns the issued tokens.
+    async fn refuse_unverified_then_sign_in(h: &Harness, authorize: &str) -> Value {
+        let mut device = device();
+        enrol(h, &mut device).await;
+        let flow = call(&h.app, Method::GET, authorize, None, &[], None)
+            .await
+            .cookie(FLOW_COOKIE)
+            .unwrap();
+        let options = post(&h.app, "/login/options", json!({}), &[]).await;
+        let ceremony = options.cookie(CEREMONY_COOKIE).unwrap();
+        let cookies = [
+            (FLOW_COOKIE, flow.as_str()),
+            (CEREMONY_COOKIE, ceremony.as_str()),
+        ];
+        assert_eq!(options.body["publicKey"]["userVerification"], "required");
+
+        let mut discouraged = options.body.clone();
+        discouraged["publicKey"]["userVerification"] = json!("discouraged");
+        let unverified = serde_json::to_value(
+            device
+                .authenticate(
+                    &origin(),
+                    serde_json::from_value::<CredentialRequestOptions>(discouraged).unwrap(),
+                    DefaultClientData,
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let flags = authenticator_flags(&unverified);
+        assert_eq!(flags & (FLAG_UP | FLAG_UV), FLAG_UP, "UP set, UV clear");
+        let rejected = post(
+            &h.app,
+            "/login",
+            json!({ "credential": unverified }),
+            &cookies,
+        )
+        .await;
+        assert_eq!(rejected.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(rejected.kind(), "urn:genkan:problem:passkey-failed");
+        assert!(rejected.body.get("redirect_to").is_none());
+        let fields = &rejected.audit.as_ref().unwrap()["fields"];
+        assert!(fields.get("user").is_none());
+        assert!(fields.get("subject").is_none());
+        // Refused by the UV check, not by the signature, challenge or origin checks.
+        let diagnostic = rejected.diagnostics.first().unwrap();
+        assert_eq!(diagnostic["fields"]["reason"], "passkey-failed");
+        assert!(
+            diagnostic["fields"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("user verified bit is not set"),
+            "{diagnostic}"
+        );
+
+        let verified = serde_json::to_value(
+            device
+                .authenticate(
+                    &origin(),
+                    serde_json::from_value::<CredentialRequestOptions>(options.body).unwrap(),
+                    DefaultClientData,
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(authenticator_flags(&verified) & FLAG_UV, FLAG_UV);
+        let reply = post(
+            &h.app,
+            "/login",
+            json!({ "credential": verified }),
+            &cookies,
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+        exchange(h, &reply).await
+    }
+
     #[tokio::test]
     async fn setup_link_then_passkey_sign_in_issues_tokens() {
         let h = harness().await;
@@ -435,31 +553,7 @@ mod tests {
                 .any(|c| c.to_str().unwrap().starts_with(&format!("{FLOW_COOKIE}=;"))),
             "flow cookie cleared"
         );
-        let location = reply.body["redirect_to"].as_str().unwrap();
-        assert!(location.starts_with("http://127.0.0.1:8000/?code="));
-        let code = form_urlencoded::parse(location.split_once('?').unwrap().1.as_bytes())
-            .find(|(k, _)| k == "code")
-            .unwrap()
-            .1
-            .into_owned();
-
-        let body = form_urlencoded::Serializer::new(String::new())
-            .extend_pairs([
-                ("grant_type", "authorization_code"),
-                ("code", &code),
-                ("code_verifier", VERIFIER),
-                ("client_id", "kubectl"),
-            ])
-            .finish();
-        let request = Request::post("/token")
-            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(Body::from(body))
-            .unwrap();
-        let response = h.app.clone().oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let tokens: Value =
-            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
-                .unwrap();
+        let tokens = exchange(&h, &reply).await;
         let payload = tokens["access_token"]
             .as_str()
             .unwrap()
@@ -800,7 +894,8 @@ mod tests {
         let ceremony = reply.cookie(CEREMONY_COOKIE).unwrap();
         let options: CredentialCreationOptions = serde_json::from_value(reply.body).unwrap();
         // A client honouring `userVerification: required` refuses outright; if one sends a
-        // response anyway, the server must reject it.
+        // response anyway, the server must reject it. This covers registration from the client
+        // side only; `refuse_unverified_then_sign_in` covers signed sign-in assertions.
         if let Ok(credential) = device.register(&origin(), options, DefaultClientData).await {
             let reply = post(
                 &h.app,
@@ -820,6 +915,50 @@ mod tests {
         )
         .await;
         assert_eq!(reply.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn sign_in_without_user_verification_is_refused() {
+        let h = harness().await;
+        let authorize = format!(
+            "/authorize?client_id=kubectl&redirect_uri=http%3A%2F%2F127.0.0.1%3A8000%2F&response_type=code&scope=openid&code_challenge={CHALLENGE}&code_challenge_method=S256"
+        );
+        let tokens = refuse_unverified_then_sign_in(&h, &authorize).await;
+        assert!(tokens["refresh_token"].is_string());
+        assert!(tokens["id_token"].is_string());
+    }
+
+    #[tokio::test]
+    async fn elevation_without_user_verification_is_refused() {
+        let h = harness().await;
+        let mut admin = h
+            .service
+            .oauth
+            .directory
+            .user("admin")
+            .await
+            .unwrap()
+            .unwrap();
+        admin.elevated_groups = vec!["cluster-admins".into()];
+        h.service.oauth.directory.put_user(admin);
+        let authorize = format!(
+            "/authorize?client_id=kubectl&redirect_uri=http%3A%2F%2F127.0.0.1%3A8000%2F&response_type=code&scope=openid+groups+elevate&code_challenge={CHALLENGE}&code_challenge_method=S256"
+        );
+        let tokens = refuse_unverified_then_sign_in(&h, &authorize).await;
+        assert!(tokens.get("refresh_token").is_none(), "{tokens}");
+        assert!(tokens["scope"].as_str().unwrap().contains("elevate"));
+        let payload = tokens["access_token"]
+            .as_str()
+            .unwrap()
+            .split('.')
+            .nth(1)
+            .unwrap();
+        let claims: Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap();
+        assert_eq!(
+            claims["groups"],
+            json!(["admins", "elevated:cluster-admins"])
+        );
     }
 
     #[tokio::test]
