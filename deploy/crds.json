@@ -111,13 +111,6 @@
                         "nullable": true,
                         "type": "integer"
                       },
-                      "recoveryEpoch": {
-                        "default": 0,
-                        "description": "Incremented when a recovery or enrollment link is used, which invalidates every other\noutstanding link.",
-                        "format": "int64",
-                        "minimum": 0.0,
-                        "type": "integer"
-                      },
                       "sessionEpoch": {
                         "default": 0,
                         "description": "Incremented to sign the user out of every browser session.",

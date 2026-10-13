@@ -1272,6 +1272,32 @@ mod tests {
             matches!(error, SetupLinkError::HasCredentials { count: 1, .. }),
             "{error}"
         );
+        // Pending invitations: root's must not survive the reset, someone else's must.
+        let pending = |username: &str| genkan_k8s::invitations::Invitee {
+            username: username.into(),
+            display_name: None,
+            groups: vec![],
+            elevated_groups: vec![],
+        };
+        let mut tokens = Vec::new();
+        for username in ["root", "eve"] {
+            let invited = genkan_k8s::invitations::invite(
+                env.admin.clone(),
+                &env.namespace,
+                &issuer,
+                &pending(username),
+                Duration::from_hours(1),
+                t0,
+            )
+            .await
+            .unwrap();
+            tokens.push(invited.url.split("#token=").nth(1).unwrap().to_owned());
+        }
+        let with_invitations =
+            KubeSetupStore::new(env.genkan_api()).with_invitations(env.genkan_api());
+        for token in &tokens {
+            assert!(with_invitations.load(token).await.unwrap().is_some());
+        }
         issue_setup_link(
             env.admin.clone(),
             &env.namespace,
@@ -1291,6 +1317,14 @@ mod tests {
                 .items
                 .is_empty(),
             "--reset removed the passkey"
+        );
+        assert!(
+            with_invitations.load(&tokens[0]).await.unwrap().is_none(),
+            "--reset revoked root's invitation"
+        );
+        assert!(
+            with_invitations.load(&tokens[1]).await.unwrap().is_some(),
+            "--reset left eve's invitation alone"
         );
         env.cleanup().await;
     }

@@ -18,7 +18,8 @@ Secret, issuing the internal certificate) therefore happens here, with a human's
   `AuthenticationConfiguration` on stdout and how to install it on stderr.
 - `genkanctl setup-link --issuer <url> [--username admin] [--reset]`: a one-time link that
   enrols a passkey for the first admin (group `admins`, elevated group `admins`), or recovers
-  the account with `--reset`. It expires after 60 minutes by default.
+  the account with `--reset`, which first deletes the user's pending invitations, passkeys and
+  sessions. It expires after 60 minutes by default.
 - `genkanctl invite --issuer <url> --username <name>`: creates the `User` if needed and a
   one-time enrolment link (7 days by default), printed for you to send.
 

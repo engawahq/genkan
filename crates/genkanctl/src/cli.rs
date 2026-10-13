@@ -138,7 +138,7 @@ pub(crate) struct SetupLinkArgs {
     /// How long the link works.
     #[arg(long, default_value = "60m", value_parser = parse_duration)]
     pub valid_for: Duration,
-    /// Remove the user's existing passkeys and sessions first (account recovery).
+    /// Remove the user's pending invitations, passkeys and sessions first (account recovery).
     #[arg(long)]
     pub reset: bool,
 }

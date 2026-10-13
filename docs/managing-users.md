@@ -112,15 +112,12 @@ kubectl -n genkan-system delete gkgrant -l genkan.engawahq.dev/user=alice
 ## Lost passkey (account recovery)
 
 ```sh
-kubectl -n genkan-system delete gkinvite -l genkan.engawahq.dev/user=alice
 genkanctl setup-link --username alice --reset
 ```
 
-Delete Alice's pending invitations first: an unredeemed invitation adds a passkey to her account
-whenever it is opened, and `--reset` does not revoke invitations yet
-([#25](https://github.com/engawahq/genkan/issues/25)). `--reset` then deletes all of her
-credentials and sessions and prints a one-time link valid for an hour. Confirm who you are
-talking to before sending it: the link's holder becomes Alice.
+`--reset` deletes Alice's pending invitations (any of them could enrol another passkey), then
+all of her credentials and sessions, and prints a one-time link valid for an hour. Confirm who
+you are talking to before sending it: the link's holder becomes Alice.
 
 ## Suspend or remove someone
 

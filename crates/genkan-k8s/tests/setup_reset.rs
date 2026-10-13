@@ -30,10 +30,12 @@ mod tests {
 
     struct Backend {
         credentials: bool,
+        invitations: bool,
         grant: Option<Value>,
-        fail_grants: bool,
-        credential_deletes: usize,
-        grant_deletes: usize,
+        /// The collection whose next deletion fails once.
+        fail: Option<&'static str>,
+        /// Collections deleted, in order.
+        deletes: Vec<&'static str>,
         secret_writes: usize,
         secret: Value,
     }
@@ -66,22 +68,24 @@ mod tests {
                 vec![json!({"metadata":{"name":"old"},"spec":{"user":"alice","type":"Passkey",
                     "passkey":{"credentialId":"YWJj","record":"{}","backupEligible":false}}})]
             } else { vec![] }})),
-            (Method::DELETE, "credentials") => {
+            (Method::DELETE, collection @ ("invitations" | "credentials" | "grants")) => {
                 assert!(query.contains("labelSelector=genkan.engawahq.dev%2Fuser%3Dalice"));
-                state.credential_deletes += 1;
-                state.credentials = false;
-                ok(json!({"apiVersion":"v1","kind":"Status","status":"Success"}))
-            }
-            (Method::DELETE, "grants") => {
-                assert!(query.contains("labelSelector=genkan.engawahq.dev%2Fuser%3Dalice"));
-                state.grant_deletes += 1;
-                if state.fail_grants {
-                    state.fail_grants = false;
-                    status(StatusCode::INTERNAL_SERVER_ERROR, "InternalError")
-                } else {
-                    state.grant = None;
-                    ok(json!({"apiVersion":"v1","kind":"Status","status":"Success"}))
+                let collection = match collection {
+                    "invitations" => "invitations",
+                    "credentials" => "credentials",
+                    _ => "grants",
+                };
+                state.deletes.push(collection);
+                if state.fail == Some(collection) {
+                    state.fail = None;
+                    return status(StatusCode::INTERNAL_SERVER_ERROR, "InternalError");
                 }
+                match collection {
+                    "invitations" => state.invitations = false,
+                    "credentials" => state.credentials = false,
+                    _ => state.grant = None,
+                }
+                ok(json!({"apiVersion":"v1","kind":"Status","status":"Success"}))
             }
             (Method::GET, "genkan-setup") => ok(state.secret.clone()),
             (Method::PUT, "genkan-setup") => {
@@ -167,7 +171,7 @@ mod tests {
         }))
     }
 
-    async fn reset_case(credentials: bool, fail_grants: bool) {
+    async fn reset_case(credentials: bool, fail: Option<&'static str>) {
         let now = SystemClock.now();
         let name = format!("g-{}", "a".repeat(64));
         let token = RefreshToken::generate(&name).unwrap();
@@ -175,9 +179,9 @@ mod tests {
         "metadata":{"name":"genkan-setup","resourceVersion":"1"},"data":{"old":"b2xk"}});
         let state = Arc::new(Mutex::new(Backend {
             credentials,
-            fail_grants,
-            credential_deletes: 0,
-            grant_deletes: 0,
+            invitations: true,
+            fail,
+            deletes: Vec::new(),
             secret_writes: 0,
             secret: original_secret.clone(),
             grant: Some(
@@ -204,7 +208,7 @@ mod tests {
         let (status, body) = refresh(&app, &token.encode()).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let current = body["refresh_token"].as_str().unwrap();
-        if fail_grants {
+        if let Some(failing) = fail {
             assert!(
                 issue_setup_link(
                     client.clone(),
@@ -219,7 +223,11 @@ mod tests {
                 .is_err()
             );
             let backend = state.lock().await;
-            assert!(!backend.credentials);
+            // Nothing after the failing collection is touched, and no link is written.
+            let order = ["invitations", "credentials", "grants"];
+            let reached = order.iter().position(|c| *c == failing).unwrap() + 1;
+            assert_eq!(backend.deletes, order[..reached]);
+            assert_eq!(backend.credentials, failing != "grants" && credentials);
             assert_eq!(backend.secret_writes, 0);
             assert_eq!(backend.secret, original_secret);
         }
@@ -242,20 +250,31 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"], "invalid_grant");
         let backend = state.lock().await;
-        let attempts = if fail_grants { 2 } else { 1 };
-        assert_eq!(backend.credential_deletes, attempts);
-        assert_eq!(backend.grant_deletes, attempts);
+        // Invitations go first, so none survives to enrol a passkey after the reset; a retry
+        // deletes every collection again.
+        let order = ["invitations", "credentials", "grants"];
+        let first = fail.map_or(0, |failing| {
+            order.iter().position(|c| *c == failing).unwrap() + 1
+        });
+        assert_eq!(backend.deletes[..first], order[..first]);
+        assert_eq!(backend.deletes[first..], order);
+        assert!(!backend.invitations && !backend.credentials);
         assert_eq!(backend.secret_writes, 1);
         task.abort();
     }
 
     #[tokio::test]
     async fn reset_retries_grant_deletion_after_credentials_are_gone() {
-        reset_case(true, true).await;
+        reset_case(true, Some("grants")).await;
     }
 
     #[tokio::test]
     async fn reset_revokes_old_grants_without_credentials() {
-        reset_case(false, false).await;
+        reset_case(false, None).await;
+    }
+
+    #[tokio::test]
+    async fn reset_revokes_invitations_before_anything_else() {
+        reset_case(true, Some("invitations")).await;
     }
 }

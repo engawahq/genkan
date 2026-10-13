@@ -86,11 +86,6 @@ pub struct UserStatus {
     #[serde(default)]
     #[schemars(range(min = 0))]
     pub session_epoch: i64,
-    /// Incremented when a recovery or enrollment link is used, which invalidates every other
-    /// outstanding link.
-    #[serde(default)]
-    #[schemars(range(min = 0))]
-    pub recovery_epoch: i64,
     /// When the user last signed in, in Unix seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0))]

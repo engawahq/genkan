@@ -1,7 +1,8 @@
 //! The one-time setup token in a Secret, and the cluster admin's side of issuing it.
 //!
 //! The cluster admin runs `genkanctl setup-link` with their own kubeconfig. It creates the `User`
-//! (in group `admins`), optionally removes the user's old passkeys and sessions (`--reset`), and
+//! (in group `admins`), optionally removes the user's pending invitations, old passkeys and
+//! sessions (`--reset`), and
 //! writes the Secret `genkan-setup` holding only the SHA-256 of a fresh 256-bit token. Genkan's
 //! service account can only `get` and `delete` that Secret, so it can redeem a token but never
 //! create one, and it never needs RBAC rights: the `genkan:admins` binding is created at install.
@@ -13,11 +14,16 @@
 //! which also deletes the user's credentials and grants: otherwise the link's holder could add a
 //! passkey to an account that someone else controls.
 //!
-//! Reset always deletes both collections, even when there are no credentials left. A failed
-//! grant deletion may follow a successful credential deletion, so a retry cannot use the
-//! credential count as evidence that sessions are gone. No setup Secret is written until both
-//! deletions succeed. This implements Genkan's account-recovery policy using the security-event
-//! refresh-token revocation permitted by [RFC 9700 §4.14.2].
+//! Reset deletes the user's invitations first, then credentials, then grants. Invitations go
+//! first because each one can enrol another passkey: one left behind would let whoever holds it
+//! back into the recovered account. Reset always deletes all three collections, even when they
+//! look empty: a failed later deletion may follow a successful earlier one, so a retry cannot use
+//! a count as evidence that the rest are gone. No setup Secret is written until every deletion
+//! succeeds. An enrolment that redeemed its link before the reset but stores its passkey after
+//! the credentials are deleted survives it; that window is one request long, and
+//! `kubectl get gkcred -l genkan.engawahq.dev/user=<name>` after the reset shows it. This
+//! implements Genkan's account-recovery policy using the security-event refresh-token revocation
+//! permitted by [RFC 9700 §4.14.2].
 //!
 //! [RFC 9700 §4.14.2]: https://www.rfc-editor.org/rfc/rfc9700.html#section-4.14.2
 
@@ -204,7 +210,7 @@ pub enum SetupLinkError {
     Kubernetes(#[from] kube::Error),
     /// The user already has passkeys; issuing a link would let its holder add another.
     #[error(
-        "user {user} already has {count} passkey(s); pass --reset to remove them and their sessions"
+        "user {user} already has {count} passkey(s); pass --reset to remove them, their sessions and pending invitations"
     )]
     HasCredentials {
         /// User object name.
@@ -270,6 +276,11 @@ pub async fn issue_setup_link(
         });
     }
     if reset {
+        // Pending invitations first: each could enrol a passkey into the recovered account.
+        let invitations: Api<Invitation> = Api::namespaced(client.clone(), namespace);
+        invitations
+            .delete_collection(&DeleteParams::default(), &selector)
+            .await?;
         credentials
             .delete_collection(&DeleteParams::default(), &selector)
             .await?;
