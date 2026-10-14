@@ -125,6 +125,29 @@ fn user(name: &str, uid: &str) -> Value {
         "spec":{"username":name, "groups":["admins"], "elevatedGroups":[], "disabled":false}})
 }
 
+fn with_unused_metadata(mut object: Value) -> Value {
+    object["metadata"]["annotations"] =
+        json!({"gitops.example/config": "retained only by the API"});
+    object["metadata"]["labels"] = json!({"app.kubernetes.io/managed-by": "projection-test"});
+    object["metadata"]["managedFields"] = json!([{
+        "manager": "projection-test",
+        "operation": "Apply",
+        "apiVersion": "genkan.engawahq.dev/v1alpha1",
+        "fieldsType": "FieldsV1",
+        "fieldsV1": {"f:metadata": {"f:annotations": {"f:gitops.example/config": {}}}}
+    }]);
+    object["metadata"]["ownerReferences"] = json!([{
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "name": "owner",
+        "uid": "uid-owner",
+        "controller": false,
+        "blockOwnerDeletion": false
+    }]);
+    object["metadata"]["finalizers"] = json!(["genkan.engawahq.dev/projection-test"]);
+    object
+}
+
 fn metadata(object: &Value) -> Value {
     json!({"apiVersion":"meta.k8s.io/v1", "kind":"PartialObjectMetadata",
         "metadata":object["metadata"]})
@@ -309,6 +332,30 @@ fn has_client(directory: &KubeDirectory, name: &str) -> bool {
         .is_some()
 }
 
+fn assert_projected_indexes(directory: &KubeDirectory, client: &Value, user: &Value) {
+    assert_eq!(directory.client_index.len(), 1);
+    assert_eq!(directory.user_index.len(), 1);
+    let cached_client = directory.client_index.find(|_| true).unwrap();
+    let cached_user = directory.user_index.find(|_| true).unwrap();
+    for (cached, expected) in [
+        (&cached_client.metadata, &client["metadata"]),
+        (&cached_user.metadata, &user["metadata"]),
+    ] {
+        assert_eq!(cached.name.as_deref(), expected["name"].as_str());
+        assert_eq!(cached.namespace.as_deref(), expected["namespace"].as_str());
+        assert_eq!(cached.uid.as_deref(), expected["uid"].as_str());
+        assert_eq!(
+            cached.resource_version.as_deref(),
+            expected["resourceVersion"].as_str()
+        );
+        assert!(cached.annotations.is_none());
+        assert!(cached.labels.is_none());
+        assert!(cached.managed_fields.is_none());
+        assert!(cached.owner_references.is_none());
+        assert!(cached.finalizers.is_none());
+    }
+}
+
 #[tokio::test]
 async fn constructor_waits_for_both_initial_snapshots() {
     for first in [CLIENTS, USERS] {
@@ -343,6 +390,107 @@ async fn constructor_waits_for_both_initial_snapshots() {
                 .is_some()
         );
     }
+}
+
+#[tokio::test]
+async fn list_watch_and_relist_project_metadata_without_losing_locator_identity() {
+    let known = with_unused_metadata(client("known"));
+    let alice = with_unused_metadata(user("alice", "uid-alice"));
+    let (mut mock, directory) = Mock::new(vec![known.clone()], vec![alice.clone()]).await;
+    let indexes_at_version = |version: &str| {
+        directory
+            .client_index
+            .find(|object| object.metadata.resource_version.as_deref() == Some(version))
+            .is_some()
+            && directory
+                .user_index
+                .find(|object| object.metadata.resource_version.as_deref() == Some(version))
+                .is_some()
+    };
+    assert_projected_indexes(&directory, &known, &alice);
+
+    let mut modified_client = known;
+    modified_client["metadata"]["resourceVersion"] = json!("102");
+    let mut modified_user = alice;
+    modified_user["metadata"]["resourceVersion"] = json!("102");
+    modified_user["spec"]["groups"] = json!(["modified"]);
+    mock.put(CLIENTS, modified_client.clone()).await;
+    mock.put(USERS, modified_user.clone()).await;
+    // Subject lookups still read current specs before watch delivery.
+    assert_eq!(
+        directory
+            .user_by_subject("uid-alice")
+            .await
+            .unwrap()
+            .unwrap()
+            .groups,
+        ["modified"]
+    );
+    mock.event(CLIENTS, "MODIFIED", &metadata(&modified_client));
+    mock.event(USERS, "MODIFIED", &metadata(&modified_user));
+    wait_for(|| indexes_at_version("102")).await;
+    assert_projected_indexes(&directory, &modified_client, &modified_user);
+
+    let mut relisted_client = with_unused_metadata(client("relisted-client"));
+    relisted_client["metadata"]["resourceVersion"] = json!("104");
+    relisted_client["spec"]["displayName"] = json!("Relisted");
+    let mut relisted_user = with_unused_metadata(user("relisted-user", "uid-relisted-user"));
+    relisted_user["metadata"]["resourceVersion"] = json!("104");
+    relisted_user["spec"]["groups"] = json!(["relisted"]);
+    {
+        let mut backend = mock.backend.lock().await;
+        backend.objects.get_mut(CLIENTS).unwrap().clear();
+        backend.objects.get_mut(USERS).unwrap().clear();
+    }
+    mock.put(CLIENTS, relisted_client.clone()).await;
+    mock.put(USERS, relisted_user.clone()).await;
+    let expired = json!({
+        "apiVersion": "v1",
+        "kind": "Status",
+        "status": "Failure",
+        "code": 410,
+        "reason": "Expired",
+        "message": "resource version expired"
+    });
+    for resource in [CLIENTS, USERS] {
+        mock.event(resource, "ERROR", &expired);
+        drop(mock.streams.remove(resource).unwrap());
+    }
+    for resource in [CLIENTS, USERS] {
+        let reply = mock.take_list(resource).await;
+        reply_list(reply, &mock.snapshot(resource).await);
+    }
+    mock.connect_watch(CLIENTS).await;
+    mock.connect_watch(USERS).await;
+    wait_for(|| indexes_at_version("104")).await;
+    assert_projected_indexes(&directory, &relisted_client, &relisted_user);
+    assert!(directory.client("known").await.unwrap().is_none());
+    assert!(
+        directory
+            .user_by_subject("uid-alice")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        directory
+            .client("relisted-client")
+            .await
+            .unwrap()
+            .unwrap()
+            .display_name
+            .as_deref(),
+        Some("Relisted")
+    );
+    assert_eq!(
+        directory
+            .user_by_subject("uid-relisted-user")
+            .await
+            .unwrap()
+            .unwrap()
+            .groups,
+        ["relisted"]
+    );
 }
 
 #[tokio::test]

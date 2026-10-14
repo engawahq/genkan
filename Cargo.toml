@@ -142,7 +142,6 @@ unseparated_literal_suffix = "warn"
 verbose_file_reads = "warn"
 
 [profile.release]
-opt-level = "s"
 codegen-units = 1
 lto = "thin"
 strip = true
