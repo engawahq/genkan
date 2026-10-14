@@ -338,12 +338,15 @@ kubectl -n "$NS" scale deploy/genkan \
 # age asks for a passphrase. Store it somewhere you can reach when the cluster is gone.
 cd ~
 ARCHIVE="$(basename "$BACKUP").tar.gz.age"
-tar -C "$BACKUP" -czf - . | age -p -o "$ARCHIVE"
+tar -C "$BACKUP" -czf "$BACKUP.tar.gz" .
+age -p -o "$ARCHIVE" "$BACKUP.tar.gz"
+rm "$BACKUP.tar.gz"
 shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
 ```
 
-The checksum file names the archive without its directory, so it still works after you move
-both files. Copy the archive and its `.sha256` file off the cluster, to storage only a few
+`tar` runs on its own so you see it if it can't read a file; if it complains, don't keep that
+archive. The checksum file names the archive without its directory, so it still works after
+you move both files. Copy the archive and its `.sha256` file off the cluster, to storage only a few
 people can read, and keep an offline copy. Keep the passphrase separate from the archive. Once
 the copy is safe, delete the unencrypted directory. Resume GitOps and provisioning.
 
