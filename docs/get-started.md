@@ -20,9 +20,10 @@ The guide talks about two machines:
 - **The server** runs k3s and Genkan. Any Ubuntu machine your computer can reach over the
   network works: a VPS, a homelab box, a spare PC or a local VM.
 
-The cluster's admin kubeconfig stays on the server, where you use it only to install things. Your
-computer gets the cluster's CA certificate and a kubeconfig that signs in through Genkan. Every
-request it sends carries a token that expires within minutes.
+The cluster's admin kubeconfig stays on the server, where you use it to install things and to
+get back in if Genkan breaks; keep an encrypted copy offline too. Your computer gets the
+cluster's CA certificate and a kubeconfig that signs in through Genkan. Every request it sends
+carries a token that expires within minutes.
 
 ```text
 Your computer                               server (k3s)
@@ -94,6 +95,11 @@ a slow connection, this is the longest step.
 
 ## 2. Install k3s
 
+> [!IMPORTANT]
+> Step 6 changes how kube-apiserver checks who you are. If that goes wrong, you get back in with
+> the admin kubeconfig k3s creates below, or over SSH if kube-apiserver won't start at all. Keep
+> both, and skim [Backup, recovery and emergency access](operations.md) before step 6.
+
 Run this on the server. Before installing k3s, it:
 
 - turns off k3s's built-in Traefik and metrics-server, because step 3 installs them from the
@@ -128,8 +134,10 @@ install -d -m 700 ~/.kube
 sudo install -o "$USER" -m 600 /etc/rancher/k3s/k3s.yaml ~/.kube/config
 ```
 
-`~/.kube/config` is the cluster-admin credential. Keep it on the server, and use it only to install
-things.
+`~/.kube/config` is the cluster-admin credential. Use it to install things and to get back in
+when Genkan is down, not for everyday work. Keep it on the server, and keep an encrypted copy
+offline as described in
+[Keep a way in that doesn't need Genkan](operations.md#keep-a-way-in-that-doesnt-need-genkan).
 
 From here on, run `kubectl` on the server inside `nix develop` (either checkout provides it). The
 `kubectl` that comes with k3s tries to read `/etc/rancher`, which only root can read, and warns
@@ -393,6 +401,16 @@ See Traefik's [RateLimit options][traefik-ratelimit] for the details.
 
 ## 6. Let kube-apiserver trust Genkan
 
+First make sure you can get back in without Genkan. On the server, check that the admin
+kubeconfig from step 2 works:
+
+```sh
+sudo k3s kubectl --kubeconfig=/etc/rancher/k3s/k3s.yaml auth whoami
+sudo k3s kubectl --kubeconfig=/etc/rancher/k3s/k3s.yaml get --raw=/readyz
+```
+
+If either fails, stop here and fix it. Save an encrypted copy offline if you haven't yet.
+
 kube-apiserver checks Genkan's tokens itself. To do that, it fetches Genkan's signing keys over
 an internal HTTPS connection. `genkanctl kube-config` creates the certificate for that
 connection and prints the configuration kube-apiserver needs. It also prints k3s setup
@@ -562,6 +580,8 @@ What just happened:
 
 ## Next
 
+- [Back up, recover and upgrade Genkan](operations.md), and get back in when Genkan or the
+  sign-in page is down.
 - [Manage users](managing-users.md): invite people, add passkeys, sign people out or remove
   them.
 - [Sign in with GitHub](github-sign-in.md) or [Google](google-sign-in.md) as an alternative
