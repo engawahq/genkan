@@ -281,6 +281,8 @@ BACKUP=$(mktemp -d "$HOME/genkan-backup.XXXXXXXX")
 # Remember how many replicas Genkan had, then stop it.
 kubectl -n "$NS" get deploy genkan -o json > "$BACKUP/deployment.json"
 jq -r '.spec.replicas // 1' "$BACKUP/deployment.json" > "$BACKUP/replicas.txt"
+# If anything below fails, start Genkan again instead of leaving it down.
+trap 'kubectl -n "$NS" scale deploy/genkan --replicas="$(cat "$BACKUP/replicas.txt")"' EXIT
 kubectl -n "$NS" scale deploy/genkan --replicas=0
 kubectl -n "$NS" wait --for=delete pod \
   -l app.kubernetes.io/name=genkan --timeout=180s
@@ -308,7 +310,8 @@ jq -r '.spec.template.spec.volumes[]? | .secret.secretName // empty' \
   done
 ```
 
-If any command fails, stop and fix it. A half-finished directory isn't a backup.
+If any command fails, the shell exits and the `trap` starts Genkan again. Fix the cause and
+start over: a half-finished directory isn't a backup.
 
 Add your ingress resources. For the setup in Get started:
 
@@ -326,6 +329,7 @@ stopped. Then start Genkan again and encrypt the export:
 ```sh
 kubectl -n "$NS" scale deploy/genkan \
   --replicas="$(cat "$BACKUP/replicas.txt")"
+trap - EXIT
 
 # age asks for a passphrase. Store it somewhere you can reach when the cluster is gone.
 ARCHIVE="$HOME/$(basename "$BACKUP").tar.gz.age"
@@ -358,12 +362,23 @@ This directory now holds Genkan's private signing keys. Delete it when you're do
 
 Use this when you have a datastore backup. People keep their identity and passkeys.
 
-1. **Isolate.** Keep the restored cluster away from production users and upstream sign-in
-   callbacks. Work with the admin kubeconfig, not a Genkan sign-in.
+1. **Isolate, before anything starts.** A snapshot brings Genkan back the way it was when you
+   took it. If it was running then, it starts again with the old sessions as soon as the cluster
+   does. So before you start the restored cluster, make sure nobody can reach the issuer's
+   public address: keep it on a separate network, or block the address at the firewall or load
+   balancer. Keep upstream sign-in callbacks away from it too. Work with the admin kubeconfig,
+   not a Genkan sign-in.
 2. **Restore the datastore** with your distribution's procedure, including the token or keys it
    needs to decrypt it. Use the same Genkan version as when you took the backup.
-3. **Keep Genkan stopped** (zero replicas). Compare the restored users' UIDs with `users.json`
-   from your export. If they differ, the restore recreated the objects: switch to
+3. **Stop Genkan** as soon as the API answers, and keep it stopped:
+
+   ```sh
+   kubectl -n genkan-system scale deploy/genkan --replicas=0
+   ```
+
+   Snapshots taken as in [Take a backup](#take-a-backup) already have it at zero. Compare the
+   restored users' UIDs with `users.json` from your export. If they differ, the restore
+   recreated the objects: switch to
    [Restore by recreating resources](#restore-by-recreating-resources).
 4. **Review who has access.** Since the backup, someone may have been disabled, lost admin
    rights, or had a passkey or client secret revoked. Apply those changes again before anyone
@@ -429,26 +444,30 @@ room.
 
    If `create` fails, stop and find out why. Don't switch to a forced apply or delete what's in
    the way.
-3. **Restore the signing keys** and any internal TLS, public TLS and configuration Secrets,
+3. **Restore the signing keys**, the internal and public TLS, and the configuration Secrets,
    **before** starting Genkan:
 
    ```sh
    set -euo pipefail
    : "${NS:?set the namespace you are restoring into}"
-   jq --arg ns "$NS" '
-     {apiVersion:"v1", kind:"List", items:[.items[] |
-       {apiVersion, kind, type, data,
-        metadata:{name:.metadata.name, namespace:$ns,
-          labels:(.metadata.labels // {}),
-          annotations:((.metadata.annotations // {}) |
-            del(."kubectl.kubernetes.io/last-applied-configuration"))}}]}
-   ' identity-secrets.json > identity-secrets.restore.json
-   kubectl apply --server-side -f identity-secrets.restore.json
+   for file in identity-secrets.json mounted-secret-*.json public-tls.json; do
+     [ -e "$file" ] || continue
+     jq --arg ns "$NS" '
+       {apiVersion:"v1", kind:"List", items:[(if .kind == "List" then .items[] else . end) |
+         {apiVersion, kind, type, data,
+          metadata:{name:.metadata.name, namespace:$ns,
+            labels:(.metadata.labels // {}),
+            annotations:((.metadata.annotations // {}) |
+              del(."kubectl.kubernetes.io/last-applied-configuration"))}}]}
+     ' "$file" > "${file%.json}.restore.json"
+     kubectl apply --server-side -f "${file%.json}.restore.json"
+   done
    ```
 
-   This uses `apply`, not `create`, because the installer already made an empty signing-key
-   Secret. If apply reports a conflict, find out who owns the field before adding
-   `--force-conflicts`. Handle the other Secret files the same way.
+   `identity-secrets.json` holds a list; the other files hold one Secret each, and the filter
+   handles both. This uses `apply`, not `create`, because the installer already made an empty
+   signing-key Secret. If apply reports a conflict, find out who owns the field before adding
+   `--force-conflicts`.
 4. **Leave the old credentials, sessions and links behind.** Don't create anything from
    `credentials.json`, `grants.json` or `invitations.json`. Old passkeys can't work with new
    UIDs. Old sessions point at users by name, so an old refresh token could get a token for
@@ -560,7 +579,9 @@ sudo k3s kubectl get --raw=/readyz
 Don't mix a database from one backup with a token from another. If you changed the
 authentication file since the backup, put back the matching version before starting k3s.
 
-Genkan may come back with zero replicas. Before scaling it up, do steps 3 to 5 of
+If you took the snapshot with Genkan stopped, as above, it comes back stopped. If not, it
+starts with k3s: block the issuer's public address before starting k3s, and scale Genkan to zero
+as soon as `/readyz` answers. Before scaling it up again, do steps 3 to 5 of
 [Restore, keeping everyone's identity](#restore-keeping-everyones-identity). A datastore restore
 also brings back sessions you had revoked; deleting the grants is what stops them.
 
@@ -642,12 +663,13 @@ previous value. Restore any `oidc-*` entries you removed when installing. Also c
 ```sh
 sudo systemctl restart k0scontroller
 sudo journalctl -u k0scontroller --since '5 minutes ago' --no-pager
-sudo kubectl --kubeconfig=/var/lib/k0s/pki/admin.conf get --raw=/readyz
+sudo k0s kubectl --kubeconfig=/var/lib/k0s/pki/admin.conf get --raw=/readyz
 ```
 
-`/var/lib/k0s/pki/admin.conf` is the controller's own admin kubeconfig; adjust the path if you use
-a different data directory. Controller-only machines don't show up in `kubectl get nodes`, so use
-`/readyz` to check them.
+`k0s kubectl` is the `kubectl` built into k0s, so it works even where `kubectl` isn't
+installed. `/var/lib/k0s/pki/admin.conf` is the controller's own admin kubeconfig; adjust the
+path if you use a different data directory. Controller-only machines don't show up in
+`kubectl get nodes`, so use `/readyz` to check them.
 
 `spec.api` isn't part of k0s's dynamic configuration, so `k0s config edit` won't help here. If
 you manage the cluster with k0sctl or another tool, update its configuration too, or the next run
