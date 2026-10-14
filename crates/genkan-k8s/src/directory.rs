@@ -4,6 +4,10 @@
 //! subjects never cause per-request API reads. The initial snapshots must complete before any
 //! lookup. Relists replace each index atomically, and watch errors retry with backoff without
 //! falling back to per-identifier reads for indexed lookups.
+//! Before reflection, discard annotations, labels, managed fields, owner references and
+//! finalizers: this locator uses none of them. In particular, GitOps annotations and server-side
+//! apply history can dwarf the name/namespace/UID needed for lookup. Projecting before the
+//! reflector also avoids cloning those allocations into its initial and relist snapshots.
 //!
 //! An index is only a locator, never authorization data: known clients and users are read directly
 //! on every request. Watch lag may temporarily deny a new object, but cannot retain a revoked
@@ -161,7 +165,14 @@ async fn run_index<K>(
         + Sync
         + 'static,
 {
-    reflector::reflector(writer, watcher(api, watcher::Config::default()))
+    let events = watcher(api, watcher::Config::default()).modify(|object| {
+        object.metadata.annotations = None;
+        object.metadata.labels = None;
+        object.metadata.managed_fields = None;
+        object.metadata.owner_references = None;
+        object.metadata.finalizers = None;
+    });
+    reflector::reflector(writer, events)
         .default_backoff()
         .for_each(|event| async move {
             if let Err(error) = event {

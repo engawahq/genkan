@@ -9,9 +9,6 @@ rust-version = "1.99"
 license = "Apache-2.0"
 publish = false
 
-# Lint policy (see CONTRIBUTING.md).
-# Everything is `warn` so work in progress still compiles; CI runs with `-D warnings`.
-
 [workspace.dependencies]
 # Workspace crates, levelled from the bottom up.
 genkan-core = { path = "crates/genkan-core" }
@@ -62,6 +59,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "std"] }
 url = "2"
 webauthn-rs = { version = "=0.6.1-dev", features = ["conditional-ui", "danger-allow-state-serialisation"] }
+
+# Lint policy (see CONTRIBUTING.md).
+# Everything is `warn` so work in progress still compiles; CI runs with `-D warnings`.
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -142,6 +142,7 @@ unseparated_literal_suffix = "warn"
 verbose_file_reads = "warn"
 
 [profile.release]
+opt-level = "s"
 codegen-units = 1
 lto = "thin"
 strip = true

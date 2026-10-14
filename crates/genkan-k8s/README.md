@@ -36,6 +36,9 @@ server, the `genkanctl` admin CLI and the `genkan-e2e` tests.
 - **Current authorization data, metadata-indexed misses.** Metadata-only watches maintain client
   existence and user UID indexes, shared by directory clones. The asynchronous constructor
   waits for both initial snapshots within 30 seconds; the last clone dropping stops the watches.
+  Annotations, labels, managed fields, owner references and finalizers are discarded before
+  reflection; the locator does not use them, and GitOps metadata can dominate retained memory.
+  Names, namespaces, UIDs and resource versions remain intact.
   Relists replace each index atomically. Arbitrarily many unknown client IDs or user
   subjects cause no per-request API reads, and new objects become visible when their watch events
   arrive. Known clients and users are read directly on every request: secrets, permissions and
