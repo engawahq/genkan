@@ -12,7 +12,9 @@ Read it at three moments:
 - **before an upgrade**.
 
 The examples use the namespace `genkan-system` from [Get started](get-started.md). If you
-installed Genkan somewhere else, use your namespace and paths throughout.
+installed Genkan somewhere else, use your namespace and paths throughout. Paste each command
+block into one terminal; later blocks reuse the variables earlier ones set. If a command fails,
+stop there and fix it before running the rest.
 
 > [!IMPORTANT]
 > Passkeys replace the admin kubeconfig **for everyday work**. They don't replace it as your
@@ -273,7 +275,6 @@ same moment. That means a short planned outage. Before you start:
   commit the files. Base64 isn't encryption.
 
 ```sh
-set -euo pipefail
 umask 077
 NS=genkan-system
 BACKUP=$(mktemp -d "$HOME/genkan-backup.XXXXXXXX")
@@ -281,8 +282,6 @@ BACKUP=$(mktemp -d "$HOME/genkan-backup.XXXXXXXX")
 # Remember how many replicas Genkan had, then stop it.
 kubectl -n "$NS" get deploy genkan -o json > "$BACKUP/deployment.json"
 jq -r '.spec.replicas // 1' "$BACKUP/deployment.json" > "$BACKUP/replicas.txt"
-# If anything below fails, start Genkan again instead of leaving it down.
-trap 'kubectl -n "$NS" scale deploy/genkan --replicas="$(cat "$BACKUP/replicas.txt")"' EXIT
 kubectl -n "$NS" scale deploy/genkan --replicas=0
 kubectl -n "$NS" wait --for=delete pod \
   -l app.kubernetes.io/name=genkan --timeout=180s
@@ -310,8 +309,14 @@ jq -r '.spec.template.spec.volumes[]? | .secret.secretName // empty' \
   done
 ```
 
-If any command fails, the shell exits and the `trap` starts Genkan again. Fix the cause and
-start over: a half-finished directory isn't a backup.
+If a command fails, start Genkan again before you look into it, so the backup doesn't turn into
+an outage:
+
+```sh
+kubectl -n "$NS" scale deploy/genkan --replicas="$(cat "$BACKUP/replicas.txt")"
+```
+
+Then fix the cause and start over: a half-finished directory isn't a backup.
 
 Add your ingress resources. For the setup in Get started:
 
@@ -329,27 +334,27 @@ stopped. Then start Genkan again and encrypt the export:
 ```sh
 kubectl -n "$NS" scale deploy/genkan \
   --replicas="$(cat "$BACKUP/replicas.txt")"
-trap - EXIT
 
 # age asks for a passphrase. Store it somewhere you can reach when the cluster is gone.
-ARCHIVE="$HOME/$(basename "$BACKUP").tar.gz.age"
+cd ~
+ARCHIVE="$(basename "$BACKUP").tar.gz.age"
 tar -C "$BACKUP" -czf - . | age -p -o "$ARCHIVE"
 shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
 ```
 
-Copy the archive off the cluster, to storage only a few people can read, and keep an offline
-copy. Keep the passphrase separate from the archive. Once the copy is safe, delete the
-unencrypted directory. Resume GitOps and provisioning.
+The checksum file names the archive without its directory, so it still works after you move
+both files. Copy the archive and its `.sha256` file off the cluster, to storage only a few
+people can read, and keep an offline copy. Keep the passphrase separate from the archive. Once
+the copy is safe, delete the unencrypted directory. Resume GitOps and provisioning.
 
 ### Open a backup
 
 Before either restore, check the archive and decrypt it into a new private directory on an
-encrypted disk:
+encrypted disk. Start in the directory that holds the archive and its `.sha256` file:
 
 ```sh
-set -euo pipefail
 umask 077
-: "${ARCHIVE:?set the path to the encrypted archive}"
+ARCHIVE=genkan-backup.XXXXXXXX.tar.gz.age   # your archive's file name
 shasum -a 256 -c "$ARCHIVE.sha256"
 RESTORE=$(mktemp -d "$HOME/genkan-restore.XXXXXXXX")
 age -d "$ARCHIVE" | tar -xz -C "$RESTORE"
@@ -426,7 +431,6 @@ room.
    accident:
 
    ```sh
-   set -euo pipefail
    NS=genkan-system   # the namespace you are restoring into
    for resource in users oauthclients; do
      jq --arg ns "$NS" '
@@ -448,8 +452,6 @@ room.
    **before** starting Genkan:
 
    ```sh
-   set -euo pipefail
-   : "${NS:?set the namespace you are restoring into}"
    for file in identity-secrets.json mounted-secret-*.json public-tls.json; do
      [ -e "$file" ] || continue
      jq --arg ns "$NS" '
@@ -478,10 +480,8 @@ room.
    give them a setup link:
 
    ```sh
-   set -euo pipefail
-   : "${NS:?set the namespace you are restoring into}"
-   : "${GENKAN_ISSUER:?set the original issuer}"
-   read -r RECOVERY_USER
+   GENKAN_ISSUER=https://genkan.example.test   # the original issuer
+   RECOVERY_USER=alice                         # the admin you are bringing back
    kubectl -n "$NS" get users.genkan.engawahq.dev "$RECOVERY_USER" -o yaml
    kubectl -n "$NS" patch users.genkan.engawahq.dev "$RECOVERY_USER" \
      --type=merge -p '{"spec":{"disabled":false}}'
@@ -547,7 +547,6 @@ Stop k3s while you copy, so the database files are consistent. Pause other write
 Genkan first, as in [Take a backup](#take-a-backup).
 
 ```sh
-set -euo pipefail
 SNAPSHOT=/var/backups/genkan-k3s/$(date -u +%Y%m%dT%H%M%SZ)
 sudo install -d -m 0700 "$SNAPSHOT"
 sudo systemctl stop k3s
@@ -564,9 +563,8 @@ Restoring rewinds **the whole cluster**, not just Genkan, so coordinate with eve
 workloads on it. Keep the broken state for later investigation instead of deleting it:
 
 ```sh
-set -euo pipefail
-: "${RECOVERY_ARCHIVE:?set the decrypted db-and-token archive}"
-: "${FAILED_STATE:?set a new directory for the broken state}"
+RECOVERY_ARCHIVE=/path/to/db-and-token.tar.gz   # the decrypted archive
+FAILED_STATE=/var/backups/genkan-k3s/failed-$(date -u +%Y%m%dT%H%M%SZ)
 sudo install -d -m 0700 "$FAILED_STATE"
 sudo systemctl stop k3s
 sudo mv /var/lib/rancher/k3s/server/db "$FAILED_STATE/db"
@@ -616,7 +614,6 @@ If `50-genkan.yaml` exists only for Genkan, and nothing else sets `--authenticat
 it out of the way:
 
 ```sh
-set -euo pipefail
 RECOVERY=/var/backups/genkan-emergency/$(date -u +%Y%m%dT%H%M%SZ)
 sudo install -d -m 0700 "$RECOVERY"
 if sudo test -f /etc/rancher/k3s/genkan/authn.yaml; then
@@ -648,7 +645,6 @@ Genkan's setup adds:
 Save a copy, then edit the active file:
 
 ```sh
-set -euo pipefail
 K0S_CONFIG=/etc/k0s/k0s.yaml   # the file the service actually uses
 RECOVERY=/var/backups/genkan-emergency/$(date -u +%Y%m%dT%H%M%SZ)
 sudo install -d -m 0700 "$RECOVERY"
@@ -692,12 +688,14 @@ API down. So fix the file on the machine first.
 > a `.bak`, an editor swap file or any other copy there. Keep copies elsewhere, and only use a
 > manifest from the same machine.
 
-If you have the manifest from before Genkan, and the Kubernetes version hasn't changed since:
+If you have the manifest from before Genkan, and the Kubernetes version hasn't changed since,
+put it back. Set `NODE_API` to this machine's own API address, not the load balancer's, so the
+last check talks to the kube-apiserver you just fixed:
 
 ```sh
-set -euo pipefail
+BEFORE=/var/backups/genkan-control-plane/20260101T000000Z   # saved before installing Genkan
+NODE_API=https://10.0.0.11:6443                              # this machine's own address
 RECOVERY=/var/backups/genkan-emergency/$(date -u +%Y%m%dT%H%M%SZ)
-: "${BEFORE:?set the directory you saved before installing Genkan}"
 sudo install -d -m 0700 "$RECOVERY"
 sudo cp -a /etc/kubernetes/manifests/kube-apiserver.yaml "$RECOVERY/kube-apiserver.failed.yaml"
 sudo cp -a "$BEFORE/kubernetes/manifests/kube-apiserver.yaml" \
@@ -705,10 +703,10 @@ sudo cp -a "$BEFORE/kubernetes/manifests/kube-apiserver.yaml" \
 sudo mv "$RECOVERY/kube-apiserver.recovered.yaml" /etc/kubernetes/manifests/kube-apiserver.yaml
 sudo journalctl -u kubelet --since '5 minutes ago' --no-pager
 sudo crictl ps -a --name kube-apiserver
-sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf get --raw=/readyz
+sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf --server="$NODE_API" get --raw=/readyz
 ```
 
-The final `mv` replaces the file in one step only if both paths are on the same filesystem; if
+The `mv` replaces the file in one step only if both paths are on the same filesystem; if
 your backup directory isn't, copy the file next to `/etc/kubernetes` first. While the API is
 down, read kube-apiserver's logs with `sudo crictl logs <container-id>`. On kind, run all of this
 inside the control-plane container.
@@ -804,16 +802,15 @@ This is a record, not a backup.
 
 ### Upgrade
 
-Set `NEXT_GENKANCTL` to the new `genkanctl`, `NEXT_IMAGE` to the new image and `GENKAN_ISSUER` to
-your issuer. The command below matches Get started, which turns on invitations; add every option
-you installed with and leave out `--serve-arg=--invitations` if you didn't use it.
+Fill in the first four lines with your own values. The `manifests` command matches Get started,
+which turns on invitations; add every option you installed with and leave out
+`--serve-arg=--invitations` if you didn't use it.
 
 ```sh
-set -euo pipefail
 NS=genkan-system
-: "${NEXT_GENKANCTL:?set the path to the new genkanctl}"
-: "${NEXT_IMAGE:?set the new image}"
-: "${GENKAN_ISSUER:?set your issuer}"
+NEXT_GENKANCTL=/path/to/new/genkanctl
+NEXT_IMAGE=registry.example.test/genkan@sha256:...   # the new image, by digest
+GENKAN_ISSUER=https://genkan.example.test
 "$NEXT_GENKANCTL" crds > upgrade-record/crds.next.json
 "$NEXT_GENKANCTL" manifests --issuer "$GENKAN_ISSUER" --namespace "$NS" --image "$NEXT_IMAGE" \
   --serve-arg=--invitations > upgrade-record/manifests.next.json
@@ -827,7 +824,6 @@ Read both files before applying them. If apply reports a conflict, find out why 
 object of that kind.
 
 ```sh
-set -euo pipefail
 kubectl apply --server-side -f upgrade-record/crds.next.json
 kubectl apply --server-side -f upgrade-record/manifests.upgrade.json
 kubectl -n "$NS" rollout status deployment/genkan --timeout=5m
