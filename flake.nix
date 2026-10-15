@@ -57,6 +57,13 @@
               jq
               shellcheck
               actionlint
+              # Release signing, SBOM generation and registry transport; pinned by flake.lock.
+              cosign
+              syft
+              skopeo
+              curl
+              gh
+              binutils
 
               # Login page assets
               bun

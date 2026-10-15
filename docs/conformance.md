@@ -57,7 +57,8 @@ its container image.
 | One toolchain source for rustup and Nix | `rust-toolchain.toml`, `flake.nix` | `nix develop` hash check | Met |
 | Image: static binary, non-root, no shell | `Containerfile`, `genkan-k8s/src/deployment.rs` | `genkan-k8s: deployment::tests::deployment_is_locked_down`; *(e2e)* | Met |
 | Image size and idle memory measured in CI | `scripts/build-image.sh`, e2e measurement | CI `kubernetes` job summary | Met (about 20 MB; pod working set within the 30 MiB budget) |
-| Image signing (Sigstore) and SBOM | — | — | Not implemented (no release pipeline yet) |
+| Image signing (Sigstore) and SBOM | `.github/workflows/release.yml`, `scripts/release-{build,publish,verify}.sh` | Exact-digest signature/SBOM verification and public pull in both native release rehearsal jobs | Partial: pipeline implemented; public OIDC publication evidence requires a successful tag-triggered run ([release procedure](releases.md)) |
+| Versioned CLI archives, checksums, signed provenance and SBOMs | Same workflow; `scripts/release-smoke.sh` | Signed checksum manifest; downloaded archive execution and Kubernetes-backed container startup on Linux amd64/arm64 before draft finalization | Partial: pipeline implemented; local smoke is not evidence of a published release |
 
 ## OpenID Connect Discovery 1.0 and RFC 8414
 

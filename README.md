@@ -102,6 +102,7 @@ Then:
 - [Architecture](docs/architecture.md): how the pieces fit, security properties, the crates.
 - [Conformance](docs/conformance.md): every specification requirement, mapped to code and tests.
 - [Contributing](CONTRIBUTING.md): development setup, the checks CI runs, dependency policy.
+- [Releases](docs/releases.md): supported platforms, tag workflow, signatures, checksums and SBOMs.
 
 ## Licence and credits
 
