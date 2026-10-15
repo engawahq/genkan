@@ -1,110 +1,61 @@
 # Releases
 
-Releases are alpha software. `.github/workflows/release.yml` runs on `vMAJOR.MINOR.PATCH`
-tag pushes. A manual dispatch is a **non-publishing rehearsal** of CI, both native builds and
-candidate execution. It does not create a tag, GitHub release, registry package or signature.
+Use [GitHub Releases](https://github.com/engawahq/genkan/releases) to download Genkan.
+While Genkan is in alpha, releases are marked as prereleases.
 
-## Supported platforms
+## Choose your platform
 
-| Artifact | OS | Architecture | Build target |
-|---|---|---|---|
-| `genkanctl-v<VERSION>-linux-amd64.tar.gz` | Linux | amd64 / x86_64 | `x86_64-unknown-linux-musl` |
-| `genkanctl-v<VERSION>-linux-arm64.tar.gz` | Linux | arm64 / aarch64 | `aarch64-unknown-linux-musl` |
-| `ghcr.io/engawahq/genkan:v<VERSION>` | Linux | amd64 and arm64 | Native musl builds, multi-platform index |
+| Platform | CLI archive | Container image |
+|---|---|---|
+| Linux amd64 / x86_64 | `genkanctl-v<VERSION>-linux-amd64.tar.gz` | `ghcr.io/engawahq/genkan:v<VERSION>` |
+| Linux arm64 / aarch64 | `genkanctl-v<VERSION>-linux-arm64.tar.gz` | Same image tag; Docker selects your architecture |
 
-The CLI and server are statically linked. Release builds reject dynamic interpreters and shared
-library dependencies. macOS, Windows and other architectures have **no downloadable release
-artifacts**; build the CLI from source there. The container is Linux-only, runs non-root and
-contains no shell. It includes the pinned Mozilla CA bundle for outbound TLS. Internal workspace
-crates are not published to crates.io.
+The CLI and server are statically linked. For macOS, Windows or other architectures, build
+the CLI from source.
 
-## Maintainer procedure
+Each release includes checksums, signatures and SBOMs. An SBOM is a list of the dependencies
+included in an artifact; the downloadable SBOM files end in `.cdx.json`.
 
-1. Merge the desired release commit to `main`, including the workspace version in `Cargo.toml`
-   and corresponding `Cargo.lock` changes. For the first release, change `0.0.0` to `0.0.1`.
-   The tag must exactly match that version. Only stable three-part tags are accepted; releases
-   are marked prerelease while Genkan is alpha.
-2. Optionally dispatch **Release** on that commit with its matching version (for example
-   `v0.0.1`). This runs the full CI suite and both native candidate smoke jobs without publishing.
-3. Configure the GHCR package `engawahq/genkan` as **public** in GitHub package settings and
-   allow this repository's Actions token to write it. If the package does not exist yet, the
-   first publishing run creates it; set its visibility before its consumer rehearsal, or
-   follow the failed-draft recovery procedure below. New GHCR packages may default to private:
-   anonymous verification must fail until visibility is public. No PAT or long-lived key is used.
-4. Protect release tags with a repository ruleset restricting creation, update and deletion to
-   release maintainers. Protect `main` and review workflow changes. The workflow independently
-   rejects tagged commits outside `main` and reruns every CI check on the tagged commit; it does
-   not trust a green check from another commit or a mutable branch build.
-5. Create and push the matching tag, for example `git tag v0.0.1 <commit>` followed by
-   `git push origin v0.0.1`. This is the publication operation; a dispatch cannot publish.
-6. Inspect the complete Release run. It publishes a draft first; only successful native
-   download/verification/startup rehearsals on **both** platforms make the release public.
+## Download and verify
 
-The build and smoke jobs have read-only repository permissions. Only the publication job has
-`packages: write`, `contents: write` and `id-token: write`; the finalization job has only
-`contents: write`. Checkout never persists credentials. Sigstore uses GitHub OIDC, Fulcio and
-Rekor, not a stored private key. Registry verification deliberately uses an empty Docker
-credential configuration, so private packages cannot accidentally pass as public releases.
+You need GitHub CLI (`gh`), `cosign` 3.x and GNU `sha256sum`. Pulling the image also needs Docker.
+These command-line tools, apart from Docker, are available in the repository's `nix develop` shell.
 
-The pipeline stages are:
-
-- Full reusable CI, including UI, supply-chain checks and Kubernetes end-to-end tests.
-- Native amd64/arm64 builds using `rust-toolchain.toml`, `flake.lock`, `Cargo.lock` and
-  `cargo auditable build --release --locked`. Source commit time is `SOURCE_DATE_EPOCH`;
-  archive member order, ownership, modes and timestamps are normalized and gzip omits time.
-  Pinned inputs make builds repeatable; this is **not a claim of independently verified
-  bit-for-bit reproducibility** of Rust executables, Docker metadata or SBOM documents.
-- Smoke the exact archived CLI and image candidate. No release binary is rebuilt after smoke.
-- Copy saved images to GHCR, record platform and index digests, sign the digests, and attach
-  CycloneDX SBOM attestations. Build the index from those platform digests, not from tags.
-- Sign `SHA256SUMS` with a Sigstore bundle. It covers both CLI archives, all downloadable SBOMs,
-  image digests and `provenance.json` (source commit, repository and workflow run). This is
-  signed build metadata, **not a SLSA level claim**. Stage all assets in a draft release.
-- Fresh native runners download those draft assets, verify signatures and all checksums,
-  anonymously pull the signed index by digest and execute the downloaded CLI and image.
-  The smoke creates a disposable k3s cluster, installs the CLI-generated resources, starts the
-  exact image and checks its discovery/JWKS endpoints. Only then publish the GitHub prerelease.
-
-Versioned image tags become available during draft staging; a failed rehearsal leaves the
-GitHub release in draft, not a successful release. Do not consume a staged tag until the full
-release run succeeds. Always prefer the immutable digest recorded in the release.
-
-On failure, inspect the draft, candidate tags and Actions logs before recovery. Publication
-refuses to overwrite an existing draft or release. Repair package visibility or infrastructure
-as needed; remove only that failed draft before deliberately rerunning publication. A rerun
-can leave obsolete `candidate-<run>-<attempt>-<arch>` tags; they are not supported release tags.
-Do not move a published version tag to different source or bytes.
-
-## Verify a download
-
-Use `cosign` 3.x, GNU `sha256sum`, `jq`, Docker and the tools in this repository's pinned
-`nix develop` shell. Substitute the desired published version and your architecture:
+Choose a release version and your architecture, then download its files:
 
 ```sh
 version=v0.0.1
-arch=arm64 # or amd64
+arch=arm64 # use amd64 for x86_64
 identity="https://github.com/engawahq/genkan/.github/workflows/release.yml@refs/tags/$version"
 gh release download "$version" --repo engawahq/genkan --dir downloaded
-cd downloaded
-cosign verify-blob --bundle SHA256SUMS.sigstore.json \
-  --certificate-identity "$identity" \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
-sha256sum --check --strict SHA256SUMS
-# Extract only after both verification commands succeed.
-tar -xzf "genkanctl-$version-linux-$arch.tar.gz"
+```
+
+Verify the signature on `SHA256SUMS`, then use it to check the downloaded files. The identity
+ties the signature to Genkan's release workflow and the version you chose.
+
+```sh
+(
+  set -e
+  cd downloaded
+  cosign verify-blob --bundle SHA256SUMS.sigstore.json \
+    --certificate-identity "$identity" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
+  sha256sum --check --strict SHA256SUMS
+)
+```
+
+After both checks pass, extract and try the CLI:
+
+```sh
+tar -xzf "downloaded/genkanctl-$version-linux-$arch.tar.gz"
 ./genkanctl --help
 ```
 
-Keep the exact certificate identity check. A signature from some other repository or workflow
-is not sufficient. The signed checksum manifest authenticates the CLI archives, their CycloneDX
-SBOMs and provenance metadata; downloading a checksum alone does not authenticate anything.
-
-## Verify the image
-
-Read the `index` reference from the verified `image-digests.txt` (also recorded in release notes):
+To verify and pull the container, read its digest from the checked `image-digests.txt`.
+A digest identifies the exact image bytes.
 
 ```sh
-image=$(awk '$1 == "index" {print $2}' image-digests.txt)
+image=$(awk '$1 == "index" {print $2}' downloaded/image-digests.txt)
 cosign verify --certificate-identity "$identity" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com "$image"
 cosign verify-attestation --type cyclonedx --certificate-identity "$identity" \
@@ -112,33 +63,66 @@ cosign verify-attestation --type cyclonedx --certificate-identity "$identity" \
 docker pull --platform "linux/$arch" "$image"
 ```
 
-Both platform manifests and the index are signed. Platform-specific server SBOMs are attached
-to their manifests and to the index; CLI SBOMs are downloadable `.cdx.json` files. SBOMs inventory
-the actual auditable binaries (and the image's CA bundle), not the workspace's test dependencies.
-They are inventories, not assurances that dependencies are vulnerability-free.
+The image and its platform variants are signed, with server SBOMs attached. The signed
+checksums also cover the CLI archives, downloadable SBOMs, image digests and `provenance.json`,
+which records the source commit and build run.
 
-## Full consumer rehearsal
+## Publish a release
 
-On a disposable native Linux host with Docker, check out the release source and enter
-`nix develop`. Download **all** release assets to `downloaded`, then run:
+1. Update the workspace version in `Cargo.toml` and update `Cargo.lock`. For the first release,
+   use `0.0.1`. Merge the release commit to `main`.
+2. In GitHub Actions, select **Release → Run workflow**, choose that commit's branch and enter
+   the matching version, such as `v0.0.1`. This runs CI and tries both platform builds without
+   publishing.
+3. Make sure the GHCR package `engawahq/genkan` is public and this repository's Actions token
+   can write to it. If the package is new, the first publishing run creates it; change its
+   visibility before the download checks run. Set repository rulesets to protect `main` and
+   restrict release-tag changes to maintainers.
+4. Tag the release commit and push the tag. Replace `YOUR_RELEASE_COMMIT` with its commit hash:
+
+   ```sh
+   git tag v0.0.1 YOUR_RELEASE_COMMIT
+   git push origin v0.0.1
+   ```
+
+5. Watch the **Release** run in GitHub Actions. Once it succeeds, the GitHub prerelease is public.
+
+The tag must match the Cargo version, and the commit must be on `main`. The workflow reruns
+CI, builds both platforms using the pinned Rust/Nix toolchain and locked dependencies, and
+tests the CLI archives and images it will publish. It then signs and uploads the artifacts,
+downloads them on fresh runners, and verifies and runs them before publishing the draft release.
+Signing uses GitHub's short-lived identity token through Sigstore. Write permissions are
+limited to the publication and finalization jobs.
+
+Image tags appear while the GitHub release is still a draft. Use a release after its workflow
+succeeds, and use the digest in its release notes when pinning a deployment.
+
+If a run fails, check its Actions logs and draft release. Fix the cause, such as a private
+GHCR package, then delete that failed draft before rerunning publication. Keep published
+version tags unchanged.
+
+## Try the artifacts on a test machine
+
+On a disposable Linux machine matching the chosen architecture, install Docker, check out
+the release source and enter `nix develop`. With the variables and `downloaded` directory
+from the examples above, run:
 
 ```sh
 bash scripts/release-verify.sh "$version" "$arch" downloaded "$image" "$identity"
 ```
 
-This verifies the signed manifest, checksums, image signature and SBOM attestation, anonymously
-pulls the immutable image and runs the archived CLI plus container startup smoke. It needs
-network access to GHCR, Sigstore, the pinned k3s image and the Nix caches. It creates and deletes
-its own uniquely named k3d cluster; do not point it at a production cluster.
+The script verifies the downloads, pulls the image and creates a temporary k3s cluster.
+It uses the downloaded CLI to install Genkan, checks the running server and removes the
+cluster when finished. It needs access to GHCR, Sigstore, the k3s image and Nix caches.
 
-For a local **unsigned** candidate rehearsal (no GitHub OIDC or public registry needed):
+To try a build from your working tree, run these commands inside `nix develop`. Use the
+version in `Cargo.toml` and your machine's architecture:
 
 ```sh
-export SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
-bash scripts/release-build.sh v0.0.0 arm64 dist # use the checked-out Cargo version and native arch
-bash scripts/release-smoke.sh dist/genkanctl-v0.0.0-linux-arm64.tar.gz genkan:release-arm64
+version=v0.0.0
+arch=arm64 # or amd64
+SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+export SOURCE_DATE_EPOCH
+bash scripts/release-build.sh "$version" "$arch" dist
+bash scripts/release-smoke.sh "dist/genkanctl-$version-linux-$arch.tar.gz" "genkan:release-$arch"
 ```
-
-A local candidate smoke does not establish public downloadability, OIDC signing or amd64
-execution on an arm64 VM. The tag-triggered native consumer jobs are the publication gate for
-those properties; retain their run URL as release rehearsal evidence.
