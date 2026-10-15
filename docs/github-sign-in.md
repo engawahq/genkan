@@ -63,7 +63,8 @@ including `--invitations`, which step 4 needs.
 
 ```sh
 GITHUB_CLIENT_ID=Ov23li...   # from step 1; not a secret
-genkanctl manifests --image docker.io/library/genkan:dev \
+GENKAN_IMAGE=$(kubectl -n genkan-system get deployment genkan -o jsonpath='{.spec.template.spec.containers[0].image}')
+genkanctl manifests --image "$GENKAN_IMAGE" \
   --config-secret genkan-config \
   --serve-arg=--invitations \
   --serve-arg=--github-client-id=$GITHUB_CLIENT_ID \

@@ -12,7 +12,7 @@ every laptop, and cannot be revoked. Genkan (玄関, the entrance of a Japanese 
 with a passkey: `kubectl` opens your browser, you touch your fingerprint reader, and you get a
 token that lasts minutes, not years.
 
-> **Status: alpha.** Not released yet; expect breaking changes.
+> **Status: alpha.** Expect breaking changes.
 
 https://github.com/user-attachments/assets/4c6e29f2-341c-4622-8cc5-4337e13e53b5
 
@@ -68,24 +68,24 @@ rights, then back to read-only.
 
 ## Get started
 
-The [step-by-step guide](docs/get-started.md) installs k3s on an Ubuntu server (a VPS, a
-homelab box or a VM), installs Genkan, and signs `kubectl` in with a passkey from your own
-computer (macOS, Linux or Windows), in about half an hour.
+Follow the [step-by-step guide](docs/get-started.md) to install k3s on an Ubuntu server,
+download and verify Genkan, and sign in with a passkey from your computer (macOS, Linux or
+Windows).
 
-On a cluster you already run, the shape of it is below. Every `genkanctl` subcommand that needs
-an issuer reads `GENKAN_ISSUER`, so these examples do not repeat `--issuer`.
+For an existing cluster, first [download and verify Genkan](docs/get-started.md#1-download-genkan).
+Then install it with your cluster-admin kubeconfig:
 
 ```sh
 export GENKAN_ISSUER=https://login.example.com
 genkanctl crds | kubectl apply --server-side -f -
-genkanctl manifests --image <image> --serve-arg=--invitations | kubectl apply --server-side -f -
+genkanctl manifests --image "$GENKAN_IMAGE" --serve-arg=--invitations | kubectl apply --server-side -f -
 # Prints kube-apiserver's configuration and how to install it for your distribution:
 genkanctl kube-config --distro k3s > authn.yaml
 # A one-time link: open it and create your passkey.
 genkanctl setup-link --username admin
 ```
 
-There is no published image yet; the guide shows how to build one.
+For development builds, see [Building from source](CONTRIBUTING.md#building-from-source).
 
 Then:
 

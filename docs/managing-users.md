@@ -78,7 +78,8 @@ Invitation links need the server's `--invitations` option. [Get started](get-sta
 turns it on. If your installation does not have it, regenerate the deployment with it:
 
 ```sh
-genkanctl manifests --image docker.io/library/genkan:dev \
+GENKAN_IMAGE=$(kubectl -n genkan-system get deployment genkan -o jsonpath='{.spec.template.spec.containers[0].image}')
+genkanctl manifests --image "$GENKAN_IMAGE" \
   --serve-arg=--invitations | kubectl apply --server-side -f -
 kubectl -n genkan-system rollout status deploy/genkan
 ```

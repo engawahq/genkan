@@ -78,7 +78,8 @@ namespace, other `--serve-arg`s) plus the new ones. Keep `--invitations`: step 3
 
 ```sh
 GOOGLE_CLIENT_ID=1234567890-example.apps.googleusercontent.com   # replace with your client ID
-genkanctl manifests --image docker.io/library/genkan:dev \
+GENKAN_IMAGE=$(kubectl -n genkan-system get deployment genkan -o jsonpath='{.spec.template.spec.containers[0].image}')
+genkanctl manifests --image "$GENKAN_IMAGE" \
   --config-secret genkan-config \
   --serve-arg=--invitations \
   --serve-arg=--google-client-id=$GOOGLE_CLIENT_ID \

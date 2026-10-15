@@ -115,14 +115,7 @@ The script verifies the downloads, pulls the image and creates a temporary k3s c
 It uses the downloaded CLI to install Genkan, checks the running server and removes the
 cluster when finished. It needs access to GHCR, Sigstore, the k3s image and Nix caches.
 
-To try a build from your working tree, run these commands inside `nix develop`. Use the
-version in `Cargo.toml` and your machine's architecture:
+For a local build, follow [Building from source](../CONTRIBUTING.md#building-from-source).
 
-```sh
-version=v0.0.0
-arch=arm64 # or amd64
-SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
-export SOURCE_DATE_EPOCH
-bash scripts/release-build.sh "$version" "$arch" dist
-bash scripts/release-smoke.sh "dist/genkanctl-$version-linux-$arch.tar.gz" "genkan:release-$arch"
-```
+Before publishing a new version, follow the [installation checklist](release-installation.md)
+to check the guide, browser sign-in and account recovery with the release artifacts.

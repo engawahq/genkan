@@ -13,6 +13,31 @@ git commit -s
 CI rejects pull requests whose commits lack a `Signed-off-by` line matching the author. Commit
 messages follow [Conventional Commits](https://www.conventionalcommits.org/).
 
+## Building from source
+
+Use a Linux machine matching your cluster's architecture, with Docker running and Nix
+flakes enabled:
+
+```sh
+git clone https://github.com/engawahq/genkan.git
+cd genkan
+nix develop
+cargo build --release --locked -p genkanctl
+alias genkanctl="$PWD/target/release/genkanctl"
+./scripts/build-image.sh genkan:dev
+```
+
+For a local k3s cluster, import the image and choose it for the installation:
+
+```sh
+docker save genkan:dev | sudo k3s ctr images import -
+export GENKAN_IMAGE=docker.io/library/genkan:dev
+```
+
+Continue at [Install Genkan](docs/get-started.md#3-install-genkan), with the cluster-admin
+kubeconfig from the guide. For a k3d test cluster, use the [test setup](#disposable-k3d-cluster)
+below.
+
 ## Before you open a pull request
 
 Run what CI runs, inside `nix develop`:

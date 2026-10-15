@@ -174,7 +174,7 @@ Things that make it worse:
 
 A ready pod isn't enough. Sign in again from scratch with a passkey, so you know new sign-ins
 work and not just cached tokens. On your computer, with the kubeconfig from
-[Get started](get-started.md#8-set-up-kubectl-on-your-computer):
+[Get started](get-started.md#7-set-up-kubectl-on-your-computer):
 
 ```sh
 export KUBECONFIG=~/.kube/genkan-k3s.yaml
@@ -236,7 +236,7 @@ cluster version, the namespace, the issuer URL and the install options you used:
 | Secret `genkan-internal-tls` | The certificate kube-apiserver uses to reach Genkan internally. Belongs with the authentication file on each control-plane machine. |
 | Deployment, Service, ServiceAccount, Role and RoleBinding `genkan`; ClusterRoleBindings `genkan-admins` and `genkan-elevated-admins` | How Genkan runs and who gets admin rights. Back up your own RoleBindings for other apps too. |
 | Secrets mounted into Genkan, such as `genkan-config` | GitHub and Google client secrets. Keep the upstream app registrations with them. |
-| Public TLS and routing | In Get started: Secret `genkan-tls`, Gateway `genkan`, HTTPRoutes `genkan` and `genkan-rate-limited`, Middleware `genkan-rate-limit`. Use whatever your ingress uses. |
+| Public TLS and routing | In Get started: Secret `genkan-tls`, Ingress `genkan`; for rate limiting, Ingress `genkan-rate-limited`, Middleware `genkan-rate-limit` and the `traefik` HelmChartConfig in `kube-system`. |
 | kube-apiserver's configuration on each control-plane machine | For k3s: `/etc/rancher/k3s/genkan/authn.yaml` and the config that loads it. |
 | Client secrets of confidential apps, in those apps' own secret stores | Genkan keeps only a hash. See below. |
 | Your GitOps or user-provisioning configuration | Otherwise it may overwrite what you restore the moment it resumes. |
@@ -322,10 +322,15 @@ Add your ingress resources. For the setup in Get started:
 
 ```sh
 kubectl -n "$NS" get secret genkan-tls -o json > "$BACKUP/public-tls.json"
-kubectl -n "$NS" get gateway genkan -o json > "$BACKUP/gateway.json"
-kubectl -n "$NS" get httproute genkan genkan-rate-limited -o json > "$BACKUP/routes.json"
-kubectl -n "$NS" get middleware.traefik.io genkan-rate-limit -o json \
-  > "$BACKUP/rate-limit.json"
+kubectl -n "$NS" get ingress genkan -o json > "$BACKUP/ingress.json"
+```
+
+If you enabled the guide's sign-in rate limit, save its configuration too:
+
+```sh
+kubectl -n "$NS" get ingress genkan-rate-limited -o json > "$BACKUP/rate-limited-ingress.json"
+kubectl -n "$NS" get middleware.traefik.io genkan-rate-limit -o json > "$BACKUP/rate-limit.json"
+kubectl -n kube-system get helmchartconfig traefik -o json > "$BACKUP/traefik-config.json"
 ```
 
 If you also want a datastore snapshot from the same moment, take it now while Genkan is

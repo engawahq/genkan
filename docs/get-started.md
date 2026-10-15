@@ -1,17 +1,10 @@
 # Get started: k3s on an Ubuntu server, kubectl with a passkey
 
-By the end of this guide you will run `kubectl get pods` on your computer, confirm with your
-passkey, and get into a k3s cluster without an admin kubeconfig on your computer. It takes
-about half an hour, most of it spent on downloads and one Rust build.
+By the end of this guide, you will sign in to a k3s cluster with a passkey and run
+`kubectl` from your computer.
 
-You will:
-
-1. install k3s on an Ubuntu server;
-2. add an ingress, cert-manager and a few other basics from the
-   [recommendations catalog](https://github.com/engawahq/recommendations);
-3. build and install Genkan, and publish its sign-in page over HTTPS;
-4. tell kube-apiserver to trust Genkan's tokens;
-5. create your passkey and point `kubectl` on your computer at the cluster.
+You will download Genkan, install it on an Ubuntu server, then set up HTTPS and your first
+admin account. The server uses the Traefik ingress included with k3s.
 
 The guide talks about two machines:
 
@@ -60,12 +53,13 @@ On **your computer**:
   runs: run `mkcert -install` once (it may ask for your password). Firefox also needs NSS's
   `certutil`; see mkcert's README. With WSL, the browser runs on Windows, so install the
   Windows build (for example `winget install FiloSottile.mkcert`) and call it as `mkcert.exe`
-  from WSL, both here and in step 5.
+  from WSL, both here and in step 4.
 - `ssh` access to the server.
 
-On **the server**: Ubuntu 24.04 or later, 4 CPUs, 8 GiB memory, 30 GiB free disk, Docker, and
-Nix with flakes. Your user must be in the `docker` group. Use a machine that runs nothing else
-important: this guide installs k3s and changes its configuration.
+On **the server**: Ubuntu 24.04 or later on amd64 or arm64, 4 CPUs, 8 GiB memory and
+30 GiB free disk. Install `curl` and [cosign 3.x](https://docs.sigstore.dev/cosign/system_config/installation/).
+Allow your computer to reach TCP ports 443 (sign-in) and 6443 (Kubernetes API).
+Use a spare machine or VM: this guide installs k3s and changes its configuration.
 
 Keep two terminals open: one on your computer, and one logged in to the server. Each step says
 which one to use. In the terminal on your computer, set the SSH login so later commands can use
@@ -75,39 +69,71 @@ it:
 SERVER=ubuntu@genkan.example.test
 ```
 
-## 1. Get the code
+## 1. Download Genkan
 
-Log in to the server from your computer:
+Log in to the server:
 
 ```sh
 ssh "$SERVER"
 ```
 
-In that server shell, clone both repositories into your home directory:
+Choose a version from [GitHub Releases](https://github.com/engawahq/genkan/releases).
+The examples use `v0.0.1`. Set `arch` to `amd64` for x86_64 or `arm64` for aarch64:
 
 ```sh
-git clone https://github.com/engawahq/genkan.git ~/genkan
-git clone https://github.com/engawahq/recommendations.git ~/recommendations
+version=v0.0.1
+arch=arm64
+mkdir -p ~/genkan-download
 ```
 
-The first `nix develop` in each checkout downloads its toolchain (about 1–2 GB for Genkan). On
-a slow connection, this is the longest step.
+Download the CLI, its signed checksums and the image digests. This block verifies the files
+before installing `genkanctl`:
+
+```sh
+(
+  set -eu
+  cd ~/genkan-download
+  url="https://github.com/engawahq/genkan/releases/download/$version"
+  archive="genkanctl-$version-linux-$arch.tar.gz"
+  for file in "$archive" SHA256SUMS SHA256SUMS.sigstore.json image-digests.txt; do
+    curl --fail --location "$url/$file" --output "$file"
+  done
+  identity="https://github.com/engawahq/genkan/.github/workflows/release.yml@refs/tags/$version"
+  cosign verify-blob --bundle SHA256SUMS.sigstore.json \
+    --certificate-identity "$identity" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
+  sha256sum --check --strict --ignore-missing SHA256SUMS
+  tar -xzf "$archive"
+  sudo install -m 0755 genkanctl /usr/local/bin/genkanctl
+  genkanctl --version
+)
+```
+
+Now verify the image and its SBOM (the list of dependencies shipped in it). `GENKAN_IMAGE`
+holds the release's exact image digest, which you will use when installing:
+
+```sh
+GENKAN_IMAGE=$(awk '$1 == "index" {print $2}' ~/genkan-download/image-digests.txt)
+export GENKAN_IMAGE
+identity="https://github.com/engawahq/genkan/.github/workflows/release.yml@refs/tags/$version"
+cosign verify --certificate-identity "$identity" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com "$GENKAN_IMAGE"
+cosign verify-attestation --type cyclonedx --certificate-identity "$identity" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com "$GENKAN_IMAGE"
+```
+
+Continue once both commands succeed. See [Releases](releases.md) for the platform list and
+the other files included in a release.
 
 ## 2. Install k3s
 
 > [!IMPORTANT]
-> Step 6 changes how kube-apiserver checks who you are. If that goes wrong, you get back in with
-> the admin kubeconfig k3s creates below, or over SSH if kube-apiserver won't start at all. Keep
-> both, and skim [Backup, recovery and emergency access](operations.md) before step 6.
+> Step 5 changes how kube-apiserver checks who you are. Keep the admin kubeconfig below and
+> SSH access so you can recover. Read
+> [Backup, recovery and emergency access](operations.md) before that step.
 
-Run this on the server. Before installing k3s, it:
-
-- turns off k3s's built-in Traefik and metrics-server, because step 3 installs them from the
-  catalog;
-- adds `genkan.example.test` to the API server's certificate, so your computer can connect by
-  that name;
-- points kube-apiserver at an authentication file that is empty for now. Step 6 fills it in,
-  and kube-apiserver picks up the change without a restart.
+Run the following on the server. It adds your host name to the API server's certificate and
+sets up an empty authentication file. Step 5 fills that file with Genkan's settings.
 
 ```sh
 sudo mkdir -p /etc/rancher/k3s/genkan /etc/rancher/k3s/config.yaml.d
@@ -119,8 +145,6 @@ anonymous:
 jwt: []
 EOF
 sudo tee /etc/rancher/k3s/config.yaml >/dev/null <<'EOF'
-# Traefik and metrics-server come from the recommendations catalog instead.
-disable: [traefik, metrics-server]
 # The name your computer uses for the API server.
 tls-san: [genkan.example.test]
 EOF
@@ -132,6 +156,7 @@ curl -sfL https://get.k3s.io | sudo INSTALL_K3S_VERSION=v1.36.5+k3s1 sh -
 
 install -d -m 700 ~/.kube
 sudo install -o "$USER" -m 600 /etc/rancher/k3s/k3s.yaml ~/.kube/config
+export KUBECONFIG="$HOME/.kube/config"
 ```
 
 `~/.kube/config` is the cluster-admin credential. Use it to install things and to get back in
@@ -139,120 +164,48 @@ when Genkan is down, not for everyday work. Keep it on the server, and keep an e
 offline as described in
 [Keep a way in that doesn't need Genkan](operations.md#keep-a-way-in-that-doesnt-need-genkan).
 
-From here on, run `kubectl` on the server inside `nix develop` (either checkout provides it). The
-`kubectl` that comes with k3s tries to read `/etc/rancher`, which only root can read, and warns
-on every call.
-
-## 3. Install the recommended components
-
-The catalog lists components but does not install them. This short script installs one
-component: it applies the component's Helm charts or manifests in order, using the shared
-values plus those of one profile. Save it as `~/install-component.sh` on the server.
-
-```bash
-#!/usr/bin/env bash
-# Installs one component of the recommendations catalog, its releases in order.
-# Run from the recommendations checkout inside `nix develop` (helm, kubectl, yq).
-#   install-component.sh <profile> capabilities/<capability>/<upstream>.yaml
-set -euo pipefail
-
-profile="${1:?usage: install-component.sh <profile> <file>}"
-file="${2:?usage: install-component.sh <profile> <file>}"
-work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
-
-count=$(yq '.releases | length' "$file")
-for ((i = 0; i < count; i++)); do
-  r=".releases[$i]"
-  name=$(yq "$r.name" "$file")
-  ns=$(yq "$r.namespace" "$file")
-  version=$(yq "$r.version" "$file")
-
-  skip=$(yq "$r.skipIfPresent // [] | .[]" "$file")
-  if [ -n "$skip" ] && kubectl get crd $skip >/dev/null 2>&1; then
-    echo "skip $name: $skip already present"
-    continue
-  fi
-
-  if [ "$(yq "$r | has(\"chart\")" "$file")" = true ]; then
-    chart=$(yq "$r.chart" "$file")
-    repo=$(yq "$r.repo // \"\"" "$file")
-    yq "$r.values // \"\"" "$file" > "$work/values.yaml"
-    yq "$r.profiles[\"$profile\"] // \"\"" "$file" > "$work/profile.yaml"
-    echo "helm $name $chart $version"
-    helm upgrade --install "$name" "$chart" ${repo:+--repo "$repo"} --version "$version" \
-      --namespace "$ns" --create-namespace \
-      -f "$work/values.yaml" -f "$work/profile.yaml" --wait --timeout 10m
-  else
-    kubectl create namespace "$ns" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-    for url in $(yq "$r.urls // [] | .[]" "$file"); do
-      url="${url//\{version\}/$version}"
-      echo "apply $name $url"
-      kubectl apply --server-side -n "$ns" -f "$url"
-    done
-    if [ "$(yq "$r | has(\"manifests\")" "$file")" = true ]; then
-      yq "$r.manifests" "$file" | kubectl apply --server-side -n "$ns" -f -
-    fi
-  fi
-done
-```
+Check that the node and k3s's built-in ingress are ready:
 
 ```sh
-chmod +x ~/install-component.sh
+kubectl wait --for=condition=Ready node --all --timeout=180s
+kubectl -n kube-system wait --for=create deployment/traefik --timeout=180s
+kubectl -n kube-system rollout status deployment/traefik --timeout=180s
 ```
 
-Install these four components in this order; cert-manager needs the Gateway API CRDs that the
-ingress installs. (The script does not handle a component's `inputs` or `contributes`; these
-four have neither.)
+## 3. Install Genkan
 
-```sh
-cd ~/recommendations && nix develop
-for c in ingress/traefik certificates/cert-manager metrics/metrics-server node-updates/system-upgrade-controller; do
-  ~/install-component.sh single-node capabilities/$c.yaml
-done
-kubectl get gatewayclass traefik          # ACCEPTED True
-kubectl top nodes                         # metrics-server answers after about a minute
-```
-
-The catalog also recommends VictoriaMetrics and VictoriaLogs for single-node clusters. This
-guide leaves them out to keep the cluster small. To add them later, install
-`observability-operator/victoria-metrics-operator`, then `metrics/victoria-metrics` and
-`logs/victoria-logs` the same way, after checking their `inputs`.
-
-## 4. Build and install Genkan
-
-Genkan has no published image yet, so build one on the server and load it into k3s. Building on
-the server gives you a Linux image for the node's CPU architecture. You also build `genkanctl`,
-the admin tool you use for the rest of the guide.
-
-```sh
-cd ~/genkan && nix develop
-./scripts/build-image.sh genkan:dev                       # about 20 MB
-docker save genkan:dev | sudo k3s ctr images import -
-cargo build --release -p genkanctl && alias genkanctl=$PWD/target/release/genkanctl
-```
-
-Now install it. `genkanctl` reads the issuer from `GENKAN_ISSUER`, so the commands do not need
-`--issuer`. Keep using this server shell for the rest of the guide: the `genkanctl` alias,
-`GENKAN_ISSUER` and the `nix develop` environment last only as long as the shell. In a new shell,
-run `cd ~/genkan && nix develop` and the `alias` and `export` lines again.
+Run this in the same server shell:
 
 ```sh
 export GENKAN_ISSUER=https://genkan.example.test
 genkanctl crds | kubectl apply --server-side -f -
-genkanctl manifests --image docker.io/library/genkan:dev \
+kubectl wait --for=condition=Established --timeout=90s \
+  crd/users.genkan.engawahq.dev crd/credentials.genkan.engawahq.dev \
+  crd/oauthclients.genkan.engawahq.dev crd/grants.genkan.engawahq.dev \
+  crd/invitations.genkan.engawahq.dev
+genkanctl manifests --image "$GENKAN_IMAGE" \
   --serve-arg=--invitations | kubectl apply --server-side -f -
-kubectl -n genkan-system rollout status deploy/genkan
+kubectl -n genkan-system rollout status deploy/genkan --timeout=180s
 ```
 
-Everything Genkan owns lives in the `genkan-system` namespace. `--serve-arg=--invitations`
-turns on invitation links, which you use later to [add people](managing-users.md#add-someone).
+The generated manifests include RBAC, the Service and the Deployment. Everything Genkan
+owns lives in `genkan-system`. `--invitations` enables the links you will use to
+[invite people](managing-users.md#add-someone).
 
-## 5. Publish the sign-in page over HTTPS
+Keep using this server shell. If you open a new one, restore these settings:
 
-Browsers offer passkeys only on pages they trust, so Genkan's sign-in page needs a certificate
-your browser accepts. This guide uses mkcert's local CA. With a real domain, use a cert-manager
-`ClusterIssuer` (ACME) and a `Certificate` instead.
+```sh
+export KUBECONFIG="$HOME/.kube/config"
+export GENKAN_ISSUER=https://genkan.example.test
+GENKAN_IMAGE=$(kubectl -n genkan-system get deployment genkan -o jsonpath='{.spec.template.spec.containers[0].image}')
+export GENKAN_IMAGE
+```
+
+## 4. Publish the sign-in page over HTTPS
+
+Browsers need a trusted HTTPS connection to create passkeys. This guide uses mkcert for
+your test machine. For a public service, use a certificate from a public CA, for example
+through [cert-manager](https://cert-manager.io/docs/).
 
 On your computer, issue a certificate for the issuer's host name and copy it to the server. Only the
 certificate and its key leave your computer; the CA's key stays. With WSL, write `mkcert.exe`
@@ -265,41 +218,41 @@ scp genkan.crt genkan.key "$SERVER":genkan-tls/
 rm genkan.key
 ```
 
-On the server, store it as a Secret and route the host name to Genkan through Traefik. (Traefik
-listens on 8443 inside its pod; k3s exposes that as port 443 on the node.)
+On the server, store the certificate as a Secret and create an Ingress. K3s's Traefik
+accepts HTTPS on port 443 and forwards requests to Genkan:
 
 ```sh
 kubectl -n genkan-system create secret tls genkan-tls \
   --cert=$HOME/genkan-tls/genkan.crt --key=$HOME/genkan-tls/genkan.key
 kubectl apply -f - <<'EOF'
-apiVersion: gateway.networking.k8s.io/v1
-kind: Gateway
-metadata: {name: genkan, namespace: genkan-system}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: genkan
+  namespace: genkan-system
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
 spec:
-  gatewayClassName: traefik
-  listeners:
-  - name: https
-    protocol: HTTPS
-    port: 8443
-    hostname: genkan.example.test
-    tls:
-      certificateRefs: [{name: genkan-tls}]
-    allowedRoutes: {namespaces: {from: Same}}
----
-apiVersion: gateway.networking.k8s.io/v1
-kind: HTTPRoute
-metadata: {name: genkan, namespace: genkan-system}
-spec:
-  parentRefs: [{name: genkan}]
-  hostnames: [genkan.example.test]
+  ingressClassName: traefik
+  tls:
+  - hosts: [genkan.example.test]
+    secretName: genkan-tls
   rules:
-  - backendRefs: [{name: genkan, port: 80}]
+  - host: genkan.example.test
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: genkan
+            port: {number: 80}
 EOF
-kubectl -n genkan-system wait gateway/genkan --for=condition=Programmed
 ```
 
-Check it from your computer. You should get a JSON document whose `issuer` is
-`https://genkan.example.test`:
+Give Traefik a few seconds to load the route and certificate, then check from your computer.
+You should get a JSON document whose `issuer` is `https://genkan.example.test`:
 
 ```sh
 curl --cacert "$(mkcert -CAROOT)/rootCA.pem" \
@@ -315,30 +268,29 @@ curl --cacert "$(wslpath "$(mkcert.exe -CAROOT | tr -d '\r')")/rootCA.pem" \
 
 ### Before going public: rate-limit sign-in
 
-Skip this on a server only you can reach. Before you expose Genkan to the internet, limit how often one
-address can call the sign-in endpoints. Genkan does not rate-limit by IP address itself; that
-is the ingress's job, because only the ingress sees the browser's real address.
+For a public server, limit requests to the sign-in endpoints by client IP address.
+You can skip this section on a server only you can reach.
 
-**First, let Traefik see each visitor's real address.** By default, k3s's built-in load
-balancer hands Traefik every outside request from the cluster's internal gateway address
-(`10.42.0.1`). Every visitor would then share one limit, and one person could use it up for
-everyone. Setting the Traefik Service's `externalTrafficPolicy` to `Local` keeps the address. On
-the server:
+First, preserve each visitor's address through k3s's load balancer. On the server, set
+Traefik's `externalTrafficPolicy` to `Local` so visitors get separate rate-limit counters:
 
 ```sh
-cd ~/recommendations && nix develop
-helm -n traefik upgrade traefik oci://ghcr.io/traefik/helm/traefik \
-  --version "$(yq '.releases[] | select(.name == "traefik") | .version' capabilities/ingress/traefik.yaml)" \
-  --reuse-values --set service.spec.externalTrafficPolicy=Local --wait
+kubectl apply -f - <<'EOF'
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata: {name: traefik, namespace: kube-system}
+spec:
+  valuesContent: |-
+    service:
+      spec:
+        externalTrafficPolicy: Local
+EOF
 ```
 
-Change it with Helm, not `kubectl patch`: a patch takes over the field, and the next chart
-upgrade then fails with a conflict. On a cluster with several nodes, `Local` also means only
-nodes that run a Traefik pod accept traffic.
+This uses k3s's [Traefik configuration](https://docs.k3s.io/helm/#customizing-packaged-components-with-helmchartconfig).
+On a cluster with several nodes, `Local` means only nodes with a Traefik pod accept traffic.
 
-**Then add the limit.** The Traefik from step 3 already reads `Middleware` objects, so nothing
-else needs installing (for other setups, see Traefik's
-[Gateway middleware prerequisites][traefik-extref]). Back in the `~/genkan` shell:
+Then add a rate limit to the sign-in routes:
 
 ```sh
 kubectl apply -f - <<'EOF'
@@ -351,25 +303,31 @@ spec:
     period: 1s
     burst: 20
 ---
-apiVersion: gateway.networking.k8s.io/v1
-kind: HTTPRoute
-metadata: {name: genkan-rate-limited, namespace: genkan-system}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: genkan-rate-limited
+  namespace: genkan-system
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    traefik.ingress.kubernetes.io/router.middlewares: genkan-system-genkan-rate-limit@kubernetescrd
 spec:
-  parentRefs: [{name: genkan}]
-  hostnames: [genkan.example.test]
+  ingressClassName: traefik
+  tls:
+  - hosts: [genkan.example.test]
+    secretName: genkan-tls
   rules:
-  - matches:
-    - path: {type: Exact, value: /authorize}
-    - path: {type: Exact, value: /token}
-    - path: {type: Exact, value: /par}
-    - path: {type: Exact, value: /revoke}
-    - path: {type: PathPrefix, value: /login}
-    - path: {type: PathPrefix, value: /setup}
-    - path: {type: PathPrefix, value: /upstream}
-    filters:
-    - type: ExtensionRef
-      extensionRef: {group: traefik.io, kind: Middleware, name: genkan-rate-limit}
-    backendRefs: [{name: genkan, port: 80}]
+  - host: genkan.example.test
+    http:
+      paths:
+      - {path: /authorize, pathType: Exact, backend: {service: {name: genkan, port: {number: 80}}}}
+      - {path: /token, pathType: Exact, backend: {service: {name: genkan, port: {number: 80}}}}
+      - {path: /par, pathType: Exact, backend: {service: {name: genkan, port: {number: 80}}}}
+      - {path: /revoke, pathType: Exact, backend: {service: {name: genkan, port: {number: 80}}}}
+      - {path: /login, pathType: Prefix, backend: {service: {name: genkan, port: {number: 80}}}}
+      - {path: /setup, pathType: Prefix, backend: {service: {name: genkan, port: {number: 80}}}}
+      - {path: /upstream, pathType: Prefix, backend: {service: {name: genkan, port: {number: 80}}}}
 EOF
 ```
 
@@ -397,9 +355,8 @@ Treat the numbers as a starting point:
 See Traefik's [RateLimit options][traefik-ratelimit] for the details.
 
 [traefik-ratelimit]: https://doc.traefik.io/traefik/reference/routing-configuration/http/middlewares/ratelimit/
-[traefik-extref]: https://doc.traefik.io/traefik/reference/routing-configuration/kubernetes/gateway-api/#extensionref-filters
 
-## 6. Let kube-apiserver trust Genkan
+## 5. Let kube-apiserver trust Genkan
 
 First make sure you can get back in without Genkan. On the server, check that the admin
 kubeconfig from step 2 works:
@@ -452,7 +409,7 @@ genkanctl kube-config --distro k3s > ~/authn.yaml &&
 The internal certificate is valid for a year. [Renew it](#once-a-year-renew-the-internal-certificate)
 before then.
 
-## 7. Register kubectl and create the first passkey
+## 6. Register kubectl and create the first passkey
 
 Every application that signs in through Genkan is registered as a client. Register `kubectl`
 (through kubelogin, which receives the sign-in result on `127.0.0.1`). `--allow-elevation`
@@ -472,7 +429,7 @@ genkanctl setup-link --username admin
 Open the printed link in the browser on your computer and create a passkey. The link works
 once and expires after 60 minutes; run the command again if you need a new one.
 
-## 8. Set up kubectl on your computer
+## 7. Set up kubectl on your computer
 
 Copy the cluster's CA certificate from the server. It is public; it only lets `kubectl` check that
 it talks to the right API server.
@@ -535,7 +492,7 @@ Krew and Nix install kubelogin as a `kubectl` plugin, so the file works as writt
 installed it with Homebrew, set `command: kubelogin` and drop `oidc-login` from `args`.
 
 With WSL, kubelogin runs inside Linux and does not see the CA that the Windows mkcert trusted.
-Add the CA to both `args` lists, using the path from the WSL check in step 5:
+Add the CA to both `args` lists, using the path from the WSL check in step 4:
 
 ```sh
 wslpath "$(mkcert.exe -CAROOT | tr -d '\r')"   # e.g. /mnt/c/Users/you/AppData/Local/mkcert
@@ -552,17 +509,19 @@ address in your browser, and the sign-in continues as usual.
 Keep `--oidc-use-access-token`: kube-apiserver accepts only Genkan's access tokens, not ID
 tokens.
 
-## 9. Try it
+## 8. Try it
 
 ```sh
 export KUBECONFIG=~/.kube/genkan-k3s.yaml
 kubectl auth whoami                      # opens the browser; user genkan:admin, group genkan:admins
 kubectl get pods -A                      # allowed: genkan:admins has the built-in view role
-kubectl create namespace demo            # Forbidden: an everyday token cannot change anything
-kubectl --context genkan-k3s-admin create namespace demo
-                                         # asks for your passkey again; works for 5 minutes
+kubectl -n default create configmap genkan-permission-check --from-literal=check=ok
+# Forbidden: the everyday context is read-only.
+kubectl --context genkan-k3s-admin -n default create configmap genkan-permission-check --from-literal=check=ok
+# Asks for your passkey again, then creates the ConfigMap.
 kubectl --context genkan-k3s-admin auth whoami
-                                         # now also in genkan:elevated:admins (cluster-admin)
+# Includes genkan:elevated:admins.
+kubectl --context genkan-k3s-admin -n default delete configmap genkan-permission-check
 ```
 
 What just happened:
@@ -591,13 +550,13 @@ What just happened:
 
 ## Once a year: renew the internal certificate
 
-The certificate from step 6 is valid for 365 days. If it expires, kube-apiserver can no longer
+The certificate from step 5 is valid for 365 days. If it expires, kube-apiserver can no longer
 fetch Genkan's keys, and every sign-in to the cluster fails. Running `genkanctl kube-config`
 again replaces the certificate automatically when it has less than 30 days left;
 `--renew-certificate` replaces it now.
 
-On the server, in a shell set up as in step 4 (`nix develop`, the `genkanctl` alias and
-`GENKAN_ISSUER`) and with the `reloads` and `wait_for_reload` helpers from step 6 defined:
+On the server, restore the environment from step 3 and define the `reloads` and
+`wait_for_reload` helpers from step 5:
 
 ```sh
 before=$(reloads)
@@ -610,7 +569,7 @@ authn=$(mktemp) &&
 ```
 
 Renewal creates a new CA as well, so kube-apiserver needs the configuration this command
-prints, not the one from step 6. Sign-ins can fail briefly while Genkan and kube-apiserver both
+prints, not the one from step 5. Sign-ins can fail briefly while Genkan and kube-apiserver both
 pick up the change (each within about a minute). Then run `kubectl auth whoami` on your
 computer.
 
@@ -630,7 +589,7 @@ To change the validity, use `--certificate-validity`; see the
   where the browser runs (`mkcert -install`), or the certificate's name does not match the
   issuer's host name.
 - **`kubectl` says `Unauthorized`:** kube-apiserver may not have loaded the configuration from
-  step 6. If it finds an error in the file, it ignores the file until it changes. On k3s, look
+  step 5. If it finds an error in the file, it ignores the file until it changes. On k3s, look
   for the reason with `sudo journalctl -u k3s | grep -i "authentication config"`.
 - **Port 8000 is in use:** kubelogin listens there for the browser's redirect. Change
   `--listen-address` and `--oidc-redirect-url` together; any port on `127.0.0.1` matches the
@@ -643,7 +602,7 @@ in it:
 
 ```sh
 sudo /usr/local/bin/k3s-uninstall.sh
-rm -rf ~/genkan-tls ~/authn.yaml ~/install-component.sh
+rm -rf ~/genkan-tls ~/authn.yaml ~/genkan-download
 ```
 
 Then, on your computer:
